@@ -1,0 +1,316 @@
+@import "tailwindcss";
+
+@theme {
+  --font-display: "Barlow Condensed", ui-sans-serif, system-ui, sans-serif;
+  --font-sans: "Plus Jakarta Sans", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, monospace;
+}
+
+@layer base {
+  html {
+    font-family: var(--font-sans);
+    background-color: #050608;
+    color-scheme: dark;
+  }
+
+  h1, h2, h3, .font-display {
+    font-family: var(--font-display);
+  }
+}
+
+.tabular-nums {
+  font-variant-numeric: tabular-nums;
+}
+
+/* Cinta Liga Master Argentina: Celeste, Blanco, Verde, Plata y Oro */
+.albiceleste-ribbon {
+  background: linear-gradient(
+    90deg,
+    #38bdf8 0%,
+    #ffffff 24%,
+    #10b981 42%,
+    #e2e8f0 56%,
+    #facc15 72%,
+    #ffffff 86%,
+    #38bdf8 100%
+  );
+}
+
+/* Tipografía Oficial Liga Master Argentina: Dorada con Negro y cambio dinámico de color lento y fluido */
+@keyframes lma-text-color-shift {
+  0% {
+    background-position: 0% 50%;
+  }
+  50% {
+    background-position: 100% 50%;
+  }
+  100% {
+    background-position: 0% 50%;
+  }
+}
+
+.text-lma-brand,
+.text-albiceleste-3d {
+  background-image: linear-gradient(
+    115deg,
+    #fff7cc 0%,
+    #facc15 12%,
+    #b45309 22%,
+    #18181b 27%,
+    #fde047 35%,
+    #38bdf8 48%,
+    #ffffff 56%,
+    #22c55e 66%,
+    #09090b 74%,
+    #facc15 84%,
+    #fff7cc 94%,
+    #d97706 100%
+  );
+  background-size: 320% 100%;
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+  -webkit-text-stroke: 1.6px #000000;
+  paint-order: stroke fill;
+  filter: drop-shadow(0 3px 0 #000000) drop-shadow(0 5px 12px rgba(250, 204, 21, 0.32));
+  animation: lma-text-color-shift 22s ease-in-out infinite;
+  will-change: background-position;
+}
+
+.text-lma-brand-static {
+  background-image: linear-gradient(
+    115deg,
+    #fff7cc 0%,
+    #facc15 18%,
+    #fde047 36%,
+    #38bdf8 52%,
+    #ffffff 64%,
+    #22c55e 78%,
+    #facc15 92%,
+    #fff7cc 100%
+  );
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+  -webkit-text-stroke: 1.4px #000000;
+  paint-order: stroke fill;
+  text-shadow: 0 3px 0 rgba(0, 0, 0, 0.85);
+}
+
+/* Tipografía Ligera GPU para Títulos de Sección (Celeste / Blanco / Plateado) */
+.text-albiceleste-shiny {
+  background-image: linear-gradient(
+    180deg,
+    #ffffff 0%,
+    #f1f5f9 32%,
+    #bae6fd 68%,
+    #7dd3fc 100%
+  );
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+  filter: drop-shadow(0 2px 3px rgba(0, 0, 0, 0.9));
+}
+
+/* Tipografía Metálica Plateada Elegante */
+.text-silver-shiny {
+  background-image: linear-gradient(
+    180deg,
+    #ffffff 0%,
+    #f1f5f9 26%,
+    #cbd5e1 55%,
+    #94a3b8 82%,
+    #e2e8f0 100%
+  );
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+  filter: drop-shadow(0 2px 2px rgba(0, 0, 0, 0.88));
+}
+
+/* Tipografía Oro Brillante */
+.text-gold-shiny {
+  background-image: linear-gradient(
+    180deg,
+    #fffdf2 0%,
+    #fef08a 26%,
+    #facc15 54%,
+    #d97706 82%,
+    #fde047 100%
+  );
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+  filter: drop-shadow(0 2px 3px rgba(0, 0, 0, 0.9));
+}
+
+.text-gold-3d-front {
+  background-image: linear-gradient(
+    180deg,
+    #fffef7 0%,
+    #fef08a 24%,
+    #fde047 48%,
+    #f59e0b 72%,
+    #fef3c7 88%,
+    #d97706 100%
+  );
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+  filter: drop-shadow(0 1px 0 rgba(120, 53, 15, 0.96))
+    drop-shadow(0 4px 10px rgba(0, 0, 0, 0.95));
+}
+
+.surface-luxury,
+.surface-albiceleste {
+  background-color: rgba(11, 13, 18, 0.95);
+  border: 1px solid rgba(250, 204, 21, 0.35);
+  box-shadow: 0 16px 36px -14px rgba(0, 0, 0, 0.9), inset 0 1px 0 rgba(226, 232, 240, 0.08);
+}
+
+.btn-gold-luxury {
+  background-image: linear-gradient(95deg, #fef08a 0%, #facc15 48%, #d97706 100%);
+  color: #07080b;
+  font-weight: 700;
+  border: 1px solid rgba(254, 240, 138, 0.8);
+  box-shadow: 0 4px 16px rgba(245, 158, 11, 0.25);
+}
+
+.btn-gold-luxury:hover {
+  filter: brightness(1.08);
+}
+
+.btn-silver-luxury {
+  background-image: linear-gradient(135deg, #f8fafc 0%, #cbd5e1 52%, #94a3b8 100%);
+  color: #07080b;
+  font-weight: 700;
+  border: 1px solid rgba(255, 255, 255, 0.75);
+  box-shadow: 0 4px 14px rgba(148, 163, 184, 0.22);
+}
+
+.btn-silver-luxury:hover {
+  filter: brightness(1.06);
+}
+
+.btn-celeste-gold {
+  background-image: linear-gradient(135deg, #0b111a 0%, #101826 52%, #071916 100%);
+  color: #f8fafc;
+  font-weight: 700;
+  border: 1.5px solid rgba(250, 204, 21, 0.65);
+  box-shadow: 0 4px 14px rgba(16, 185, 129, 0.16), 0 0 0 1px rgba(226, 232, 240, 0.12);
+}
+
+.btn-celeste-gold:hover {
+  border-color: rgba(250, 204, 21, 0.92);
+  filter: brightness(1.12);
+}
+
+@keyframes crest-ring-rotate {
+  from {
+    transform: rotate(0deg);
+  }
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.crest-ring-spin {
+  animation: crest-ring-rotate 12s linear infinite;
+  will-change: transform;
+}
+
+.crest-border-0,
+.crest-border-1 {
+  background: conic-gradient(from 0deg, #fde047, #e2e8f0, #38bdf8, #10b981, #ffffff, #f59e0b, #fde047);
+}
+.crest-glow-0,
+.crest-glow-1 {
+  box-shadow: 0 0 24px rgba(250, 204, 21, 0.42), 0 12px 28px rgba(0, 0, 0, 0.85);
+}
+
+.crest-border-2 {
+  background: conic-gradient(from 0deg, #e2e8f0, #38bdf8, #ffffff, #10b981, #facc15, #e2e8f0);
+}
+.crest-glow-2 {
+  box-shadow: 0 0 22px rgba(226, 232, 240, 0.34), 0 12px 28px rgba(0, 0, 0, 0.85);
+}
+
+.crest-border-3 {
+  background: conic-gradient(from 0deg, #fde68a, #10b981, #ffffff, #cbd5e1, #38bdf8, #fde68a);
+}
+.crest-glow-3 {
+  box-shadow: 0 0 22px rgba(16, 185, 129, 0.36), 0 12px 28px rgba(0, 0, 0, 0.85);
+}
+
+.crest-border-4 {
+  background: conic-gradient(from 0deg, #fef08a, #cbd5e1, #38bdf8, #ffffff, #f59e0b, #fef08a);
+}
+.crest-glow-4 {
+  box-shadow: 0 0 22px rgba(250, 204, 21, 0.4), 0 12px 28px rgba(0, 0, 0, 0.85);
+}
+
+.crest-border-5 {
+  background: conic-gradient(from 0deg, #e2e8f0, #fde047, #ffffff, #10b981, #38bdf8, #e2e8f0);
+}
+.crest-glow-5 {
+  box-shadow: 0 0 22px rgba(56, 189, 248, 0.34), 0 12px 28px rgba(0, 0, 0, 0.85);
+}
+
+/* Bordes del escudo oficial que cambian de color suavemente (Celeste, Blanco, Verde, Dorado, Plata) */
+@keyframes lma-crest-color-cycle {
+  0% {
+    border-color: #38bdf8;
+    box-shadow: 0 0 18px rgba(56, 189, 248, 0.72), 0 0 36px rgba(56, 189, 248, 0.32), inset 0 0 12px rgba(56, 189, 248, 0.35);
+  }
+  25% {
+    border-color: #f8fafc;
+    box-shadow: 0 0 18px rgba(248, 250, 252, 0.78), 0 0 36px rgba(226, 232, 240, 0.35), inset 0 0 12px rgba(255, 255, 255, 0.35);
+  }
+  50% {
+    border-color: #22c55e;
+    box-shadow: 0 0 18px rgba(34, 197, 94, 0.76), 0 0 36px rgba(16, 185, 129, 0.36), inset 0 0 12px rgba(34, 197, 94, 0.35);
+  }
+  75% {
+    border-color: #facc15;
+    box-shadow: 0 0 20px rgba(250, 204, 21, 0.82), 0 0 40px rgba(245, 158, 11, 0.38), inset 0 0 12px rgba(250, 204, 21, 0.4);
+  }
+  100% {
+    border-color: #38bdf8;
+    box-shadow: 0 0 18px rgba(56, 189, 248, 0.72), 0 0 36px rgba(56, 189, 248, 0.32), inset 0 0 12px rgba(56, 189, 248, 0.35);
+  }
+}
+
+.lma-crest-color-ring {
+  border-width: 3px;
+  border-style: solid;
+  animation: lma-crest-color-cycle 14s ease-in-out infinite;
+}
+
+/* Efecto 3D en Portada Principal (La Cabra con la Copa del Mundo) */
+.hero-cover-3d-stage {
+  perspective: 1400px;
+}
+
+@keyframes hero-cover-3d-float {
+  0%, 100% {
+    transform: rotateX(1.2deg) rotateY(-1.8deg) translateZ(6px) scale(1.015);
+  }
+  50% {
+    transform: rotateX(-1.1deg) rotateY(1.8deg) translateZ(14px) scale(1.028);
+  }
+}
+
+.hero-cover-3d-idle {
+  transform-style: preserve-3d;
+  animation: hero-cover-3d-float 9s ease-in-out infinite;
+  will-change: transform;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}

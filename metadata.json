@@ -1,0 +1,8 @@
+{
+  "name": "~L-M-A PES6~",
+  "description": "Liga Master Argentina - PES6 (THE DEN PATCH) ",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}

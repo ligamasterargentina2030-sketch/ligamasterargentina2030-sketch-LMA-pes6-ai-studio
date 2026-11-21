@@ -1,4 +1,6 @@
-const TOKEN_KEY = 'lma_pes6_auth_token';
+import { auth } from '../firebase';
+
+let inMemoryLegacyToken: string | null = null;
 
 const CONFIGURED_API_BASE = (
   typeof import.meta !== 'undefined' && import.meta.env?.VITE_API_BASE_URL
@@ -18,23 +20,22 @@ export function resolveApiUrl(url: string): string {
 }
 
 export function getStoredToken(): string | null {
-  try {
-    return localStorage.getItem(TOKEN_KEY);
-  } catch {
-    return null;
-  }
+  return inMemoryLegacyToken;
 }
 
 export function setStoredToken(token: string | null): void {
-  try {
-    if (token) {
-      localStorage.setItem(TOKEN_KEY, token);
-    } else {
-      localStorage.removeItem(TOKEN_KEY);
+  inMemoryLegacyToken = token ? String(token) : null;
+}
+
+async function resolveBearerToken(): Promise<string | null> {
+  if (auth.currentUser) {
+    try {
+      return await auth.currentUser.getIdToken();
+    } catch {
+      // fall back to legacy token
     }
-  } catch {
-    // ignore storage errors
   }
+  return inMemoryLegacyToken;
 }
 
 function summarizeNonJsonBody(rawText: string): string {
@@ -56,7 +57,7 @@ function summarizeNonJsonBody(rawText: string): string {
 
 export async function apiFetch<T>(url: string, options: RequestInit = {}): Promise<T> {
   const targetUrl = resolveApiUrl(url);
-  const token = getStoredToken();
+  const token = await resolveBearerToken();
   const headers = new Headers(options.headers || {});
   if (token && !headers.has('Authorization')) {
     headers.set('Authorization', `Bearer ${token}`);
@@ -108,7 +109,7 @@ export async function apiFetch<T>(url: string, options: RequestInit = {}): Promi
       (response.status === 405 || (response.status === 404 && isHtmlResponse))
     ) {
       throw new Error(
-        `El servidor actual no responde a las rutas API (HTTP ${response.status}). Estás viendo una versión estática (sin servidor Express activo), por lo que el inicio de sesión no puede validarse desde esta URL; usá la URL publicada de la aplicación con servidor activo.`
+        `El servidor actual no responde a las rutas API (HTTP ${response.status}).`
       );
     }
 
@@ -129,4 +130,27 @@ export async function apiFetch<T>(url: string, options: RequestInit = {}): Promi
   }
 
   return data as T;
+}
+
+export type UploadSubdir =
+  | 'crests'
+  | 'matches'
+  | 'videos'
+  | 'champions'
+  | 'music'
+  | 'site'
+  | 'claims'
+  | 'news';
+
+export async function uploadMediaFile(subdir: UploadSubdir, file: File): Promise<string> {
+  const form = new FormData();
+  form.append('file', file);
+  const res = await apiFetch<{ url: string }>(`/api/upload/${subdir}`, {
+    method: 'POST',
+    body: form,
+  });
+  if (!res?.url) {
+    throw new Error('El servidor no devolvió la URL del archivo subido.');
+  }
+  return res.url;
 }

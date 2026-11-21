@@ -1,5 +1,9 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
+import { onAuthStateChanged } from 'firebase/auth';
+import { doc, onSnapshot } from 'firebase/firestore';
 import { RotateCcw, Target, Trophy, Volume2, VolumeX } from 'lucide-react';
+import { auth, db } from '../firebase';
+import { safeDocId, saveUserPenaltyBestScoreFirestore } from '../services/firestoreLeague';
 
 type GameState = 'TITLE_MENU' | 'PLAYING' | 'GAME_OVER';
 type Difficulty = 'normal' | 'dificil';
@@ -24,7 +28,6 @@ const GOAL_BOTTOM = 194;
 const SPOT_X = 320;
 const SPOT_Y = 330;
 const TOTAL_SHOTS = 5;
-const BEST_SCORE_KEY = 'lma_penalty_best_score';
 
 function playSynthSound(kind: 'kick' | 'goal' | 'save' | 'post' | 'miss', muted: boolean) {
   if (muted || typeof window === 'undefined') return;
@@ -116,14 +119,33 @@ export function PenaltyMiniGame() {
   const [muted, setMuted] = useState(false);
   const [goals, setGoals] = useState(0);
   const [shotHistory, setShotHistory] = useState<ShotOutcome[]>([]);
-  const [bestScore, setBestScore] = useState<number>(() => {
-    try {
-      return Number(localStorage.getItem(BEST_SCORE_KEY) || 0);
-    } catch {
-      return 0;
-    }
-  });
+  const [bestScore, setBestScore] = useState<number>(0);
   const [bannerMsg, setBannerMsg] = useState<string>('Mové el mouse para apuntar y hacé clic para patear');
+
+  useEffect(() => {
+    let unsubDoc: (() => void) | null = null;
+    const unsubAuth = onAuthStateChanged(auth, (u) => {
+      if (unsubDoc) {
+        unsubDoc();
+        unsubDoc = null;
+      }
+      if (!u || !u.emailVerified) {
+        return;
+      }
+      unsubDoc = onSnapshot(doc(db, 'user_preferences', safeDocId(u.uid)), (snap) => {
+        if (snap.exists()) {
+          const val = (snap.data() as { penaltyBestScore?: number }).penaltyBestScore;
+          if (typeof val === 'number') {
+            setBestScore((prev) => Math.max(prev, val));
+          }
+        }
+      });
+    });
+    return () => {
+      if (unsubDoc) unsubDoc();
+      unsubAuth();
+    };
+  }, []);
 
   const simRef = useRef({
     state: 'TITLE_MENU' as GameState,
@@ -334,10 +356,8 @@ export function PenaltyMiniGame() {
       if (nextShotsCount >= TOTAL_SHOTS) {
         setBestScore((prevBest) => {
           const updated = Math.max(prevBest, nextGoals);
-          try {
-            localStorage.setItem(BEST_SCORE_KEY, String(updated));
-          } catch {
-            // ignore storage errors
+          if (auth.currentUser && auth.currentUser.emailVerified && updated > prevBest) {
+            void saveUserPenaltyBestScoreFirestore(updated).catch(() => undefined);
           }
           return updated;
         });

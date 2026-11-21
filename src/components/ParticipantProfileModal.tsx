@@ -3,12 +3,14 @@ import { Award, Crown, Disc3, Heart, Shield, Trophy, X } from 'lucide-react';
 import type {
   ChampionEntry,
   LastListenedTrack,
+  LeagueSettings,
   Match,
   PublicTeam,
   StandingRow,
   TeamTrophy,
 } from '../types';
 import { resolveAssetUrl } from '../utils/assetUrl';
+import { getTitleText } from '../utils/customTitles';
 import { ResilientImage } from './ResilientImage';
 
 interface ParticipantProfileModalProps {
@@ -17,6 +19,7 @@ interface ParticipantProfileModalProps {
   standing?: StandingRow;
   matches: Match[];
   champions: ChampionEntry[];
+  settings?: LeagueSettings;
   liked: boolean;
   onLike: (teamId: string) => Promise<void>;
   onClose: () => void;
@@ -40,26 +43,29 @@ export function ParticipantProfileModal({
   standing,
   matches,
   champions,
+  settings,
   liked,
   onLike,
   onClose,
 }: ParticipantProfileModalProps) {
   const [liking, setLiking] = useState(false);
+  const [likeError, setLikeError] = useState<string | null>(null);
 
   if (!team) return null;
 
-  let lastSong: LastListenedTrack | undefined = team.lastListenedTrack;
-  if (!lastSong?.title) {
-    try {
-      const raw = localStorage.getItem(`lma_last_song_${team.id}`);
-      if (raw) {
-        const parsed = JSON.parse(raw) as LastListenedTrack;
-        if (parsed?.title) lastSong = parsed;
-      }
-    } catch {
-      // ignore
-    }
-  }
+  const trophyImgByType: Record<'liga' | 'copa' | 'recopa', string> = {
+    liga: resolveAssetUrl(settings?.ligaTrophyUrl || TROPHY_IMG_BY_TYPE.liga),
+    copa: resolveAssetUrl(settings?.copaTrophyUrl || TROPHY_IMG_BY_TYPE.copa),
+    recopa: resolveAssetUrl(settings?.recopaTrophyUrl || TROPHY_IMG_BY_TYPE.recopa),
+  };
+
+  const trophyLabelByType: Record<'liga' | 'copa' | 'recopa', string> = {
+    liga: getTitleText(settings, 'compLigaName'),
+    copa: getTitleText(settings, 'compCopaName'),
+    recopa: getTitleText(settings, 'compRecopaName'),
+  };
+
+  const lastSong: LastListenedTrack | undefined = team.lastListenedTrack;
 
   const teamMap = new Map(teams.map((t) => [t.id, t]));
   const teamMatches = matches
@@ -90,14 +96,9 @@ export function ParticipantProfileModal({
       return {
         id: `derived_${c.id}`,
         type,
-        title:
-          type === 'copa'
-            ? 'Campeón Copa de la Liga'
-            : type === 'recopa'
-            ? 'Gran Campeón Recopa Argentina'
-            : 'Campeón Liga Argentina',
+        title: `Campeón ${trophyLabelByType[type]}`,
         season: c.season,
-        imageUrl: TROPHY_IMG_BY_TYPE[type],
+        imageUrl: trophyImgByType[type],
         message: c.notes || '',
         awardedAt: c.createdAt,
         sourceKey: `champ_${c.id}`,
@@ -110,10 +111,13 @@ export function ParticipantProfileModal({
   const recopaCount = allTrophies.filter((t) => t.type === 'recopa').length;
 
   const handleLikeClick = async () => {
-    if (liking) return;
+    if (liking || liked) return;
     setLiking(true);
+    setLikeError(null);
     try {
       await onLike(team.id);
+    } catch (err) {
+      setLikeError(err instanceof Error ? err.message : 'No se pudo registrar el Me Gusta.');
     } finally {
       setLiking(false);
     }
@@ -173,27 +177,42 @@ export function ParticipantProfileModal({
         </div>
 
         <div className="p-6 space-y-6">
-          {/* Botón Me Gusta del perfil */}
-          <div className="flex flex-wrap items-center justify-between gap-3 p-4 rounded-xl bg-[#07090E] border border-rose-400/35">
-            <div className="text-xs text-zinc-300">
-              ¿Te gusta el perfil o el nivel de <strong className="text-white">{team.name}</strong>? Dejale tu Me Gusta:
+          {/* Botón Me Gusta del perfil (máximo 1 corazón por miembro) */}
+          <div className="p-4 rounded-xl bg-[#07090E] border border-rose-400/35 space-y-2">
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <div className="text-xs text-zinc-300">
+                {liked ? (
+                  <span>
+                    Ya dejaste tu corazón para <strong className="text-white">{team.name}</strong> (1 por miembro).
+                  </span>
+                ) : (
+                  <span>
+                    ¿Te gusta el perfil o el nivel de <strong className="text-white">{team.name}</strong>? Dejale tu corazón (1 por miembro):
+                  </span>
+                )}
+              </div>
+              <button
+                type="button"
+                disabled={liking || liked}
+                aria-pressed={liked}
+                onClick={handleLikeClick}
+                title={liked ? 'Ya dejaste tu corazón (1 por miembro)' : 'Dejar 1 corazón a este miembro'}
+                className={`inline-flex items-center gap-2 px-4 py-2 rounded-xl text-xs font-bold transition-all whitespace-nowrap ${
+                  liked
+                    ? 'bg-rose-500/25 text-rose-200 border border-rose-400/70 shadow-[0_0_16px_rgba(244,63,94,0.28)] cursor-default'
+                    : 'bg-[#141720] hover:bg-rose-500/20 text-white border border-rose-400/50 disabled:opacity-60'
+                }`}
+              >
+                <Heart className={`w-4 h-4 ${liked ? 'fill-rose-500 text-rose-400' : 'text-rose-400'}`} />
+                <span>{liked ? 'Corazón enviado' : liking ? 'Enviando...' : 'Me Gusta'}</span>
+                <span className="px-2 py-0.5 rounded-md bg-black/50 font-mono text-rose-200 tabular-nums">
+                  {team.likes || 0}
+                </span>
+              </button>
             </div>
-            <button
-              type="button"
-              disabled={liking}
-              onClick={handleLikeClick}
-              className={`inline-flex items-center gap-2 px-4 py-2 rounded-xl text-xs font-bold transition-all whitespace-nowrap ${
-                liked
-                  ? 'bg-rose-500/25 text-rose-200 border border-rose-400/70 shadow-[0_0_16px_rgba(244,63,94,0.28)]'
-                  : 'bg-[#141720] hover:bg-rose-500/20 text-white border border-rose-400/50'
-              }`}
-            >
-              <Heart className={`w-4 h-4 ${liked ? 'fill-rose-500 text-rose-400' : 'text-rose-400'}`} />
-              <span>Me Gusta</span>
-              <span className="px-2 py-0.5 rounded-md bg-black/50 font-mono text-rose-200 tabular-nums">
-                {team.likes || 0}
-              </span>
-            </button>
+            {likeError && (
+              <p className="text-[11px] font-semibold text-rose-300">{likeError}</p>
+            )}
           </div>
 
           {/* Última canción escuchada con su foto original */}
@@ -314,15 +333,15 @@ export function ParticipantProfileModal({
                     key={trophy.id}
                     className="rounded-xl overflow-hidden bg-[#07090E] border border-amber-400/45 shadow-lg flex flex-col"
                   >
-                    <div className="relative h-44 bg-[#04060A] overflow-hidden border-b border-amber-400/30">
+                    <div className="relative h-44 bg-[#04060A] overflow-hidden border-b border-amber-400/30 p-1">
                       <ResilientImage
-                        src={trophy.imageUrl || TROPHY_IMG_BY_TYPE[trophy.type]}
+                        src={trophy.imageUrl || trophyImgByType[trophy.type]}
                         alt={trophy.title}
-                        className="w-full h-full object-cover object-center"
-                        fallbackLabel={TROPHY_LABEL_BY_TYPE[trophy.type]}
+                        className="w-full h-full object-contain object-center"
+                        fallbackLabel={trophyLabelByType[trophy.type]}
                       />
                       <span className="absolute top-2.5 left-2.5 px-2 py-0.5 rounded-md bg-black/75 border border-amber-400/60 text-[10px] font-bold text-amber-300 uppercase tracking-wider">
-                        {TROPHY_LABEL_BY_TYPE[trophy.type]}
+                        {trophyLabelByType[trophy.type]}
                       </span>
                     </div>
                     <div className="p-3.5 space-y-1.5 flex-1 flex flex-col justify-between">
@@ -361,7 +380,7 @@ export function ParticipantProfileModal({
                 <ResilientImage
                   src={team.celebrationImageUrl}
                   alt={`Festejo de ${team.name}`}
-                  className="w-full h-full object-cover"
+                  className="w-full h-full object-contain"
                   fallbackLabel={team.name}
                 />
               </div>

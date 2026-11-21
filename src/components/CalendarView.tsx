@@ -21,15 +21,27 @@ import type {
   CalendarEvent,
   CupMatchNode,
   CupTournament,
+  LeagueSettings,
   PublicTeam,
   ScheduledFixture,
 } from '../types';
-import { apiFetch } from '../utils/api';
+import {
+  createCalendarEventFirestore,
+  deleteCalendarEventFirestore,
+  saveSettingsFirestore,
+  updateCalendarEventFirestore,
+  updateCupMatchNodeFirestore,
+  updateCupRecopaFirestore,
+  updateFixtureScheduleFirestore,
+} from '../services/firestoreLeague';
+import { uploadMediaFile } from '../utils/api';
+import { getTitleText } from '../utils/customTitles';
 import { ResilientImage } from './ResilientImage';
 
 interface CalendarViewProps {
   calendarEvents: CalendarEvent[];
   calendarMessage?: string;
+  settings?: LeagueSettings;
   cup: CupTournament;
   fixtures: ScheduledFixture[];
   teams: PublicTeam[];
@@ -150,6 +162,7 @@ function formatCountdownBadge(
 export function CalendarView({
   calendarEvents,
   calendarMessage = '',
+  settings,
   cup,
   fixtures,
   teams,
@@ -592,10 +605,7 @@ export function CalendarView({
     setSavingBannerMsg(true);
     setBannerMsgFeedback(null);
     try {
-      await apiFetch('/api/admin/calendar/message', {
-        method: 'PUT',
-        body: JSON.stringify({ message: bannerMsgDraft.trim() }),
-      });
+      await saveSettingsFirestore({ calendarMessage: bannerMsgDraft.trim() });
       setEditingBannerMsg(false);
       setBannerMsgFeedback(
         bannerMsgDraft.trim()
@@ -617,10 +627,7 @@ export function CalendarView({
     setSavingBannerMsg(true);
     setBannerMsgFeedback(null);
     try {
-      await apiFetch('/api/admin/calendar/message', {
-        method: 'PUT',
-        body: JSON.stringify({ message: '' }),
-      });
+      await saveSettingsFirestore({ calendarMessage: '' });
       setBannerMsgDraft('');
       setEditingBannerMsg(false);
       await onRefresh();
@@ -639,28 +646,14 @@ export function CalendarView({
     setMsg(null);
     setSaving(true);
     try {
-      const formData = new FormData();
-      formData.append('title', formTitle.trim());
-      formData.append('category', formCategory);
-      formData.append('date', formDate);
-      formData.append('time', formTime || '21:00');
-      if (formCupMatchId) formData.append('cupMatchId', formCupMatchId);
-      if (formFixtureId) formData.append('fixtureId', formFixtureId);
-      formData.append('homeTeamId', formHomeTeamId);
-      formData.append('awayTeamId', formAwayTeamId);
-      formData.append('homeTeamName', formHomeTeam.trim());
-      formData.append('awayTeamName', formAwayTeam.trim());
-      if (!formHomeCrestFile && !clearHomeCrest && formHomeCrestUrl) {
-        formData.append('homeCrestUrl', formHomeCrestUrl);
+      let resolvedHomeCrest = clearHomeCrest ? '' : formHomeCrestUrl || '';
+      let resolvedAwayCrest = clearAwayCrest ? '' : formAwayCrestUrl || '';
+      if (formHomeCrestFile) {
+        resolvedHomeCrest = await uploadMediaFile('crests', formHomeCrestFile);
       }
-      if (!formAwayCrestFile && !clearAwayCrest && formAwayCrestUrl) {
-        formData.append('awayCrestUrl', formAwayCrestUrl);
+      if (formAwayCrestFile) {
+        resolvedAwayCrest = await uploadMediaFile('crests', formAwayCrestFile);
       }
-      if (clearHomeCrest) formData.append('clearHomeCrest', 'true');
-      if (clearAwayCrest) formData.append('clearAwayCrest', 'true');
-      if (formHomeCrestFile) formData.append('homeCrest', formHomeCrestFile);
-      if (formAwayCrestFile) formData.append('awayCrest', formAwayCrestFile);
-      formData.append('notes', formNotes.trim());
 
       const roundLabel =
         formCategory === 'copa'
@@ -668,20 +661,63 @@ export function CalendarView({
           : formCategory === 'recopa'
           ? 'Recopa'
           : '';
-      if (roundLabel) formData.append('roundLabel', roundLabel);
 
       if (editingId) {
-        await apiFetch(`/api/admin/calendar/${editingId}`, {
-          method: 'PUT',
-          body: formData,
+        await updateCalendarEventFirestore(editingId, {
+          title: formTitle.trim(),
+          category: formCategory,
+          date: formDate,
+          time: formTime || '21:00',
+          roundLabel: roundLabel || undefined,
+          cupMatchId: formCupMatchId || undefined,
+          fixtureId: formFixtureId || undefined,
+          homeTeamId: formHomeTeamId || undefined,
+          awayTeamId: formAwayTeamId || undefined,
+          homeTeamName: formHomeTeam.trim() || undefined,
+          awayTeamName: formAwayTeam.trim() || undefined,
+          homeCrestUrl: resolvedHomeCrest || undefined,
+          awayCrestUrl: resolvedAwayCrest || undefined,
+          notes: formNotes.trim(),
         });
         setMsg({ type: 'ok', text: 'Partido y escudos actualizados en el calendario.' });
       } else {
-        await apiFetch('/api/admin/calendar', {
-          method: 'POST',
-          body: formData,
+        await createCalendarEventFirestore({
+          title: formTitle.trim(),
+          category: formCategory,
+          date: formDate,
+          time: formTime || '21:00',
+          roundLabel: roundLabel || undefined,
+          cupMatchId: formCupMatchId || undefined,
+          fixtureId: formFixtureId || undefined,
+          homeTeamId: formHomeTeamId || undefined,
+          awayTeamId: formAwayTeamId || undefined,
+          homeTeamName: formHomeTeam.trim() || undefined,
+          awayTeamName: formAwayTeam.trim() || undefined,
+          homeCrestUrl: resolvedHomeCrest || undefined,
+          awayCrestUrl: resolvedAwayCrest || undefined,
+          notes: formNotes.trim(),
         });
         setMsg({ type: 'ok', text: 'Partido y escudos agendados en el calendario.' });
+      }
+
+      if (formFixtureId) {
+        await updateFixtureScheduleFirestore(formFixtureId, formDate, formTime || '21:00');
+      }
+      if (formCupMatchId) {
+        if (formCupMatchId === 'recopa') {
+          await updateCupRecopaFirestore(
+            cup,
+            { scheduledDate: formDate, scheduledTime: formTime || '21:00' },
+            teams
+          );
+        } else {
+          await updateCupMatchNodeFirestore(
+            cup,
+            formCupMatchId,
+            { scheduledDate: formDate, scheduledTime: formTime || '21:00' },
+            teams
+          );
+        }
       }
 
       resetForm();
@@ -730,22 +766,18 @@ export function CalendarView({
     setMsg(null);
     try {
       if (item.source === 'custom') {
-        await apiFetch(`/api/admin/calendar/${item.sourceId}`, { method: 'DELETE' });
+        await deleteCalendarEventFirestore(item.sourceId);
       } else if (item.source === 'fixture') {
-        await apiFetch(`/api/admin/fixtures/${item.sourceId}`, {
-          method: 'PUT',
-          body: JSON.stringify({ scheduledDate: '', scheduledTime: '' }),
-        });
+        await updateFixtureScheduleFirestore(item.sourceId, '', '');
       } else if (item.source === 'cup') {
-        await apiFetch(`/api/admin/cup/matches/${item.sourceId}`, {
-          method: 'PUT',
-          body: JSON.stringify({ scheduledDate: '', scheduledTime: '' }),
-        });
+        await updateCupMatchNodeFirestore(
+          cup,
+          item.sourceId,
+          { scheduledDate: '', scheduledTime: '' },
+          teams
+        );
       } else if (item.source === 'recopa') {
-        await apiFetch('/api/admin/cup/recopa', {
-          method: 'PUT',
-          body: JSON.stringify({ scheduledDate: '', scheduledTime: '' }),
-        });
+        await updateCupRecopaFirestore(cup, { scheduledDate: '', scheduledTime: '' }, teams);
       }
       if (editingId === item.sourceId) {
         resetForm();
@@ -780,9 +812,9 @@ export function CalendarView({
   };
 
   const categoryLabel = (cat: CalendarCategory) => {
-    if (cat === 'copa') return 'Copa de la Liga';
-    if (cat === 'recopa') return 'Recopa';
-    if (cat === 'liga') return 'Liga Master';
+    if (cat === 'copa') return getTitleText(settings, 'compCopaName');
+    if (cat === 'recopa') return getTitleText(settings, 'compRecopaName');
+    if (cat === 'liga') return getTitleText(settings, 'compLigaName');
     return 'Evento';
   };
 
@@ -795,11 +827,11 @@ export function CalendarView({
             <div className="flex items-center gap-2">
               <CalendarDays className="w-5 h-5 text-amber-300 shrink-0" />
               <h1 className="font-display text-3xl sm:text-4xl font-extrabold tracking-tight text-albiceleste-shiny">
-                Calendario Oficial · Liga & Copa de la Liga
+                {getTitleText(settings, 'calendarTitle')}
               </h1>
             </div>
             <p className="text-xs sm:text-sm text-zinc-200">
-              Sincronizado en tiempo real con el día, mes, año, hora actual y los partidos con escudos programados por el Administrador.
+              {getTitleText(settings, 'calendarSubtitle')}
             </p>
           </div>
 

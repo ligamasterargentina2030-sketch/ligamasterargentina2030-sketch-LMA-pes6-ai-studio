@@ -16,14 +16,29 @@ import {
   Upload,
   Users,
 } from 'lucide-react';
-import type { CupMatchNode, CupParticipant, CupRound, CupTournament, PublicTeam } from '../types';
-import { apiFetch } from '../utils/api';
+import type {
+  CupMatchNode,
+  CupParticipant,
+  CupRound,
+  CupTournament,
+  Match,
+  PublicTeam,
+} from '../types';
+import {
+  resetCupFirestore,
+  saveCupFirestore,
+  updateCupMatchNodeFirestore,
+  updateCupRecopaFirestore,
+} from '../services/firestoreLeague';
+import { uploadMediaFile } from '../utils/api';
+import { computeStandings } from '../utils/standings';
 import { CupBracketCard } from './CupBracketCard';
 import { ResilientImage } from './ResilientImage';
 
 interface AdminCupPanelProps {
   cup: CupTournament;
   teams: PublicTeam[];
+  matches?: Match[];
   onRefresh: () => Promise<void>;
   onGoToChampions: () => void;
   onGoToHome?: () => void;
@@ -616,6 +631,7 @@ function MatchNodeEditor({
 export function AdminCupPanel({
   cup,
   teams,
+  matches = [],
   onRefresh,
   onGoToChampions,
   onGoToHome,
@@ -720,16 +736,22 @@ export function AdminCupPanel({
     setMsg(null);
     setSavingSettings(true);
     try {
-      const form = new FormData();
-      form.append('editionName', editionName.trim());
-      form.append('status', cupStatus);
-      form.append('championTeamName', championTeamName.trim());
-      form.append('championMemberName', championMemberName.trim());
-      form.append('championGreeting', championGreeting.trim());
-      if (championCrestFile) {
-        form.append('championCrest', championCrestFile);
+      const draft: CupTournament = JSON.parse(JSON.stringify(cup)) as CupTournament;
+      if (editionName.trim()) draft.editionName = editionName.trim();
+      draft.status = cupStatus;
+      draft.championTeamName = championTeamName.trim();
+      draft.championMemberName = championMemberName.trim();
+      draft.championGreeting = championGreeting.trim() || draft.championGreeting;
+      if (draft.championTeamName && draft.recopa) {
+        draft.recopa.cupChampionName = draft.championTeamName;
+        draft.recopa.cupChampionMember = draft.championMemberName;
       }
-      await apiFetch('/api/admin/cup/settings', { method: 'PUT', body: form });
+      if (championCrestFile) {
+        const uploadedCrest = await uploadMediaFile('crests', championCrestFile);
+        draft.championCrestUrl = uploadedCrest;
+        if (draft.recopa) draft.recopa.cupChampionCrestUrl = uploadedCrest;
+      }
+      await saveCupFirestore(draft, teams, matches, 'Guardar configuración de Copa');
       setChampionCrestFile(null);
       await refreshAndBroadcast();
       showOk('Configuración y campeón central de la Copa guardados.');
@@ -743,10 +765,29 @@ export function AdminCupPanel({
   const handleSeedFromStandings = async () => {
     setMsg(null);
     try {
-      await apiFetch('/api/admin/cup/seed-standings', {
-        method: 'POST',
-        body: JSON.stringify({ mode: 'seeded' }),
+      const ranked = computeStandings(teams, matches).map((s) => s.team).slice(0, 16);
+      const seededOrder = [0, 15, 7, 8, 4, 11, 3, 12, 2, 13, 5, 10, 6, 9, 1, 14];
+      const draft: CupTournament = JSON.parse(JSON.stringify(cup)) as CupTournament;
+      draft.participants = Array.from({ length: 16 }, (_, idx) => {
+        const slot = idx + 1;
+        const t = ranked[seededOrder[idx]];
+        if (t) {
+          return {
+            slot,
+            teamId: t.id,
+            teamName: t.name,
+            memberName: t.memberName,
+            crestUrl: t.crestUrl,
+          };
+        }
+        return {
+          slot,
+          teamName: `Cupo Libre #${slot}`,
+          memberName: 'Por definir',
+          crestUrl: '',
+        };
       });
+      await saveCupFirestore(draft, teams, matches, 'Cargar Top 16 en Copa');
       await refreshAndBroadcast();
       showOk('Top 16 de la Tabla de Posiciones cargado en las llaves de la Copa (sin modificar tus equipos de Liga).');
     } catch (err) {
@@ -760,16 +801,29 @@ export function AdminCupPanel({
   ) => {
     setMsg(null);
     try {
-      const form = new FormData();
-      form.append('teamName', payload.teamName);
-      form.append('memberName', payload.memberName);
-      form.append('teamId', payload.teamId || '');
-      if (payload.crestFile) {
-        form.append('crest', payload.crestFile);
+      const draft: CupTournament = JSON.parse(JSON.stringify(cup)) as CupTournament;
+      const participant = draft.participants.find((p) => p.slot === slot);
+      if (!participant) throw new Error('Cupo de copa no encontrado.');
+      const tid = (payload.teamId || '').trim();
+      if (tid) {
+        const foundTeam = teams.find((t) => t.id === tid);
+        participant.teamId = tid;
+        if (foundTeam && !payload.teamName.trim()) participant.teamName = foundTeam.name;
+        if (foundTeam && !payload.memberName.trim()) participant.memberName = foundTeam.memberName;
+        if (foundTeam && !payload.crestFile && !participant.crestUrl) {
+          participant.crestUrl = foundTeam.crestUrl;
+        }
+      } else {
+        participant.teamId = undefined;
       }
-      await apiFetch(`/api/admin/cup/participants/${slot}`, { method: 'PUT', body: form });
+      if (payload.teamName.trim()) participant.teamName = payload.teamName.trim();
+      if (payload.memberName.trim()) participant.memberName = payload.memberName.trim();
+      if (payload.crestFile) {
+        participant.crestUrl = await uploadMediaFile('crests', payload.crestFile);
+      }
+      await saveCupFirestore(draft, teams, matches, `Actualizar cupo #${slot}`);
       await refreshAndBroadcast();
-      showOk(`Cupo #${slot} actualizado (escudo PNG 128x128 y nombres guardados en la Copa).`);
+      showOk(`Cupo #${slot} actualizado (escudo y nombres guardados en la Copa).`);
     } catch (err) {
       showErr(err);
     }
@@ -778,7 +832,31 @@ export function AdminCupPanel({
   const handleRemoveParticipant = async (slot: number) => {
     setMsg(null);
     try {
-      await apiFetch(`/api/admin/cup/participants/${slot}`, { method: 'DELETE' });
+      const draft: CupTournament = JSON.parse(JSON.stringify(cup)) as CupTournament;
+      const participant = draft.participants.find((p) => p.slot === slot);
+      if (!participant) throw new Error('Cupo no encontrado.');
+      participant.teamId = undefined;
+      participant.teamName = `Cupo Libre #${slot}`;
+      participant.memberName = 'Por definir';
+      participant.crestUrl = '';
+      for (const m of draft.matches) {
+        if (m.round !== 'r16') {
+          if (m.homeSlot === slot) m.homeSlot = null;
+          if (m.awaySlot === slot) m.awaySlot = null;
+        }
+        if (m.winnerSlot === slot) {
+          m.winnerSlot = null;
+          m.played = false;
+        }
+      }
+      if (draft.championSlot === slot) {
+        draft.championSlot = null;
+        draft.championTeamName = '';
+        draft.championMemberName = '';
+        draft.championCrestUrl = '';
+        draft.status = 'in_progress';
+      }
+      await saveCupFirestore(draft, teams, matches, `Liberar cupo #${slot}`);
       await refreshAndBroadcast();
       showOk(`Participante quitado del cupo #${slot}.`);
     } catch (err) {
@@ -789,10 +867,25 @@ export function AdminCupPanel({
   const handleSwapParticipants = async (slotA: number, slotB: number) => {
     setMsg(null);
     try {
-      await apiFetch('/api/admin/cup/participants/swap', {
-        method: 'POST',
-        body: JSON.stringify({ slotA, slotB }),
-      });
+      const draft: CupTournament = JSON.parse(JSON.stringify(cup)) as CupTournament;
+      const pA = draft.participants.find((p) => p.slot === slotA);
+      const pB = draft.participants.find((p) => p.slot === slotB);
+      if (!pA || !pB) throw new Error('Cupo no encontrado.');
+      const temp = {
+        teamId: pA.teamId,
+        teamName: pA.teamName,
+        memberName: pA.memberName,
+        crestUrl: pA.crestUrl,
+      };
+      pA.teamId = pB.teamId;
+      pA.teamName = pB.teamName;
+      pA.memberName = pB.memberName;
+      pA.crestUrl = pB.crestUrl;
+      pB.teamId = temp.teamId;
+      pB.teamName = temp.teamName;
+      pB.memberName = temp.memberName;
+      pB.crestUrl = temp.crestUrl;
+      await saveCupFirestore(draft, teams, matches, 'Intercambiar cupos de Copa');
       await refreshAndBroadcast();
       showOk(`Se intercambiaron los puestos #${slotA} y #${slotB}.`);
     } catch (err) {
@@ -803,10 +896,13 @@ export function AdminCupPanel({
   const handleSaveMatch = async (matchId: string, body: Record<string, unknown>) => {
     setMsg(null);
     try {
-      await apiFetch(`/api/admin/cup/matches/${encodeURIComponent(matchId)}`, {
-        method: 'PUT',
-        body: JSON.stringify(body),
-      });
+      await updateCupMatchNodeFirestore(
+        cup,
+        matchId,
+        body as Parameters<typeof updateCupMatchNodeFirestore>[2],
+        teams,
+        matches
+      );
       await refreshAndBroadcast();
       showOk('Llave guardada y ganador avanzado automáticamente a la siguiente ronda.');
     } catch (err) {
@@ -817,10 +913,7 @@ export function AdminCupPanel({
   const handlePullLeagueLeader = async () => {
     setMsg(null);
     try {
-      await apiFetch('/api/admin/cup/recopa', {
-        method: 'PUT',
-        body: JSON.stringify({ pullLeagueLeader: true }),
-      });
+      await updateCupRecopaFirestore(cup, { pullLeagueLeader: true }, teams, matches);
       await refreshAndBroadcast();
       showOk('Campeón actual de la Liga (#1 de Tabla de Posiciones) cargado en la Recopa.');
     } catch (err) {
@@ -834,9 +927,9 @@ export function AdminCupPanel({
     try {
       const selectedSide =
         overrideSide !== undefined ? overrideSide : grandChampSide ? grandChampSide : undefined;
-      await apiFetch('/api/admin/cup/recopa', {
-        method: 'PUT',
-        body: JSON.stringify({
+      await updateCupRecopaFirestore(
+        cup,
+        {
           leagueChampionName: leagueChampName.trim(),
           leagueChampionMember: leagueChampMember.trim(),
           leagueChampionCrestUrl: leagueChampCrest,
@@ -852,8 +945,10 @@ export function AdminCupPanel({
           scheduledDate: recopaDate.trim(),
           scheduledTime: recopaTime.trim(),
           ...(selectedSide !== undefined ? { grandChampionSide: selectedSide } : {}),
-        }),
-      });
+        },
+        teams,
+        matches
+      );
       await refreshAndBroadcast();
       showOk('Final de Recopa y felicitación al Gran Campeón actualizadas.');
     } catch (err) {
@@ -868,12 +963,12 @@ export function AdminCupPanel({
     setMsg(null);
     setSavingRecopa(true);
     try {
-      await apiFetch('/api/admin/cup/recopa', {
-        method: 'PUT',
-        body: JSON.stringify(
-          side === 'league' ? { leagueTeamId: teamId } : { cupTeamId: teamId }
-        ),
-      });
+      await updateCupRecopaFirestore(
+        cup,
+        side === 'league' ? { leagueTeamId: teamId } : { cupTeamId: teamId },
+        teams,
+        matches
+      );
       await refreshAndBroadcast();
       showOk('Equipo de Liga agregado a la Recopa.');
     } catch (err) {
@@ -887,10 +982,12 @@ export function AdminCupPanel({
     setMsg(null);
     setSavingRecopa(true);
     try {
-      await apiFetch('/api/admin/cup/recopa', {
-        method: 'PUT',
-        body: JSON.stringify(side === 'league' ? { clearLeague: true } : { clearCup: true }),
-      });
+      await updateCupRecopaFirestore(
+        cup,
+        side === 'league' ? { clearLeague: true } : { clearCup: true },
+        teams,
+        matches
+      );
       await refreshAndBroadcast();
       showOk('Equipo quitado de la Recopa.');
     } catch (err) {
@@ -909,12 +1006,9 @@ export function AdminCupPanel({
     setMsg(null);
     setResetting(true);
     try {
-      await apiFetch('/api/admin/cup/reset', {
-        method: 'POST',
-        body: JSON.stringify({
-          clearParticipants: clearParticipantsOnReset,
-          editionName: nextEditionName.trim(),
-        }),
+      await resetCupFirestore(cup, teams, false, matches, {
+        clearParticipants: clearParticipantsOnReset,
+        editionName: nextEditionName.trim(),
       });
       setConfirmReset(false);
       await refreshAndBroadcast();
@@ -933,41 +1027,38 @@ export function AdminCupPanel({
   ) => {
     setMsg(null);
     try {
-      const targetMatch = cup.matches.find((m) => m.id === matchId);
+      const draft: CupTournament = JSON.parse(JSON.stringify(cup)) as CupTournament;
+      const targetMatch = draft.matches.find((m) => m.id === matchId);
       const foundTeam = teams.find((t) => t.id === teamId);
       if (!targetMatch || !foundTeam) return;
 
-      // Determine target participant slot (1..16)
       let targetSlot = side === 'home' ? targetMatch.homeSlot : targetMatch.awaySlot;
       if (!targetSlot) {
         if (targetMatch.round === 'r16') {
           targetSlot = (targetMatch.matchIndex - 1) * 2 + (side === 'home' ? 1 : 2);
         } else {
-          // Reuse existing slot of this team if already in cup, else first empty slot
-          const existing = cup.participants.find((p) => p.teamId === teamId);
-          const free = cup.participants.find(
+          const existing = draft.participants.find((p) => p.teamId === teamId);
+          const free = draft.participants.find(
             (p) => !p.teamId && (p.teamName.startsWith('Cupo Libre') || p.teamName === 'Por definir')
           );
           targetSlot = existing?.slot || free?.slot || 1;
         }
       }
 
-      const form = new FormData();
-      form.append('teamId', foundTeam.id);
-      form.append('teamName', foundTeam.name);
-      form.append('memberName', foundTeam.memberName);
-      form.append('crestUrl', foundTeam.crestUrl);
-      await apiFetch(`/api/admin/cup/participants/${targetSlot}`, { method: 'PUT', body: form });
-
-      if (targetMatch.round !== 'r16') {
-        await apiFetch(`/api/admin/cup/matches/${encodeURIComponent(matchId)}`, {
-          method: 'PUT',
-          body: JSON.stringify(
-            side === 'home' ? { homeSlot: targetSlot } : { awaySlot: targetSlot }
-          ),
-        });
+      const part = draft.participants.find((p) => p.slot === targetSlot);
+      if (part) {
+        part.teamId = foundTeam.id;
+        part.teamName = foundTeam.name;
+        part.memberName = foundTeam.memberName;
+        part.crestUrl = foundTeam.crestUrl;
       }
 
+      if (targetMatch.round !== 'r16') {
+        if (side === 'home') targetMatch.homeSlot = targetSlot;
+        else targetMatch.awaySlot = targetSlot;
+      }
+
+      await saveCupFirestore(draft, teams, matches, 'Asignar equipo a llave');
       await refreshAndBroadcast();
       showOk(`${foundTeam.name} colocado en la llave correctamente.`);
     } catch (err) {
@@ -990,21 +1081,17 @@ export function AdminCupPanel({
         const computedTargetSlot =
           (targetMatch.matchIndex - 1) * 2 + (targetSide === 'home' ? 1 : 2);
         if (computedTargetSlot === sourceSlot) return;
-        await apiFetch('/api/admin/cup/participants/swap', {
-          method: 'POST',
-          body: JSON.stringify({ slotA: sourceSlot, slotB: computedTargetSlot }),
-        });
-        await refreshAndBroadcast();
-        showOk(`Equipo movido del puesto #${sourceSlot} al #${computedTargetSlot}.`);
+        await handleSwapParticipants(sourceSlot, computedTargetSlot);
         return;
       }
 
-      await apiFetch(`/api/admin/cup/matches/${encodeURIComponent(targetMatchId)}`, {
-        method: 'PUT',
-        body: JSON.stringify(
-          targetSide === 'home' ? { homeSlot: sourceSlot } : { awaySlot: sourceSlot }
-        ),
-      });
+      await updateCupMatchNodeFirestore(
+        cup,
+        targetMatchId,
+        targetSide === 'home' ? { homeSlot: sourceSlot } : { awaySlot: sourceSlot },
+        teams,
+        matches
+      );
       await refreshAndBroadcast();
       showOk('Equipo asignado a la llave.');
     } catch (err) {
@@ -1022,15 +1109,18 @@ export function AdminCupPanel({
       const targetMatch = cup.matches.find((m) => m.id === matchId);
       if (!targetMatch) return;
       if (targetMatch.round === 'r16' && slot) {
-        await apiFetch(`/api/admin/cup/participants/${slot}`, { method: 'DELETE' });
+        await handleRemoveParticipant(slot);
       } else {
-        await apiFetch(`/api/admin/cup/matches/${encodeURIComponent(matchId)}`, {
-          method: 'PUT',
-          body: JSON.stringify(side === 'home' ? { homeSlot: null } : { awaySlot: null }),
-        });
+        await updateCupMatchNodeFirestore(
+          cup,
+          matchId,
+          side === 'home' ? { homeSlot: null } : { awaySlot: null },
+          teams,
+          matches
+        );
+        await refreshAndBroadcast();
+        showOk('Equipo eliminado de la llave.');
       }
-      await refreshAndBroadcast();
-      showOk('Equipo eliminado de la llave.');
     } catch (err) {
       showErr(err);
     }
@@ -1348,6 +1438,8 @@ export function AdminCupPanel({
       {showLiveBracket && (
         <CupBracketCard
           cup={cup}
+          teams={teams}
+          matches={matches}
           isAdmin
           embeddedPreview
           onEditCup={() => setSection('r16')}

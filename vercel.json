@@ -1,0 +1,23 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "buildCommand": "npm run build",
+  "outputDirectory": "dist",
+  "functions": {
+    "api/index.ts": {
+      "includeFiles": "{data/**,firebase-applet-config.json}",
+      "maxDuration": 30
+    }
+  },
+  "rewrites": [
+    { "source": "/api/(.*)", "destination": "/api/index" },
+    { "source": "/uploads/(.*)", "destination": "/api/index" },
+    { "source": "/default-assets/(.*)", "destination": "/api/index" },
+    { "source": "/LMA-pes6-ai-studio/api/(.*)", "destination": "/api/index" },
+    { "source": "/LMA-pes6-ai-studio/uploads/(.*)", "destination": "/api/index" },
+    { "source": "/LMA-pes6-ai-studio/default-assets/(.*)", "destination": "/api/index" },
+    {
+      "source": "/((?!assets/|api/|uploads/|default-assets/|manifest\\.json|sw\\.js|workbox-.*|pwa-.*|apple-touch-icon\\.png|favicon\\.ico|static-bootstrap\\.json).*)",
+      "destination": "/index.html"
+    }
+  ]
+}

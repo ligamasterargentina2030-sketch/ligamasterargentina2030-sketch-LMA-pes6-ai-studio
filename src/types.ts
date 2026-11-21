@@ -18,6 +18,8 @@ export interface CommunityVideo {
   fechaLabel: string;
 }
 
+export type CustomTitles = Record<string, string>;
+
 export interface LeagueSettings {
   title: string;
   subtitle: string;
@@ -35,6 +37,10 @@ export interface LeagueSettings {
   radioName?: string;
   radioStreamUrl?: string;
   maxTeams: number;
+  ligaTrophyUrl?: string;
+  copaTrophyUrl?: string;
+  recopaTrophyUrl?: string;
+  customTitles?: CustomTitles;
 }
 
 export type ModerationStatus = 'pending' | 'approved' | 'rejected';
@@ -76,7 +82,11 @@ export interface Team {
   accountStatus?: AccountStatus;
   hasPassword?: boolean;
   credentialsUpdatedAt?: string;
+  primaryColor?: string;
+  secondaryColor?: string;
+  ownerUid?: string;
   createdAt: string;
+  updatedAt?: string;
 }
 
 export interface PublicTeam {
@@ -93,7 +103,11 @@ export interface PublicTeam {
   celebrationStatus?: ModerationStatus;
   celebrationUploadedAt?: string;
   accountStatus?: AccountStatus;
+  primaryColor?: string;
+  secondaryColor?: string;
+  ownerUid?: string;
   createdAt: string;
+  updatedAt?: string;
 }
 
 export type MatchStatus = 'pending' | 'validated' | 'rejected';
@@ -121,9 +135,11 @@ export interface Match {
   fixtureId?: string;
   submittedByTeamId: string;
   submittedByName: string;
+  submittedByUid?: string;
   status: MatchStatus;
   validatedAt?: string;
   createdAt: string;
+  updatedAt?: string;
 }
 
 export interface ScheduledFixture {
@@ -168,6 +184,7 @@ export interface Claim {
   matchId?: string;
   reporterTeamId: string;
   reporterName: string;
+  reporterUid?: string;
   accusedTeamId?: string;
   accusedTeamName?: string;
   reasonType: ClaimReasonType;
@@ -179,6 +196,7 @@ export interface Claim {
   adminResolutionNote?: string;
   resolvedAt?: string;
   createdAt: string;
+  updatedAt?: string;
 }
 
 export interface GalleryVideo {
@@ -331,6 +349,9 @@ export interface AuthUser {
   id: string;
   displayName: string;
   teamId?: string;
+  uid?: string;
+  email?: string;
+  firebaseAuthenticated?: boolean;
 }
 
 export interface NewsPost {
@@ -350,6 +371,7 @@ export interface NewsPost {
   celebrationImageUrl?: string;
   sourceKey?: string;
   createdAt: string;
+  updatedAt?: string;
 }
 
 export interface TopGoalItem {
@@ -361,6 +383,7 @@ export interface TopGoalItem {
   videoUrl: string;
   sourceVideoId?: string;
   createdAt: string;
+  updatedAt?: string;
 }
 
 export interface LeagueComment {
@@ -368,9 +391,11 @@ export interface LeagueComment {
   authorName: string;
   authorTeamName?: string;
   authorTeamId?: string;
+  authorUid?: string;
   message: string;
   status: 'pending' | 'approved';
   createdAt: string;
+  updatedAt?: string;
 }
 
 export type CredentialAuditAction =
@@ -381,12 +406,15 @@ export type CredentialAuditAction =
   | 'activate_participant'
   | 'delete_participant'
   | 'update_admin_credentials'
-  | 'admin_firebase_password_reset';
+  | 'admin_firebase_password_reset'
+  | 'assign_member_email'
+  | 'create_backup'
+  | 'restore_backup';
 
 export interface CredentialAuditEntry {
   id: string;
   action: CredentialAuditAction;
-  targetType: 'participant' | 'admin';
+  targetType: 'participant' | 'admin' | 'backup';
   targetId: string;
   targetLabel: string;
   details: string;
@@ -394,11 +422,50 @@ export interface CredentialAuditEntry {
   createdAt: string;
 }
 
+export interface MemberInvite {
+  email: string;
+  teamId: string;
+  status: 'active' | 'revoked';
+  createdAt: string;
+}
+
+export interface BackupSummary {
+  teamsCount: number;
+  matchesCount: number;
+  fixturesCount: number;
+  calendarEventsCount: number;
+  newsCount: number;
+  claimsCount: number;
+  commentsCount: number;
+  championsCount: number;
+  musicCount: number;
+  videosCount: number;
+  communityVideosCount: number;
+  topGoalsCount: number;
+}
+
+export interface LeagueBackupRecord {
+  id: string;
+  label: string;
+  trigger: 'auto_daily' | 'manual' | 'pre_restore' | 'initial_migration';
+  createdByEmail?: string;
+  summary: BackupSummary;
+  snapshot: Record<string, unknown>;
+  createdAt: string;
+}
+
+export interface SaveConfirmationStatus {
+  state: 'idle' | 'saving' | 'saved' | 'error';
+  message: string;
+  timestamp?: number;
+}
+
 export interface LeagueBootstrap {
   settings: LeagueSettings;
   teams: PublicTeam[];
   adminTeams?: Team[];
   credentialAuditLog?: CredentialAuditEntry[];
+  memberInvites?: MemberInvite[];
   matches: Match[];
   fixtures: ScheduledFixture[];
   calendarEvents: CalendarEvent[];

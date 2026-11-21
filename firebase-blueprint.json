@@ -1,0 +1,556 @@
+{
+  "entities": {
+    "LeagueSettings": {
+      "title": "LeagueSettings",
+      "description": "Public league configuration, branding, radio stream, featured video, and page like counter.",
+      "type": "object",
+      "properties": {
+        "title": { "type": "string", "minLength": 1, "maxLength": 140 },
+        "subtitle": { "type": "string", "maxLength": 160 },
+        "description": { "type": "string", "maxLength": 1200 },
+        "calendarMessage": { "type": "string", "maxLength": 600 },
+        "bannerText": { "type": "string", "maxLength": 200 },
+        "crestUrl": { "type": "string", "maxLength": 500 },
+        "coverUrl": { "type": "string", "maxLength": 500 },
+        "backgroundUrl": { "type": "string", "maxLength": 500 },
+        "faviconUrl": { "type": "string", "maxLength": 500 },
+        "adminId": { "type": "string", "minLength": 2, "maxLength": 32, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "adminTeamId": { "type": "string", "maxLength": 32, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "featuredVideo": { "type": "object" },
+        "radioName": { "type": "string", "maxLength": 140 },
+        "radioStreamUrl": { "type": "string", "maxLength": 500 },
+        "maxTeams": { "type": "number" },
+        "pageLikes": { "type": "number" },
+        "ligaTrophyUrl": { "type": "string", "maxLength": 500 },
+        "copaTrophyUrl": { "type": "string", "maxLength": 500 },
+        "recopaTrophyUrl": { "type": "string", "maxLength": 500 },
+        "customTitles": { "type": "object" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["title", "adminId", "maxTeams", "pageLikes"]
+    },
+    "LeaguePrivateConfig": {
+      "title": "LeaguePrivateConfig",
+      "description": "Private admin-only configuration including hashed credentials and recovery email.",
+      "type": "object",
+      "properties": {
+        "adminId": { "type": "string", "minLength": 2, "maxLength": 32, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "adminClaveHash": { "type": "string", "maxLength": 300 },
+        "adminTokenVersion": { "type": "number" },
+        "backupGmail": { "type": "string", "format": "email", "maxLength": 180 },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["adminId", "adminTokenVersion"]
+    },
+    "AdminAccount": {
+      "title": "AdminAccount",
+      "description": "Trusted administrator directory keyed by Firebase Auth UID.",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "email": { "type": "string", "format": "email", "maxLength": 180 },
+        "displayName": { "type": "string", "maxLength": 120 },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["uid", "email", "createdAt"]
+    },
+    "MemberLink": {
+      "title": "MemberLink",
+      "description": "Maps a verified Firebase Auth user UID to an official team participant ID.",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "teamId": { "type": "string", "minLength": 1, "maxLength": 32, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "email": { "type": "string", "format": "email", "maxLength": 180 },
+        "displayName": { "type": "string", "maxLength": 120 },
+        "status": { "type": "string", "enum": ["active", "blocked"] },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["uid", "teamId", "status", "createdAt"]
+    },
+    "Team": {
+      "title": "Team",
+      "description": "Participating club and member public profile.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "minLength": 1, "maxLength": 32, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "name": { "type": "string", "minLength": 1, "maxLength": 100 },
+        "memberName": { "type": "string", "minLength": 1, "maxLength": 100 },
+        "crestUrl": { "type": "string", "maxLength": 500 },
+        "bio": { "type": "string", "maxLength": 600 },
+        "likes": { "type": "number" },
+        "trophies": { "type": "array" },
+        "personalMusic": { "type": "array" },
+        "lastListenedTrack": { "type": "object" },
+        "celebrationImageUrl": { "type": "string", "maxLength": 500 },
+        "celebrationStatus": { "type": "string", "enum": ["pending", "approved", "rejected"] },
+        "celebrationUploadedAt": { "type": "string", "format": "date-time" },
+        "accountStatus": { "type": "string", "enum": ["active", "blocked"] },
+        "primaryColor": { "type": "string", "maxLength": 20 },
+        "secondaryColor": { "type": "string", "maxLength": 20 },
+        "ownerUid": { "type": "string", "maxLength": 128 },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "name", "memberName", "accountStatus", "createdAt"]
+    },
+    "TeamCredential": {
+      "title": "TeamCredential",
+      "description": "Admin-only scrypt password hashes and token versions for legacy ID+password login.",
+      "type": "object",
+      "properties": {
+        "teamId": { "type": "string", "minLength": 1, "maxLength": 32, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "claveHash": { "type": "string", "maxLength": 300 },
+        "tokenVersion": { "type": "number" },
+        "accountStatus": { "type": "string", "enum": ["active", "blocked"] },
+        "credentialsUpdatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["teamId", "tokenVersion", "accountStatus"]
+    },
+    "Match": {
+      "title": "Match",
+      "description": "League, Cup, or Recopa match result submitted by a member or admin.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "minLength": 1, "maxLength": 64, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "matchday": { "type": "number" },
+        "homeTeamId": { "type": "string", "minLength": 1, "maxLength": 32, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "awayTeamId": { "type": "string", "minLength": 1, "maxLength": 32, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "homeGoals": { "type": "number" },
+        "awayGoals": { "type": "number" },
+        "leg": { "type": "string", "enum": ["Ida", "Vuelta"] },
+        "competitionType": { "type": "string", "enum": ["liga", "copa", "recopa"] },
+        "cupMatchId": { "type": "string", "maxLength": 64 },
+        "homePenalties": { "type": "number" },
+        "awayPenalties": { "type": "number" },
+        "extraTime": { "type": "boolean" },
+        "playedAt": { "type": "string", "maxLength": 40 },
+        "notes": { "type": "string", "maxLength": 600 },
+        "proofImageUrl": { "type": "string", "maxLength": 500 },
+        "proofImageStatus": { "type": "string", "enum": ["pending", "approved", "rejected"] },
+        "scorerImageUrl": { "type": "string", "maxLength": 500 },
+        "scorerName": { "type": "string", "maxLength": 100 },
+        "scorerImageStatus": { "type": "string", "enum": ["pending", "approved", "rejected"] },
+        "fixtureId": { "type": "string", "maxLength": 64 },
+        "submittedByTeamId": { "type": "string", "maxLength": 32 },
+        "submittedByName": { "type": "string", "maxLength": 100 },
+        "submittedByUid": { "type": "string", "maxLength": 128 },
+        "status": { "type": "string", "enum": ["pending", "validated", "rejected"] },
+        "validatedAt": { "type": "string", "format": "date-time" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "matchday", "homeTeamId", "awayTeamId", "homeGoals", "awayGoals", "leg", "playedAt", "submittedByTeamId", "submittedByName", "status", "createdAt"]
+    },
+    "ScheduledFixture": {
+      "title": "ScheduledFixture",
+      "description": "Scheduled league fixture created by admin.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "minLength": 1, "maxLength": 64, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "matchday": { "type": "number" },
+        "homeTeamId": { "type": "string", "minLength": 1, "maxLength": 32 },
+        "awayTeamId": { "type": "string", "minLength": 1, "maxLength": 32 },
+        "leg": { "type": "string", "enum": ["Ida", "Vuelta"] },
+        "scheduledDate": { "type": "string", "maxLength": 20 },
+        "scheduledTime": { "type": "string", "maxLength": 20 },
+        "notes": { "type": "string", "maxLength": 500 },
+        "completedMatchId": { "type": "string", "maxLength": 64 },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "matchday", "homeTeamId", "awayTeamId", "leg", "createdAt"]
+    },
+    "CalendarEvent": {
+      "title": "CalendarEvent",
+      "description": "Scheduled league, cup, recopa, or special event on the calendar.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "minLength": 1, "maxLength": 64, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "title": { "type": "string", "minLength": 1, "maxLength": 160 },
+        "category": { "type": "string", "enum": ["copa", "liga", "recopa", "evento"] },
+        "date": { "type": "string", "minLength": 8, "maxLength": 20 },
+        "time": { "type": "string", "minLength": 4, "maxLength": 10 },
+        "roundLabel": { "type": "string", "maxLength": 100 },
+        "cupMatchId": { "type": "string", "maxLength": 64 },
+        "fixtureId": { "type": "string", "maxLength": 64 },
+        "homeTeamId": { "type": "string", "maxLength": 32 },
+        "awayTeamId": { "type": "string", "maxLength": 32 },
+        "homeTeamName": { "type": "string", "maxLength": 100 },
+        "awayTeamName": { "type": "string", "maxLength": 100 },
+        "homeCrestUrl": { "type": "string", "maxLength": 500 },
+        "awayCrestUrl": { "type": "string", "maxLength": 500 },
+        "notes": { "type": "string", "maxLength": 600 },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "title", "category", "date", "time", "createdAt"]
+    },
+    "Claim": {
+      "title": "Claim",
+      "description": "Member disciplinary or match rule claim.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "minLength": 1, "maxLength": 64, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "matchId": { "type": "string", "maxLength": 64 },
+        "reporterTeamId": { "type": "string", "minLength": 1, "maxLength": 32 },
+        "reporterName": { "type": "string", "minLength": 1, "maxLength": 100 },
+        "reporterUid": { "type": "string", "maxLength": 128 },
+        "accusedTeamId": { "type": "string", "maxLength": 32 },
+        "accusedTeamName": { "type": "string", "maxLength": 100 },
+        "reasonType": { "type": "string", "enum": ["juego_sucio", "gol_prohibido", "otro"] },
+        "description": { "type": "string", "minLength": 1, "maxLength": 1200 },
+        "cardPhotoUrl": { "type": "string", "maxLength": 500 },
+        "cardPhotoStatus": { "type": "string", "enum": ["pending", "approved", "rejected"] },
+        "videoUrl": { "type": "string", "maxLength": 500 },
+        "status": { "type": "string", "enum": ["pending", "valid_match", "invalid_match", "dismissed"] },
+        "adminResolutionNote": { "type": "string", "maxLength": 600 },
+        "resolvedAt": { "type": "string", "format": "date-time" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "reporterTeamId", "reporterName", "reasonType", "description", "status", "createdAt"]
+    },
+    "NewsPost": {
+      "title": "NewsPost",
+      "description": "Official league announcement or champion newspaper item.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "minLength": 1, "maxLength": 80, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "title": { "type": "string", "minLength": 1, "maxLength": 200 },
+        "content": { "type": "string", "minLength": 1, "maxLength": 4000 },
+        "textColor": { "type": "string", "maxLength": 30 },
+        "imageUrl": { "type": "string", "maxLength": 500 },
+        "videoUrl": { "type": "string", "maxLength": 500 },
+        "likes": { "type": "number" },
+        "isChampionNewspaper": { "type": "boolean" },
+        "championTeamName": { "type": "string", "maxLength": 120 },
+        "championMemberName": { "type": "string", "maxLength": 120 },
+        "championCrestUrl": { "type": "string", "maxLength": 500 },
+        "championTournament": { "type": "string", "maxLength": 120 },
+        "championSeason": { "type": "string", "maxLength": 120 },
+        "celebrationImageUrl": { "type": "string", "maxLength": 500 },
+        "sourceKey": { "type": "string", "maxLength": 120 },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "title", "content", "textColor", "createdAt"]
+    },
+    "TopGoal": {
+      "title": "TopGoal",
+      "description": "Admin-curated Top 5 best goals entry.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "minLength": 1, "maxLength": 64, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "rank": { "type": "number" },
+        "title": { "type": "string", "minLength": 1, "maxLength": 160 },
+        "scorerName": { "type": "string", "maxLength": 100 },
+        "author": { "type": "string", "maxLength": 100 },
+        "videoUrl": { "type": "string", "minLength": 1, "maxLength": 500 },
+        "sourceVideoId": { "type": "string", "maxLength": 80 },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "rank", "title", "videoUrl", "createdAt"]
+    },
+    "LeagueComment": {
+      "title": "LeagueComment",
+      "description": "Community comment awaiting or holding admin approval.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "minLength": 1, "maxLength": 64, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "authorName": { "type": "string", "minLength": 1, "maxLength": 100 },
+        "authorTeamName": { "type": "string", "maxLength": 100 },
+        "authorTeamId": { "type": "string", "maxLength": 32 },
+        "authorUid": { "type": "string", "maxLength": 128 },
+        "message": { "type": "string", "minLength": 1, "maxLength": 800 },
+        "status": { "type": "string", "enum": ["pending", "approved"] },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "authorName", "message", "status", "createdAt"]
+    },
+    "ChampionEntry": {
+      "title": "ChampionEntry",
+      "description": "Historical champion record in Hall of Champions.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "minLength": 1, "maxLength": 64, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "season": { "type": "string", "minLength": 1, "maxLength": 140 },
+        "teamName": { "type": "string", "minLength": 1, "maxLength": 120 },
+        "memberName": { "type": "string", "minLength": 1, "maxLength": 120 },
+        "teamId": { "type": "string", "maxLength": 32 },
+        "tournamentType": { "type": "string", "enum": ["liga", "copa", "recopa"] },
+        "notes": { "type": "string", "maxLength": 600 },
+        "celebrationImageUrl": { "type": "string", "maxLength": 500 },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "season", "teamName", "memberName", "celebrationImageUrl", "createdAt"]
+    },
+    "RulesConfig": {
+      "title": "RulesConfig",
+      "description": "Official league and cup rules configuration.",
+      "type": "object",
+      "properties": {
+        "prohibitedRules": { "type": "array" },
+        "generalNotes": { "type": "string", "maxLength": 2000 },
+        "gameMode": { "type": "object" },
+        "cupRules": { "type": "object" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["prohibitedRules", "generalNotes", "gameMode"]
+    },
+    "CupTournament": {
+      "title": "CupTournament",
+      "description": "Cup bracket and Recopa state.",
+      "type": "object",
+      "properties": {
+        "editionNumber": { "type": "number" },
+        "editionName": { "type": "string", "minLength": 1, "maxLength": 160 },
+        "status": { "type": "string", "enum": ["in_progress", "finished"] },
+        "participants": { "type": "array" },
+        "matches": { "type": "array" },
+        "championSlot": { "type": "number" },
+        "championTeamName": { "type": "string", "maxLength": 120 },
+        "championMemberName": { "type": "string", "maxLength": 120 },
+        "championCrestUrl": { "type": "string", "maxLength": 500 },
+        "championGreeting": { "type": "string", "maxLength": 400 },
+        "recopa": { "type": "object" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["editionNumber", "editionName", "status", "participants", "matches", "recopa", "updatedAt"]
+    },
+    "MusicTrack": {
+      "title": "MusicTrack",
+      "description": "Official league soundtrack entry.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "minLength": 1, "maxLength": 64, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "title": { "type": "string", "minLength": 1, "maxLength": 160 },
+        "artist": { "type": "string", "minLength": 1, "maxLength": 120 },
+        "audioUrl": { "type": "string", "minLength": 1, "maxLength": 500 },
+        "coverUrl": { "type": "string", "maxLength": 500 },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "title", "artist", "audioUrl", "createdAt"]
+    },
+    "GalleryVideo": {
+      "title": "GalleryVideo",
+      "description": "Official admin-managed video entry.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "minLength": 1, "maxLength": 64, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "title": { "type": "string", "minLength": 1, "maxLength": 160 },
+        "description": { "type": "string", "maxLength": 600 },
+        "videoUrl": { "type": "string", "minLength": 1, "maxLength": 500 },
+        "downloadUrl": { "type": "string", "maxLength": 500 },
+        "imagekitFileId": { "type": "string", "maxLength": 128 },
+        "originalFormat": { "type": "string", "enum": ["MP4", "AVI"] },
+        "uploadedBy": { "type": "string", "maxLength": 120 },
+        "featured": { "type": "boolean" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "title", "videoUrl", "originalFormat", "uploadedBy", "createdAt"]
+    },
+    "CommunityVideo": {
+      "title": "CommunityVideo",
+      "description": "Community-uploaded MP4 video via Uploadcare.",
+      "type": "object",
+      "properties": {
+        "titulo": { "type": "string", "minLength": 1, "maxLength": 160 },
+        "autor": { "type": "string", "minLength": 1, "maxLength": 120 },
+        "videoUrl": { "type": "string", "minLength": 1, "maxLength": 500 },
+        "authorUid": { "type": "string", "maxLength": 128 },
+        "fecha": { "type": "string", "format": "date-time" },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["titulo", "autor", "videoUrl"]
+    },
+    "UserLike": {
+      "title": "UserLike",
+      "description": "Per-user atomic like marker preventing duplicate likes.",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "targetType": { "type": "string", "enum": ["page", "team", "news"] },
+        "targetId": { "type": "string", "minLength": 1, "maxLength": 80 },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["uid", "targetType", "targetId", "createdAt"]
+    },
+    "UserPreference": {
+      "title": "UserPreference",
+      "description": "Persistent user preference document replacing browser localStorage.",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "musicMode": { "type": "string", "enum": ["league", "personal"] },
+        "penaltyBestScore": { "type": "number" },
+        "personalMusic": { "type": "array" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["uid", "musicMode"]
+    },
+    "LeagueBackup": {
+      "title": "LeagueBackup",
+      "description": "Admin-only periodic or manual full league backup snapshot.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "minLength": 1, "maxLength": 80, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "label": { "type": "string", "minLength": 1, "maxLength": 160 },
+        "trigger": { "type": "string", "enum": ["auto_daily", "manual", "pre_restore", "initial_migration"] },
+        "createdByEmail": { "type": "string", "maxLength": 180 },
+        "summary": { "type": "object" },
+        "snapshot": { "type": "object" },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "label", "trigger", "summary", "snapshot", "createdAt"]
+    },
+    "CredentialAudit": {
+      "title": "CredentialAudit",
+      "description": "Admin-only credential & backup audit trail entry.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "minLength": 1, "maxLength": 80 },
+        "action": { "type": "string", "maxLength": 64 },
+        "targetType": { "type": "string", "enum": ["participant", "admin", "backup"] },
+        "targetId": { "type": "string", "maxLength": 64 },
+        "targetLabel": { "type": "string", "maxLength": 140 },
+        "details": { "type": "string", "maxLength": 600 },
+        "performedBy": { "type": "string", "maxLength": 120 },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "action", "targetType", "targetId", "details", "performedBy", "createdAt"]
+    },
+    "MemberInvite": {
+      "title": "MemberInvite",
+      "description": "Admin-assigned Google email invitation mapping a verified email to a specific teamId.",
+      "type": "object",
+      "properties": {
+        "email": { "type": "string", "format": "email", "maxLength": 180 },
+        "teamId": { "type": "string", "minLength": 1, "maxLength": 32, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "status": { "type": "string", "enum": ["active", "revoked"] },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["email", "teamId", "status", "createdAt"]
+    },
+    "BootstrapMeta": {
+      "title": "BootstrapMeta",
+      "description": "Idempotent migration marker preventing re-seeding or overwriting existing DB.",
+      "type": "object",
+      "properties": {
+        "version": { "type": "number" },
+        "source": { "type": "string", "maxLength": 100 },
+        "migratedAt": { "type": "string", "format": "date-time" },
+        "migratedByEmail": { "type": "string", "maxLength": 180 }
+      },
+      "required": ["version", "source", "migratedAt"]
+    }
+  },
+  "firestore": {
+    "/league_settings/{docId}": {
+      "schema": { "$ref": "#/entities/LeagueSettings" },
+      "description": "Public global league configuration and page like counter."
+    },
+    "/league_private/{docId}": {
+      "schema": { "$ref": "#/entities/LeaguePrivateConfig" },
+      "description": "Admin-only private settings and credentials."
+    },
+    "/admins/{uid}": {
+      "schema": { "$ref": "#/entities/AdminAccount" },
+      "description": "Trusted administrator directory."
+    },
+    "/member_invites/{email}": {
+      "schema": { "$ref": "#/entities/MemberInvite" },
+      "description": "Admin-authorized member email to teamId invitations."
+    },
+    "/members/{uid}": {
+      "schema": { "$ref": "#/entities/MemberLink" },
+      "description": "Verified Firebase user to participating team mapping."
+    },
+    "/teams/{teamId}": {
+      "schema": { "$ref": "#/entities/Team" },
+      "description": "Participating teams public profiles."
+    },
+    "/team_credentials/{teamId}": {
+      "schema": { "$ref": "#/entities/TeamCredential" },
+      "description": "Admin-only member login hashes and account status."
+    },
+    "/matches/{matchId}": {
+      "schema": { "$ref": "#/entities/Match" },
+      "description": "League, Cup, and Recopa match results."
+    },
+    "/fixtures/{fixtureId}": {
+      "schema": { "$ref": "#/entities/ScheduledFixture" },
+      "description": "Scheduled league matchups."
+    },
+    "/calendar_events/{eventId}": {
+      "schema": { "$ref": "#/entities/CalendarEvent" },
+      "description": "Scheduled calendar items."
+    },
+    "/claims/{claimId}": {
+      "schema": { "$ref": "#/entities/Claim" },
+      "description": "Member disciplinary and rule claims."
+    },
+    "/news/{newsId}": {
+      "schema": { "$ref": "#/entities/NewsPost" },
+      "description": "League news and champion newspapers."
+    },
+    "/top_goals/{goalId}": {
+      "schema": { "$ref": "#/entities/TopGoal" },
+      "description": "Curated Top 5 best goals."
+    },
+    "/comments/{commentId}": {
+      "schema": { "$ref": "#/entities/LeagueComment" },
+      "description": "Community comments moderated by admin."
+    },
+    "/champions/{champId}": {
+      "schema": { "$ref": "#/entities/ChampionEntry" },
+      "description": "Historical champions gallery."
+    },
+    "/rules/{docId}": {
+      "schema": { "$ref": "#/entities/RulesConfig" },
+      "description": "Official league and cup rules."
+    },
+    "/cup/{docId}": {
+      "schema": { "$ref": "#/entities/CupTournament" },
+      "description": "Copa de la Liga bracket and Recopa state."
+    },
+    "/music/{trackId}": {
+      "schema": { "$ref": "#/entities/MusicTrack" },
+      "description": "Official league soundtrack tracks."
+    },
+    "/videos/{videoId}": {
+      "schema": { "$ref": "#/entities/GalleryVideo" },
+      "description": "Official admin-managed videos."
+    },
+    "/videos_comunidad/{videoId}": {
+      "schema": { "$ref": "#/entities/CommunityVideo" },
+      "description": "Community MP4 videos uploaded via Uploadcare."
+    },
+    "/likes/{likeId}": {
+      "schema": { "$ref": "#/entities/UserLike" },
+      "description": "Per-user atomic like records."
+    },
+    "/user_preferences/{uid}": {
+      "schema": { "$ref": "#/entities/UserPreference" },
+      "description": "User UI preferences stored in Firestore instead of localStorage."
+    },
+    "/backups/{backupId}": {
+      "schema": { "$ref": "#/entities/LeagueBackup" },
+      "description": "Admin-only database backups and restore snapshots."
+    },
+    "/audit_log/{entryId}": {
+      "schema": { "$ref": "#/entities/CredentialAudit" },
+      "description": "Admin-only security and credential audit trail."
+    },
+    "/league_meta/{docId}": {
+      "schema": { "$ref": "#/entities/BootstrapMeta" },
+      "description": "Migration and bootstrap state metadata."
+    }
+  }
+}

@@ -2,6 +2,7 @@ import express from 'express';
 import type { Request, Response, NextFunction } from 'express';
 import fs from 'node:fs';
 import http from 'node:http';
+import os from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { execFile } from 'node:child_process';
@@ -10,17 +11,33 @@ import multer from 'multer';
 import dotenv from 'dotenv';
 import ImageKit from 'imagekit';
 import { GoogleGenAI, Type } from '@google/genai';
+import {
+  getSupabasePublicObjectUrl,
+  getSupabaseServerUrl,
+  getSupabaseServiceRoleKey,
+  inferMimeTypeFromPath,
+  isSupabaseDbConfigured,
+  readLeagueDbFromSupabase,
+  uploadBufferToSupabaseStorage,
+  uploadFileToSupabaseStorage,
+  writeLeagueDbToSupabase,
+} from './src/server/supabaseBackend';
 
+dotenv.config({ path: path.resolve(process.cwd(), '.env.local') });
 dotenv.config();
 
 const execFileAsync = promisify(execFile);
 
+const IS_VERCEL =
+  process.env.VERCEL === '1' ||
+  Boolean(process.env.VERCEL_ENV || process.env.NOW_REGION);
 const PORT = Number(process.env.PORT) || 3000;
 const ROOT_DIR = process.cwd();
 const DATA_DIR = path.join(ROOT_DIR, 'data');
 const DB_PATH = path.join(DATA_DIR, 'league.json');
 const SECRET_PATH = path.join(DATA_DIR, 'secret.key');
 const UPLOADS_DIR = path.join(DATA_DIR, 'uploads');
+const TEMP_UPLOADS_DIR = IS_VERCEL ? path.join(os.tmpdir(), 'lma-pes6-uploads') : UPLOADS_DIR;
 
 const IMAGEKIT_PUBLIC_KEY =
   (process.env.IMAGEKIT_PUBLIC_KEY || 'public_XfHA7f8b6xGibDVHxIoMovZHMik=').trim();
@@ -58,13 +75,45 @@ function buildImageKitMp4Url(filePath?: string, rawUrl?: string): string {
 }
 
 const UPLOAD_SUBDIRS = ['crests', 'matches', 'videos', 'champions', 'music', 'site', 'claims', 'news'] as const;
-for (const dir of [
-  DATA_DIR,
-  UPLOADS_DIR,
-  ...UPLOAD_SUBDIRS.map((d) => path.join(UPLOADS_DIR, d)),
-  path.join(UPLOADS_DIR, 'music', 'covers'),
-]) {
-  fs.mkdirSync(dir, { recursive: true });
+const dirsToEnsure = [
+  ...(!IS_VERCEL ? [DATA_DIR, UPLOADS_DIR] : []),
+  TEMP_UPLOADS_DIR,
+  ...UPLOAD_SUBDIRS.map((d) => path.join(TEMP_UPLOADS_DIR, d)),
+  path.join(TEMP_UPLOADS_DIR, 'music', 'covers'),
+];
+for (const dir of dirsToEnsure) {
+  try {
+    fs.mkdirSync(dir, { recursive: true });
+  } catch {
+    // Ignore on read-only serverless filesystems; TEMP_UPLOADS_DIR in /tmp remains writable
+  }
+}
+
+function safeUnlink(filePath?: string | null): void {
+  if (!filePath) return;
+  try {
+    if (fs.existsSync(filePath)) {
+      fs.unlinkSync(filePath);
+    }
+  } catch {
+    // ignore cleanup failure
+  }
+}
+
+async function persistUploadedFile(
+  localFilePath: string,
+  subdir: (typeof UPLOAD_SUBDIRS)[number],
+  finalFilename: string,
+  mimeType?: string
+): Promise<string> {
+  if (isSupabaseDbConfigured()) {
+    try {
+      return await uploadFileToSupabaseStorage(localFilePath, subdir, finalFilename, mimeType);
+    } finally {
+      safeUnlink(localFilePath);
+    }
+  }
+  return `/uploads/${subdir}/${finalFilename}`;
 }
 
 interface FeaturedVideoSelection {
@@ -503,17 +552,33 @@ function getSecret(): string {
   if (envSecret) {
     return envSecret;
   }
-  try {
-    if (fs.existsSync(SECRET_PATH)) {
-      const existing = fs.readFileSync(SECRET_PATH, 'utf8').trim();
-      if (existing) return existing;
+  if (!IS_VERCEL) {
+    try {
+      if (fs.existsSync(SECRET_PATH)) {
+        const existing = fs.readFileSync(SECRET_PATH, 'utf8').trim();
+        if (existing) return existing;
+      }
+      const secret = crypto.randomBytes(32).toString('hex');
+      fs.writeFileSync(SECRET_PATH, secret, 'utf8');
+      return secret;
+    } catch {
+      // fall through to deterministic fallback
     }
-    const secret = crypto.randomBytes(32).toString('hex');
-    fs.writeFileSync(SECRET_PATH, secret, 'utf8');
-    return secret;
-  } catch {
-    return crypto.randomBytes(32).toString('hex');
   }
+  const deterministicSeed =
+    getSupabaseServiceRoleKey() ||
+    getSupabaseServerUrl() ||
+    process.env.VERCEL_PROJECT_PRODUCTION_URL ||
+    'liga-master-argentina-pes6-default-auth-seed';
+  if (IS_VERCEL) {
+    console.warn(
+      '⚠️ AUTH_SECRET no está configurada en las variables de entorno. Configurá AUTH_SECRET en Vercel para mayor seguridad.'
+    );
+  }
+  return crypto
+    .createHmac('sha256', 'lma-pes6-stable-auth-secret-v1')
+    .update(deterministicSeed)
+    .digest('hex');
 }
 
 const SERVER_SECRET = getSecret();
@@ -543,70 +608,71 @@ function verifyToken(token: string): TokenPayload | null {
 function ensureDefaultAnthemWav(): string {
   const filename = 'himno_estadio_pes6.wav';
   const filepath = path.join(UPLOADS_DIR, 'music', filename);
-  if (!fs.existsSync(filepath)) {
-    // Generate a warm, loopable 16-second stadium synth progression (44.1kHz 16-bit mono PCM WAV)
-    const sampleRate = 22050;
-    const durationSec = 16;
-    const numSamples = sampleRate * durationSec;
-    const dataSize = numSamples * 2;
-    const buffer = Buffer.alloc(44 + dataSize);
+  if (!IS_VERCEL && !fs.existsSync(filepath)) {
+    try {
+      // Generate a warm, loopable 16-second stadium synth progression (22.05kHz 16-bit mono PCM WAV)
+      const sampleRate = 22050;
+      const durationSec = 16;
+      const numSamples = sampleRate * durationSec;
+      const dataSize = numSamples * 2;
+      const buffer = Buffer.alloc(44 + dataSize);
 
-    buffer.write('RIFF', 0);
-    buffer.writeUInt32LE(36 + dataSize, 4);
-    buffer.write('WAVE', 8);
-    buffer.write('fmt ', 12);
-    buffer.writeUInt32LE(16, 16);
-    buffer.writeUInt16LE(1, 20);
-    buffer.writeUInt16LE(1, 22);
-    buffer.writeUInt32LE(sampleRate, 24);
-    buffer.writeUInt32LE(sampleRate * 2, 28);
-    buffer.writeUInt16LE(2, 32);
-    buffer.writeUInt16LE(16, 34);
-    buffer.write('data', 36);
-    buffer.writeUInt32LE(dataSize, 40);
+      buffer.write('RIFF', 0);
+      buffer.writeUInt32LE(36 + dataSize, 4);
+      buffer.write('WAVE', 8);
+      buffer.write('fmt ', 12);
+      buffer.writeUInt32LE(16, 16);
+      buffer.writeUInt16LE(1, 20);
+      buffer.writeUInt16LE(1, 22);
+      buffer.writeUInt32LE(sampleRate, 24);
+      buffer.writeUInt32LE(sampleRate * 2, 28);
+      buffer.writeUInt16LE(2, 32);
+      buffer.writeUInt16LE(16, 34);
+      buffer.write('data', 36);
+      buffer.writeUInt32LE(dataSize, 40);
 
-    // Classic Argentine stadium chant chord progression: C - G - Am - F (4s each)
-    const chords = [
-      [261.63, 329.63, 392.0],
-      [196.0, 246.94, 293.66],
-      [220.0, 261.63, 329.63],
-      [174.61, 220.0, 261.63],
-    ];
-    const leadMelody = [523.25, 587.33, 659.25, 523.25, 392.0, 440.0, 523.25, 392.0];
+      const chords = [
+        [261.63, 329.63, 392.0],
+        [196.0, 246.94, 293.66],
+        [220.0, 261.63, 329.63],
+        [174.61, 220.0, 261.63],
+      ];
+      const leadMelody = [523.25, 587.33, 659.25, 523.25, 392.0, 440.0, 523.25, 392.0];
 
-    for (let i = 0; i < numSamples; i++) {
-      const t = i / sampleRate;
-      const chordIdx = Math.floor(t / 4) % chords.length;
-      const chord = chords[chordIdx];
-      const beatTime = t % 0.5;
-      const pulse = Math.exp(-beatTime * 4.5);
-      const padEnv = 0.55 + 0.45 * Math.sin((Math.PI * (t % 4)) / 4);
+      for (let i = 0; i < numSamples; i++) {
+        const t = i / sampleRate;
+        const chordIdx = Math.floor(t / 4) % chords.length;
+        const chord = chords[chordIdx];
+        const beatTime = t % 0.5;
+        const pulse = Math.exp(-beatTime * 4.5);
+        const padEnv = 0.55 + 0.45 * Math.sin((Math.PI * (t % 4)) / 4);
 
-      let sample = 0;
-      for (const freq of chord) {
-        sample += Math.sin(2 * Math.PI * freq * t) * 0.14 * padEnv;
-        sample += Math.sin(2 * Math.PI * (freq * 0.5) * t) * 0.08 * pulse;
+        let sample = 0;
+        for (const freq of chord) {
+          sample += Math.sin(2 * Math.PI * freq * t) * 0.14 * padEnv;
+          sample += Math.sin(2 * Math.PI * (freq * 0.5) * t) * 0.08 * pulse;
+        }
+
+        const noteIdx = Math.floor(t / 2) % leadMelody.length;
+        const leadFreq = leadMelody[noteIdx];
+        const noteEnv = Math.exp(-(t % 2) * 1.4);
+        sample += Math.sin(2 * Math.PI * leadFreq * t) * 0.12 * noteEnv;
+
+        if (beatTime < 0.08) {
+          const kickFreq = 90 * Math.exp(-beatTime * 28) + 42;
+          sample += Math.sin(2 * Math.PI * kickFreq * beatTime) * 0.25 * (1 - beatTime / 0.08);
+        }
+
+        if (t < 0.25) sample *= t / 0.25;
+        if (t > durationSec - 0.25) sample *= (durationSec - t) / 0.25;
+
+        const clamped = Math.max(-0.95, Math.min(0.95, sample));
+        buffer.writeInt16LE(Math.round(clamped * 32767), 44 + i * 2);
       }
-
-      const noteIdx = Math.floor(t / 2) % leadMelody.length;
-      const leadFreq = leadMelody[noteIdx];
-      const noteEnv = Math.exp(-(t % 2) * 1.4);
-      sample += Math.sin(2 * Math.PI * leadFreq * t) * 0.12 * noteEnv;
-
-      // Subtle stadium drum pulse every 0.5s
-      if (beatTime < 0.08) {
-        const kickFreq = 90 * Math.exp(-beatTime * 28) + 42;
-        sample += Math.sin(2 * Math.PI * kickFreq * beatTime) * 0.25 * (1 - beatTime / 0.08);
-      }
-
-      // Smooth fade at loop boundaries
-      if (t < 0.25) sample *= t / 0.25;
-      if (t > durationSec - 0.25) sample *= (durationSec - t) / 0.25;
-
-      const clamped = Math.max(-0.95, Math.min(0.95, sample));
-      buffer.writeInt16LE(Math.round(clamped * 32767), 44 + i * 2);
+      fs.writeFileSync(filepath, buffer);
+    } catch {
+      // ignore if read-only filesystem
     }
-    fs.writeFileSync(filepath, buffer);
   }
   return `/uploads/music/${filename}`;
 }
@@ -1137,7 +1203,7 @@ function createInitialDb(): LeagueDatabase {
       backupGmail: 'cristiandiazdevelez@gmail.com',
       radioName: 'FM 101.5 Pop Radio (Bs. As.)',
       radioStreamUrl: 'https://popradio.stweb.tv/popradio/live/playlist.m3u8',
-      maxTeams: 30,
+      maxTeams: 100,
     },
     teams: seededTeams,
     matches: seededMatches,
@@ -1238,174 +1304,244 @@ function createInitialDb(): LeagueDatabase {
   };
 }
 
-function loadDb(): LeagueDatabase {
+const DB_CACHE_TTL_MS = 1500;
+let dbMemoryCache: { db: LeagueDatabase; fetchedAt: number } | null = null;
+let inFlightDbLoad: Promise<LeagueDatabase> | null = null;
+
+async function migrateAndNormalizeDb(parsed: LeagueDatabase): Promise<{ db: LeagueDatabase; migrated: boolean }> {
+  let migrated = false;
+
+  if (parsed.settings.adminId === 'ADMIN' && parsed.settings.adminClave === 'admin2026') {
+    parsed.settings.adminId = 'ADMI';
+    parsed.settings.adminClave = 'LMA2026';
+    migrated = true;
+  }
+
+  // Migrate legacy plaintext admin password to scrypt hash and erase plaintext
+  if (!parsed.settings.adminClaveHash) {
+    const legacyAdminPlain = String(parsed.settings.adminClave || 'LMA2026').trim() || 'LMA2026';
+    parsed.settings.adminClaveHash = hashPassword(legacyAdminPlain);
+    migrated = true;
+  }
+  if ('adminClave' in parsed.settings) {
+    delete parsed.settings.adminClave;
+    migrated = true;
+  }
+  if (typeof parsed.settings.adminTokenVersion !== 'number') {
+    parsed.settings.adminTokenVersion = 1;
+    migrated = true;
+  }
+
+  // Migrate legacy plaintext participant passwords to scrypt hashes and erase plaintext
+  if (Array.isArray(parsed.teams)) {
+    for (const t of parsed.teams) {
+      if (!t.claveHash) {
+        const legacyMemberPlain = String(t.clave || t.id.toLowerCase()).trim() || t.id.toLowerCase();
+        t.claveHash = hashPassword(legacyMemberPlain);
+        migrated = true;
+      }
+      if ('clave' in t) {
+        delete t.clave;
+        migrated = true;
+      }
+      if (t.accountStatus !== 'active' && t.accountStatus !== 'blocked') {
+        t.accountStatus = 'active';
+        migrated = true;
+      }
+      if (typeof t.tokenVersion !== 'number') {
+        t.tokenVersion = 1;
+        migrated = true;
+      }
+    }
+  }
+
+  if (!Array.isArray(parsed.credentialAuditLog)) {
+    parsed.credentialAuditLog = [];
+    migrated = true;
+  }
+  if (
+    parsed.settings.crestUrl === '/default-assets/league_crest_argentina_1794642900932.jpg' ||
+    parsed.settings.crestUrl === '/assets/aistudio/icono_7859ce5e.png' ||
+    parsed.settings.crestUrl === '/default-assets/icono_liga_hd_1794645294665.jpg' ||
+    parsed.settings.crestUrl === '/default-assets/icono_liga_3d_hd_1794813291158.jpg'
+  ) {
+    parsed.settings.crestUrl = '/assets/aistudio/Liga_Master_Argentina__F_tbol_de__lite_eeeab9aa.png';
+    migrated = true;
+  }
+  if (
+    parsed.settings.coverUrl === '/default-assets/hero_cabra_messi_copa_1794642901898.jpg' ||
+    parsed.settings.coverUrl === '/default-assets/hero_cabra_messi_argentina_1794730196481.jpg' ||
+    parsed.settings.coverUrl === '/default-assets/hero_cabra_sol_bandera_1794730623048.jpg' ||
+    parsed.settings.coverUrl === '/default-assets/hero_cabra_messi_hd_1794813291066.jpg' ||
+    parsed.settings.coverUrl === '/assets/aistudio/_Liga_master_argentina_PES6._36522b75.png'
+  ) {
+    parsed.settings.coverUrl = '/assets/aistudio/cabra_copa_3d_hd.jpg';
+    migrated = true;
+  }
+  if (
+    !parsed.settings.faviconUrl ||
+    parsed.settings.faviconUrl === '/default-assets/league_crest_argentina_1794642900932.jpg' ||
+    parsed.settings.faviconUrl === '/assets/aistudio/icono_7859ce5e.png' ||
+    parsed.settings.faviconUrl === '/default-assets/icono_liga_hd_1794645294665.jpg' ||
+    parsed.settings.faviconUrl === '/default-assets/icono_liga_3d_hd_1794813291158.jpg'
+  ) {
+    parsed.settings.faviconUrl = '/assets/aistudio/Liga_Master_Argentina__F_tbol_de__lite_eeeab9aa.png';
+    migrated = true;
+  }
+  if (parsed.settings.title === 'Liga Master Argentina Pes6 (1°Temporada 2026-2027)') {
+    parsed.settings.title = 'Liga Master Argentina Pes6';
+    parsed.settings.subtitle = '(TEMPORADA 2026-2027) THE DEN PATCH';
+    migrated = true;
+  }
+  if (
+    parsed.settings.subtitle &&
+    /1°\s*temporada\s*2026/i.test(parsed.settings.subtitle)
+  ) {
+    parsed.settings.subtitle = '(TEMPORADA 2026-2027) THE DEN PATCH';
+    migrated = true;
+  }
+  if (!Array.isArray(parsed.fixtures)) {
+    parsed.fixtures = [];
+    migrated = true;
+  }
+  if (!Array.isArray(parsed.calendarEvents)) {
+    parsed.calendarEvents = [];
+    migrated = true;
+  }
+  if (!Array.isArray(parsed.claims)) {
+    parsed.claims = [];
+    migrated = true;
+  }
+  if (!Array.isArray(parsed.news)) {
+    parsed.news = [];
+    migrated = true;
+  }
+  if (!Array.isArray(parsed.comments)) {
+    parsed.comments = [];
+    migrated = true;
+  }
+  if (typeof parsed.pageLikes !== 'number') {
+    parsed.pageLikes = 0;
+    migrated = true;
+  }
+  if (!parsed.rules.cupRules) {
+    parsed.rules.cupRules = defaultCupRules();
+    migrated = true;
+  }
+  if (
+    typeof parsed.settings.description !== 'string' ||
+    /Torneo oficial de PES 6.*comunidad\.?/i.test(parsed.settings.description)
+  ) {
+    parsed.settings.description = '';
+    migrated = true;
+  }
+  if (typeof parsed.settings.calendarMessage !== 'string') {
+    parsed.settings.calendarMessage = '';
+    migrated = true;
+  }
+  if (!parsed.settings.backupGmail || !parsed.settings.backupGmail.trim()) {
+    parsed.settings.backupGmail = 'cristiandiazdevelez@gmail.com';
+    migrated = true;
+  }
+  if (!parsed.settings.radioStreamUrl || !parsed.settings.radioStreamUrl.trim()) {
+    parsed.settings.radioName = 'FM 101.5 Pop Radio (Bs. As.)';
+    parsed.settings.radioStreamUrl = 'https://popradio.stweb.tv/popradio/live/playlist.m3u8';
+    migrated = true;
+  }
+  if (!parsed.cup) {
+    const ranked = getRankedStandingsTeams(parsed.teams || [], parsed.matches || []);
+    parsed.cup = createInitialCup(1, ranked.slice(0, 16), ranked[0]);
+    migrated = true;
+  }
+
+  if (await syncAllChampionTrophies(parsed)) {
+    migrated = true;
+  }
+
+  ensureDefaultAnthemWav();
+  return { db: parsed, migrated };
+}
+
+function readBundledSeedJson(): LeagueDatabase | null {
+  try {
+    if (fs.existsSync(DB_PATH)) {
+      const raw = fs.readFileSync(DB_PATH, 'utf8');
+      return JSON.parse(raw) as LeagueDatabase;
+    }
+  } catch (err) {
+    console.warn('No se pudo leer data/league.json semilla:', err instanceof Error ? err.message : err);
+  }
+  return null;
+}
+
+async function loadDbUncached(): Promise<LeagueDatabase> {
+  if (isSupabaseDbConfigured()) {
+    const existing = await readLeagueDbFromSupabase<LeagueDatabase>();
+    if (existing?.data) {
+      const { db, migrated } = await migrateAndNormalizeDb(existing.data);
+      if (migrated) {
+        await saveDb(db);
+      } else {
+        dbMemoryCache = { db, fetchedAt: Date.now() };
+      }
+      return db;
+    }
+
+    // Primer arranque contra Supabase: migrar automáticamente data/league.json si existe
+    const seedParsed = readBundledSeedJson();
+    if (seedParsed) {
+      const { db } = await migrateAndNormalizeDb(seedParsed);
+      await saveDb(db);
+      return db;
+    }
+
+    const initial = createInitialDb();
+    await saveDb(initial);
+    return initial;
+  }
+
+  // Modo local sin Supabase configurado (desarrollo local)
   if (!fs.existsSync(DB_PATH)) {
     const initial = createInitialDb();
-    saveDb(initial);
+    await saveDb(initial);
     return initial;
   }
   try {
     const raw = fs.readFileSync(DB_PATH, 'utf8');
     const parsed = JSON.parse(raw) as LeagueDatabase;
-    let migrated = false;
-
-    if (parsed.settings.adminId === 'ADMIN' && parsed.settings.adminClave === 'admin2026') {
-      parsed.settings.adminId = 'ADMI';
-      parsed.settings.adminClave = 'LMA2026';
-      migrated = true;
+    const { db, migrated } = await migrateAndNormalizeDb(parsed);
+    if (migrated && !IS_VERCEL) {
+      await saveDb(db);
+    } else {
+      dbMemoryCache = { db, fetchedAt: Date.now() };
     }
-
-    // Migrate legacy plaintext admin password to scrypt hash and erase plaintext
-    if (!parsed.settings.adminClaveHash) {
-      const legacyAdminPlain = String(parsed.settings.adminClave || 'LMA2026').trim() || 'LMA2026';
-      parsed.settings.adminClaveHash = hashPassword(legacyAdminPlain);
-      migrated = true;
-    }
-    if ('adminClave' in parsed.settings) {
-      delete parsed.settings.adminClave;
-      migrated = true;
-    }
-    if (typeof parsed.settings.adminTokenVersion !== 'number') {
-      parsed.settings.adminTokenVersion = 1;
-      migrated = true;
-    }
-
-    // Migrate legacy plaintext participant passwords to scrypt hashes and erase plaintext
-    if (Array.isArray(parsed.teams)) {
-      for (const t of parsed.teams) {
-        if (!t.claveHash) {
-          const legacyMemberPlain = String(t.clave || t.id.toLowerCase()).trim() || t.id.toLowerCase();
-          t.claveHash = hashPassword(legacyMemberPlain);
-          migrated = true;
-        }
-        if ('clave' in t) {
-          delete t.clave;
-          migrated = true;
-        }
-        if (t.accountStatus !== 'active' && t.accountStatus !== 'blocked') {
-          t.accountStatus = 'active';
-          migrated = true;
-        }
-        if (typeof t.tokenVersion !== 'number') {
-          t.tokenVersion = 1;
-          migrated = true;
-        }
-      }
-    }
-
-    if (!Array.isArray(parsed.credentialAuditLog)) {
-      parsed.credentialAuditLog = [];
-      migrated = true;
-    }
-    if (
-      parsed.settings.crestUrl === '/default-assets/league_crest_argentina_1794642900932.jpg' ||
-      parsed.settings.crestUrl === '/assets/aistudio/icono_7859ce5e.png' ||
-      parsed.settings.crestUrl === '/default-assets/icono_liga_hd_1794645294665.jpg' ||
-      parsed.settings.crestUrl === '/default-assets/icono_liga_3d_hd_1794813291158.jpg'
-    ) {
-      parsed.settings.crestUrl = '/assets/aistudio/Liga_Master_Argentina__F_tbol_de__lite_eeeab9aa.png';
-      migrated = true;
-    }
-    if (
-      parsed.settings.coverUrl === '/default-assets/hero_cabra_messi_copa_1794642901898.jpg' ||
-      parsed.settings.coverUrl === '/default-assets/hero_cabra_messi_argentina_1794730196481.jpg' ||
-      parsed.settings.coverUrl === '/default-assets/hero_cabra_sol_bandera_1794730623048.jpg' ||
-      parsed.settings.coverUrl === '/default-assets/hero_cabra_messi_hd_1794813291066.jpg' ||
-      parsed.settings.coverUrl === '/assets/aistudio/_Liga_master_argentina_PES6._36522b75.png'
-    ) {
-      parsed.settings.coverUrl = '/assets/aistudio/cabra_copa_3d_hd.jpg';
-      migrated = true;
-    }
-    if (
-      !parsed.settings.faviconUrl ||
-      parsed.settings.faviconUrl === '/default-assets/league_crest_argentina_1794642900932.jpg' ||
-      parsed.settings.faviconUrl === '/assets/aistudio/icono_7859ce5e.png' ||
-      parsed.settings.faviconUrl === '/default-assets/icono_liga_hd_1794645294665.jpg' ||
-      parsed.settings.faviconUrl === '/default-assets/icono_liga_3d_hd_1794813291158.jpg'
-    ) {
-      parsed.settings.faviconUrl = '/assets/aistudio/Liga_Master_Argentina__F_tbol_de__lite_eeeab9aa.png';
-      migrated = true;
-    }
-    if (parsed.settings.title === 'Liga Master Argentina Pes6 (1°Temporada 2026-2027)') {
-      parsed.settings.title = 'Liga Master Argentina Pes6';
-      parsed.settings.subtitle = '(TEMPORADA 2026-2027) THE DEN PATCH';
-      migrated = true;
-    }
-    if (
-      parsed.settings.subtitle &&
-      /1°\s*temporada\s*2026/i.test(parsed.settings.subtitle)
-    ) {
-      parsed.settings.subtitle = '(TEMPORADA 2026-2027) THE DEN PATCH';
-      migrated = true;
-    }
-    if (!Array.isArray(parsed.fixtures)) {
-      parsed.fixtures = [];
-      migrated = true;
-    }
-    if (!Array.isArray(parsed.calendarEvents)) {
-      parsed.calendarEvents = [];
-      migrated = true;
-    }
-    if (!Array.isArray(parsed.claims)) {
-      parsed.claims = [];
-      migrated = true;
-    }
-    if (!Array.isArray(parsed.news)) {
-      parsed.news = [];
-      migrated = true;
-    }
-    if (!Array.isArray(parsed.comments)) {
-      parsed.comments = [];
-      migrated = true;
-    }
-    if (typeof parsed.pageLikes !== 'number') {
-      parsed.pageLikes = 0;
-      migrated = true;
-    }
-    if (!parsed.rules.cupRules) {
-      parsed.rules.cupRules = defaultCupRules();
-      migrated = true;
-    }
-    if (
-      typeof parsed.settings.description !== 'string' ||
-      /Torneo oficial de PES 6.*comunidad\.?/i.test(parsed.settings.description)
-    ) {
-      parsed.settings.description = '';
-      migrated = true;
-    }
-    if (typeof parsed.settings.calendarMessage !== 'string') {
-      parsed.settings.calendarMessage = '';
-      migrated = true;
-    }
-    if (!parsed.settings.backupGmail || !parsed.settings.backupGmail.trim()) {
-      parsed.settings.backupGmail = 'cristiandiazdevelez@gmail.com';
-      migrated = true;
-    }
-    if (!parsed.settings.radioStreamUrl || !parsed.settings.radioStreamUrl.trim()) {
-      parsed.settings.radioName = 'FM 101.5 Pop Radio (Bs. As.)';
-      parsed.settings.radioStreamUrl = 'https://popradio.stweb.tv/popradio/live/playlist.m3u8';
-      migrated = true;
-    }
-    if (!parsed.cup) {
-      const ranked = getRankedStandingsTeams(parsed.teams || [], parsed.matches || []);
-      parsed.cup = createInitialCup(1, ranked.slice(0, 16), ranked[0]);
-      migrated = true;
-    }
-
-    if (syncAllChampionTrophies(parsed)) {
-      migrated = true;
-    }
-
-    if (migrated) {
-      saveDb(parsed);
-    }
-    ensureDefaultAnthemWav();
-    return parsed;
+    return db;
   } catch {
     const initial = createInitialDb();
-    fs.writeFileSync(DB_PATH, JSON.stringify(initial, null, 2), 'utf8');
+    if (!IS_VERCEL) {
+      await saveDb(initial);
+    }
+    dbMemoryCache = { db: initial, fetchedAt: Date.now() };
     return initial;
   }
+}
+
+async function loadDb(options?: { fresh?: boolean }): Promise<LeagueDatabase> {
+  if (!options?.fresh && dbMemoryCache && Date.now() - dbMemoryCache.fetchedAt < DB_CACHE_TTL_MS) {
+    return dbMemoryCache.db;
+  }
+  if (!options?.fresh && inFlightDbLoad) {
+    return inFlightDbLoad;
+  }
+  const loader = loadDbUncached().finally(() => {
+    if (inFlightDbLoad === loader) {
+      inFlightDbLoad = null;
+    }
+  });
+  if (!options?.fresh) {
+    inFlightDbLoad = loader;
+  }
+  return loader;
 }
 
 const LIGA_TROPHY_IMG = '/assets/aistudio/Trofeo_Liga_Argentina_LMA.jpg';
@@ -1637,7 +1773,26 @@ function findNullTerm(buf: Buffer, start: number, encoding: number, limit: numbe
   return limit;
 }
 
-function extractAndSaveMp3Cover(mp3FilePath: string): string | undefined {
+async function persistMp3CoverBuffer(imgBuf: Buffer, ext: 'png' | 'jpg' | 'webp'): Promise<string | undefined> {
+  const hash = crypto.createHash('sha1').update(imgBuf).digest('hex').slice(0, 16);
+  const coverName = `cover_${hash}.${ext}`;
+  const mime = ext === 'png' ? 'image/png' : ext === 'webp' ? 'image/webp' : 'image/jpeg';
+
+  if (isSupabaseDbConfigured()) {
+    return uploadBufferToSupabaseStorage(imgBuf, `music/covers/${coverName}`, mime);
+  }
+  try {
+    const coverPath = path.join(TEMP_UPLOADS_DIR, 'music', 'covers', coverName);
+    if (!fs.existsSync(coverPath)) {
+      fs.writeFileSync(coverPath, imgBuf);
+    }
+    return `/uploads/music/covers/${coverName}`;
+  } catch {
+    return undefined;
+  }
+}
+
+async function extractAndSaveMp3Cover(mp3FilePath: string): Promise<string | undefined> {
   try {
     if (!fs.existsSync(mp3FilePath)) return undefined;
     const fd = fs.openSync(mp3FilePath, 'r');
@@ -1677,11 +1832,7 @@ function extractAndSaveMp3Cover(mp3FilePath: string): string | undefined {
           if (imgBuf.length > 64) {
             const isPng = imgBuf[0] === 0x89 && imgBuf[1] === 0x50;
             const ext = isPng ? 'png' : 'jpg';
-            const hash = crypto.createHash('sha1').update(imgBuf).digest('hex').slice(0, 16);
-            const coverName = `cover_${hash}.${ext}`;
-            const coverPath = path.join(UPLOADS_DIR, 'music', 'covers', coverName);
-            if (!fs.existsSync(coverPath)) fs.writeFileSync(coverPath, imgBuf);
-            return `/uploads/music/covers/${coverName}`;
+            return await persistMp3CoverBuffer(imgBuf, ext);
           }
         }
         pos += frameSize;
@@ -1709,11 +1860,7 @@ function extractAndSaveMp3Cover(mp3FilePath: string): string | undefined {
               const isPng = imgBuf[0] === 0x89 && imgBuf[1] === 0x50;
               const isWebp = imgBuf[0] === 0x52 && imgBuf[1] === 0x49;
               const ext = isPng ? 'png' : isWebp ? 'webp' : 'jpg';
-              const hash = crypto.createHash('sha1').update(imgBuf).digest('hex').slice(0, 16);
-              const coverName = `cover_${hash}.${ext}`;
-              const coverPath = path.join(UPLOADS_DIR, 'music', 'covers', coverName);
-              if (!fs.existsSync(coverPath)) fs.writeFileSync(coverPath, imgBuf);
-              return `/uploads/music/covers/${coverName}`;
+              return await persistMp3CoverBuffer(imgBuf, ext);
             }
           }
         }
@@ -1737,13 +1884,13 @@ function resolveLocalAudioPath(audioUrl: string): string | null {
   return null;
 }
 
-function syncAllChampionTrophies(db: LeagueDatabase): boolean {
+async function syncAllChampionTrophies(db: LeagueDatabase): Promise<boolean> {
   let changed = false;
   for (const m of db.music || []) {
     if (!m.coverUrl && m.audioUrl && m.audioUrl.toLowerCase().endsWith('.mp3')) {
       const localPath = resolveLocalAudioPath(m.audioUrl);
-      if (localPath) {
-        const cover = extractAndSaveMp3Cover(localPath);
+      if (localPath && fs.existsSync(localPath)) {
+        const cover = await extractAndSaveMp3Cover(localPath);
         if (cover) {
           m.coverUrl = cover;
           changed = true;
@@ -1763,8 +1910,8 @@ function syncAllChampionTrophies(db: LeagueDatabase): boolean {
     for (const pm of t.personalMusic) {
       if (!pm.coverUrl && pm.audioUrl && pm.audioUrl.toLowerCase().endsWith('.mp3')) {
         const localPath = resolveLocalAudioPath(pm.audioUrl);
-        if (localPath) {
-          const cover = extractAndSaveMp3Cover(localPath);
+        if (localPath && fs.existsSync(localPath)) {
+          const cover = await extractAndSaveMp3Cover(localPath);
           if (cover) {
             pm.coverUrl = cover;
             changed = true;
@@ -1996,8 +2143,8 @@ function broadcastDbUpdate(): void {
   }
 }
 
-function saveDb(db: LeagueDatabase): void {
-  // Defense-in-depth: never persist plaintext passwords to disk
+async function saveDb(db: LeagueDatabase): Promise<void> {
+  // Defense-in-depth: never persist plaintext passwords
   if (db.settings && 'adminClave' in db.settings) {
     delete db.settings.adminClave;
   }
@@ -2008,8 +2155,25 @@ function saveDb(db: LeagueDatabase): void {
       }
     }
   }
-  fs.writeFileSync(DB_PATH, JSON.stringify(db, null, 2), 'utf8');
+  dbMemoryCache = { db, fetchedAt: Date.now() };
+  if (isSupabaseDbConfigured()) {
+    await writeLeagueDbToSupabase(db);
+  } else if (!IS_VERCEL) {
+    fs.writeFileSync(DB_PATH, JSON.stringify(db, null, 2), 'utf8');
+  } else {
+    throw new Error(
+      'Falta configurar SUPABASE_URL y SUPABASE_SERVICE_ROLE_KEY en Vercel para guardar cambios de forma persistente.'
+    );
+  }
   broadcastDbUpdate();
+}
+
+function asyncRoute(
+  fn: (req: AuthenticatedRequest, res: Response, next: NextFunction) => Promise<unknown>
+) {
+  return (req: AuthenticatedRequest, res: Response, next: NextFunction): void => {
+    Promise.resolve(fn(req, res, next)).catch(next);
+  };
 }
 
 function sanitizeTeam(team: Team) {
@@ -2063,57 +2227,114 @@ function sanitizeSettings(settings: LeagueSettings, includeAdminSecrets = false)
   };
 }
 
-function extractAuth(req: AuthenticatedRequest, _res: Response, next: NextFunction): void {
-  const authHeader = req.headers.authorization;
-  if (authHeader && authHeader.startsWith('Bearer ')) {
-    const token = authHeader.slice(7).trim();
-    const parsed = verifyToken(token);
-    if (parsed) {
-      const db = loadDb();
-      if (parsed.role === 'admin') {
-        const currentAdminId = String(db.settings.adminId || 'ADMI').trim();
-        const expectedVersion = db.settings.adminTokenVersion ?? 1;
-        if (
-          String(parsed.id || '').trim().toUpperCase() !== currentAdminId.toUpperCase() ||
-          (parsed.tokenVersion ?? 1) !== expectedVersion
-        ) {
-          req.authUser = null;
-          next();
-          return;
-        }
-        const adminTeam = db.teams.find((t) => t.id === db.settings.adminTeamId);
-        parsed.id = currentAdminId;
-        parsed.teamId = adminTeam?.id;
-        parsed.displayName = adminTeam
-          ? `${adminTeam.memberName} (${adminTeam.name})`
-          : 'Administrador General';
-      } else if (parsed.role === 'member') {
-        const memberTeam = db.teams.find((t) => t.id === (parsed.teamId || parsed.id));
-        const currentAdminId = String(db.settings.adminId || 'ADMI').trim().toUpperCase();
-        if (
-          !memberTeam ||
-          memberTeam.accountStatus === 'blocked' ||
-          memberTeam.id.toUpperCase() === currentAdminId ||
-          (parsed.tokenVersion ?? 1) !== (memberTeam.tokenVersion ?? 1)
-        ) {
-          req.authUser = null;
-          next();
-          return;
-        }
-        parsed.id = memberTeam.id;
-        parsed.teamId = memberTeam.id;
-        parsed.displayName = `${memberTeam.memberName} (${memberTeam.name})`;
-      } else {
-        req.authUser = null;
-        next();
-        return;
-      }
+function readFirebaseWebApiKey(): string {
+  const envKey = (process.env.FIREBASE_WEB_API_KEY || process.env.VITE_FIREBASE_API_KEY || '').trim();
+  if (envKey) return envKey;
+  try {
+    const cfgPath = path.join(ROOT_DIR, 'firebase-applet-config.json');
+    if (fs.existsSync(cfgPath)) {
+      const parsed = JSON.parse(fs.readFileSync(cfgPath, 'utf8')) as { apiKey?: string };
+      return String(parsed.apiKey || '').trim();
     }
-    req.authUser = parsed;
-  } else {
-    req.authUser = null;
+  } catch {
+    // ignore
   }
-  next();
+  return '';
+}
+
+const ADMIN_EMAILS_SET = new Set([
+  'ligamasterargentina2030@gmail.com',
+  'cristiandiazdevelez@gmail.com',
+]);
+
+async function verifyFirebaseIdTokenViaLookup(idToken: string): Promise<TokenPayload | null> {
+  if (!idToken || idToken.split('.').length !== 3) return null;
+  const apiKey = readFirebaseWebApiKey();
+  if (!apiKey) return null;
+  try {
+    const res = await fetch(
+      `https://identitytoolkit.googleapis.com/v1/accounts:lookup?key=${encodeURIComponent(apiKey)}`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ idToken }),
+      }
+    );
+    if (!res.ok) return null;
+    const data = (await res.json()) as {
+      users?: Array<{ localId?: string; email?: string; emailVerified?: boolean; displayName?: string }>;
+    };
+    const u = data.users?.[0];
+    if (!u || !u.localId || !u.email || !u.emailVerified) return null;
+    const isAdmin = ADMIN_EMAILS_SET.has(u.email.trim().toLowerCase());
+    return {
+      role: isAdmin ? 'admin' : 'member',
+      id: isAdmin ? 'ADMI' : u.localId,
+      displayName: u.displayName || (isAdmin ? 'Administrador General' : u.email),
+      exp: Date.now() + 60 * 60 * 1000,
+    };
+  } catch {
+    return null;
+  }
+}
+
+async function extractAuth(req: AuthenticatedRequest, _res: Response, next: NextFunction): Promise<void> {
+  try {
+    const authHeader = req.headers.authorization;
+    if (authHeader && authHeader.startsWith('Bearer ')) {
+      const token = authHeader.slice(7).trim();
+      const parsed = verifyToken(token);
+      if (parsed) {
+        const db = await loadDb({ fresh: true });
+        if (parsed.role === 'admin') {
+          const currentAdminId = String(db.settings.adminId || 'ADMI').trim();
+          const expectedVersion = db.settings.adminTokenVersion ?? 1;
+          if (
+            String(parsed.id || '').trim().toUpperCase() !== currentAdminId.toUpperCase() ||
+            (parsed.tokenVersion ?? 1) !== expectedVersion
+          ) {
+            req.authUser = null;
+            next();
+            return;
+          }
+          const adminTeam = db.teams.find((t) => t.id === db.settings.adminTeamId);
+          parsed.id = currentAdminId;
+          parsed.teamId = adminTeam?.id;
+          parsed.displayName = adminTeam
+            ? `${adminTeam.memberName} (${adminTeam.name})`
+            : 'Administrador General';
+        } else if (parsed.role === 'member') {
+          const memberTeam = db.teams.find((t) => t.id === (parsed.teamId || parsed.id));
+          const currentAdminId = String(db.settings.adminId || 'ADMI').trim().toUpperCase();
+          if (
+            !memberTeam ||
+            memberTeam.accountStatus === 'blocked' ||
+            memberTeam.id.toUpperCase() === currentAdminId ||
+            (parsed.tokenVersion ?? 1) !== (memberTeam.tokenVersion ?? 1)
+          ) {
+            req.authUser = null;
+            next();
+            return;
+          }
+          parsed.id = memberTeam.id;
+          parsed.teamId = memberTeam.id;
+          parsed.displayName = `${memberTeam.memberName} (${memberTeam.name})`;
+        } else {
+          req.authUser = null;
+          next();
+          return;
+        }
+        req.authUser = parsed;
+      } else {
+        req.authUser = await verifyFirebaseIdTokenViaLookup(token);
+      }
+    } else {
+      req.authUser = null;
+    }
+    next();
+  } catch (err) {
+    next(err);
+  }
 }
 
 function requireAuth(req: AuthenticatedRequest, res: Response, next: NextFunction): void {
@@ -2135,7 +2356,13 @@ function requireAdmin(req: AuthenticatedRequest, res: Response, next: NextFuncti
 function createMulter(subdir: (typeof UPLOAD_SUBDIRS)[number], maxSizeMb = 200) {
   const storage = multer.diskStorage({
     destination: (_req, _file, cb) => {
-      cb(null, path.join(UPLOADS_DIR, subdir));
+      const targetDir = path.join(TEMP_UPLOADS_DIR, subdir);
+      try {
+        fs.mkdirSync(targetDir, { recursive: true });
+      } catch {
+        // ignore if already exists
+      }
+      cb(null, targetDir);
     },
     filename: (_req, file, cb) => {
       const ext = path.extname(file.originalname).toLowerCase() || '';
@@ -2363,18 +2590,16 @@ async function ensurePlayableMp4(inputPath: string, ext: string): Promise<string
   return null;
 }
 
-async function startServer() {
+function buildApiApp(): express.Express {
   const app = express();
-  const httpServer = http.createServer(app);
 
-  // Normalize /LMA-pes6-ai-studio/api/* to /api/* and enable CORS for API calls
+  // Normalize /LMA-pes6-ai-studio/* prefixes and enable CORS for API calls
   app.use((req: Request, res: Response, next: NextFunction) => {
-    if (
-      req.url === '/LMA-pes6-ai-studio/api' ||
-      req.url.startsWith('/LMA-pes6-ai-studio/api/') ||
-      req.url.startsWith('/LMA-pes6-ai-studio/api?')
-    ) {
-      req.url = req.url.slice('/LMA-pes6-ai-studio'.length);
+    for (const prefix of ['/LMA-pes6-ai-studio/api', '/LMA-pes6-ai-studio/uploads', '/LMA-pes6-ai-studio/default-assets']) {
+      if (req.url === prefix || req.url.startsWith(`${prefix}/`) || req.url.startsWith(`${prefix}?`)) {
+        req.url = req.url.slice('/LMA-pes6-ai-studio'.length);
+        break;
+      }
     }
 
     if (req.url === '/api' || req.url.startsWith('/api/') || req.url.startsWith('/api?')) {
@@ -2392,33 +2617,106 @@ async function startServer() {
     next();
   });
 
-  app.use(express.json({ limit: '5mb' }));
+  app.use(express.json({ limit: '10mb' }));
   app.use(extractAuth);
 
-  // Serve uploaded files (with range requests for smooth video seeking) and default generated assets
-  // Mounted at both root and Vite base path (/LMA-pes6-ai-studio) so live & preview URLs both work flawlessly
+  // Serve uploaded files (with range requests), falling back to /tmp or Supabase Storage CDN
   const uploadsStatic = express.static(UPLOADS_DIR, { acceptRanges: true });
+  const tempUploadsStatic = express.static(TEMP_UPLOADS_DIR, { acceptRanges: true });
+  const uploadsSupabaseFallback = (req: Request, res: Response, next: NextFunction) => {
+    if (isSupabaseDbConfigured()) {
+      const cleanRel = req.path.replace(/^\/+/, '');
+      if (cleanRel) {
+        res.setHeader('Cache-Control', 'public, max-age=3600');
+        res.redirect(302, getSupabasePublicObjectUrl(cleanRel));
+        return;
+      }
+    }
+    next();
+  };
   const defaultAssetsStatic = express.static(path.join(ROOT_DIR, 'src', 'assets', 'images'));
-  app.use('/uploads', uploadsStatic);
-  app.use('/LMA-pes6-ai-studio/uploads', uploadsStatic);
+  app.use('/uploads', uploadsStatic, tempUploadsStatic, uploadsSupabaseFallback);
   app.use('/default-assets', defaultAssetsStatic);
-  app.use('/LMA-pes6-ai-studio/default-assets', defaultAssetsStatic);
+
+  // Unified authenticated media upload helper for Firestore-backed records
+  const genericMediaUploaders: Record<(typeof UPLOAD_SUBDIRS)[number], multer.Multer> = {
+    crests: uploadCrest,
+    matches: uploadMatchProof,
+    videos: uploadVideo,
+    champions: uploadChampion,
+    music: uploadMusic,
+    site: uploadSiteAsset,
+    claims: uploadClaims,
+    news: uploadNews,
+  };
+
+  app.post('/api/upload/:subdir', requireAuth, (req: AuthenticatedRequest, res: Response, next: NextFunction) => {
+    const subdir = String(req.params.subdir || '') as (typeof UPLOAD_SUBDIRS)[number];
+    const uploader = genericMediaUploaders[subdir];
+    if (!uploader) {
+      res.status(400).json({ error: 'Subcarpeta de subida no válida.' });
+      return;
+    }
+    uploader.single('file')(req, res, (err) => {
+      if (err) {
+        next(err);
+        return;
+      }
+      void (async () => {
+        try {
+          if (!req.file) {
+            res.status(400).json({ error: 'No se recibió ningún archivo.' });
+            return;
+          }
+          if (isValidImageFile(req.file) && (subdir === 'matches' || subdir === 'claims')) {
+            const mod = await moderateUploadedImage(req.file.path, req.file.mimetype, `subida en ${subdir}`);
+            if (!mod.allowed) {
+              safeUnlink(req.file.path);
+              res.status(400).json({ error: mod.reason || 'Imagen rechazada por moderación.' });
+              return;
+            }
+          }
+          let finalFilename = req.file.filename;
+          if (subdir === 'crests' && isValidImageFile(req.file)) {
+            finalFilename = await normalizePng128(req.file.path);
+          } else if (subdir === 'videos' || (req.file.mimetype || '').startsWith('video/')) {
+            const ext = path.extname(req.file.originalname).toLowerCase();
+            if (ext === '.mp4' || ext === '.avi' || (req.file.mimetype || '').startsWith('video/')) {
+              const converted = await ensurePlayableMp4(req.file.path, ext || '.mp4');
+              if (converted) {
+                safeUnlink(req.file.path);
+                finalFilename = converted;
+              }
+            }
+          }
+          const finalPath = path.join(TEMP_UPLOADS_DIR, subdir, finalFilename);
+          const url = await persistUploadedFile(finalPath, subdir, finalFilename, req.file.mimetype);
+          res.status(201).json({ url, filename: finalFilename });
+        } catch (uploadErr) {
+          next(uploadErr);
+        }
+      })();
+    });
+  });
 
   // Dynamic SVG club crests for seeded teams (128x128 viewBox)
-  app.get('/api/crest/:teamId.svg', (req: Request, res: Response) => {
-    const teamId = String(req.params.teamId || '').replace(/\.svg$/i, '');
-    const db = loadDb();
-    const team = db.teams.find((t) => t.id === teamId);
-    const primary = team?.primaryColor || '#0284C7';
-    const secondary = team?.secondaryColor || '#FFFFFF';
-    const initials = (team?.name || teamId)
-      .split(/\s+/)
-      .filter(Boolean)
-      .slice(0, 2)
-      .map((w) => w[0]?.toUpperCase() || '')
-      .join('') || 'LMA';
+  app.get(
+    '/api/crest/:teamId.svg',
+    asyncRoute(async (req: Request, res: Response) => {
+      const teamId = String(req.params.teamId || '').replace(/\.svg$/i, '');
+      const db = await loadDb();
+      const team = db.teams.find((t) => t.id === teamId);
+      const primary = team?.primaryColor || '#0284C7';
+      const secondary = team?.secondaryColor || '#FFFFFF';
+      const initials =
+        (team?.name || teamId)
+          .split(/\s+/)
+          .filter(Boolean)
+          .slice(0, 2)
+          .map((w) => w[0]?.toUpperCase() || '')
+          .join('') || 'LMA';
 
-    const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
+      const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
   <defs>
     <clipPath id="shield">
       <path d="M18 14 H110 V64 C110 92 64 116 64 116 C64 116 18 92 18 64 Z"/>
@@ -2432,16 +2730,22 @@ async function startServer() {
   <rect x="26" y="43" width="76" height="36" rx="6" fill="#0F172A" fill-opacity="0.88" stroke="#38BDF8" stroke-width="2"/>
   <text x="64" y="68" text-anchor="middle" fill="#FFFFFF" font-family="Arial, sans-serif" font-weight="800" font-size="22">${initials}</text>
 </svg>`;
-    res.setHeader('Content-Type', 'image/svg+xml');
-    res.send(svg);
-  });
+      res.setHeader('Content-Type', 'image/svg+xml');
+      res.send(svg);
+    })
+  );
 
-  // Real-time Server-Sent Events stream for immediate bracket & league updates
+  // Real-time Server-Sent Events stream (short serverless response on Vercel to prevent timeouts)
   app.get('/api/events', (req: Request, res: Response) => {
     res.setHeader('Content-Type', 'text/event-stream');
     res.setHeader('Cache-Control', 'no-cache, no-transform');
-    res.setHeader('Connection', 'keep-alive');
     res.setHeader('X-Accel-Buffering', 'no');
+    if (IS_VERCEL) {
+      res.write(`retry: 20000\nevent: connected\ndata: ${JSON.stringify({ ok: true, serverless: true })}\n\n`);
+      res.end();
+      return;
+    }
+    res.setHeader('Connection', 'keep-alive');
     res.flushHeaders?.();
 
     res.write(`event: connected\ndata: ${JSON.stringify({ ok: true })}\n\n`);
@@ -2463,9 +2767,11 @@ async function startServer() {
   });
 
   // Bootstrap endpoint
-  app.get('/api/bootstrap', (req: AuthenticatedRequest, res: Response) => {
-    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
-    const db = loadDb();
+  app.get(
+    '/api/bootstrap',
+    asyncRoute(async (req: AuthenticatedRequest, res: Response) => {
+      res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+      const db = await loadDb();
     const isAdmin = req.authUser?.role === 'admin';
     const userTeamId = req.authUser?.teamId;
 
@@ -2516,9 +2822,12 @@ async function startServer() {
       pageLikes: typeof db.pageLikes === 'number' ? db.pageLikes : 0,
       user: req.authUser || null,
     });
-  });
+  })
+  );
 
   function getFirebaseAppletApiKey(): string {
+    const envKey = (process.env.FIREBASE_WEB_API_KEY || process.env.VITE_FIREBASE_API_KEY || '').trim();
+    if (envKey) return envKey;
     try {
       const cfgPath = path.join(ROOT_DIR, 'firebase-applet-config.json');
       if (fs.existsSync(cfgPath)) {
@@ -2587,7 +2896,7 @@ async function startServer() {
         return;
       }
 
-      const db = loadDb();
+      const db = await loadDb({ fresh: true });
       const teams = Array.isArray(db.teams) ? db.teams : [];
       const configuredAdminId = String(db.settings?.adminId || 'ADMI').trim();
 
@@ -2610,7 +2919,7 @@ async function startServer() {
               performedBy: configuredAdminId,
             });
             try {
-              saveDb(db);
+              await saveDb(db);
             } catch (saveErr) {
               console.error('Warning saving synced adminClaveHash:', saveErr);
             }
@@ -2713,161 +3022,171 @@ async function startServer() {
   }
 
   // Validates privately (without exposing the stored email) whether an email is the Admin's configured recovery email
-  app.post('/api/auth/verify-admin-recovery-email', (req: Request, res: Response) => {
-    if (!checkResetRateLimit(req, 10)) {
-      res.status(429).json({
-        error: 'Demasiados intentos de recuperación. Esperá unos minutos antes de reintentar.',
-      });
-      return;
-    }
-
-    const email = String(req.body?.email || '').trim().toLowerCase();
-    if (!email || !email.includes('@')) {
-      res.status(400).json({ error: 'Ingresá un correo electrónico válido.' });
-      return;
-    }
-
-    const db = loadDb();
-    const configuredEmail = (db.settings.backupGmail || 'cristiandiazdevelez@gmail.com')
-      .trim()
-      .toLowerCase();
-
-    if (email !== configuredEmail) {
-      res.status(403).json({
-        error: 'El correo ingresado no coincide con el email de recuperación autorizado del Administrador.',
-      });
-      return;
-    }
-
-    res.json({ authorized: true });
-  });
-
-  // Syncs the Admin's new Firebase Authentication password with the league Admin account
-  // after verifying the Firebase ID Token via Identity Toolkit accounts:lookup.
-  app.post('/api/auth/sync-firebase-admin-password', async (req: Request, res: Response) => {
-    if (!checkResetRateLimit(req, 15)) {
-      res.status(429).json({ error: 'Demasiados intentos. Esperá unos minutos.' });
-      return;
-    }
-
-    const authHeader = req.headers.authorization;
-    const idToken =
-      authHeader && authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : '';
-
-    const newClave = String(req.body?.newClave || '').trim();
-    if (!idToken) {
-      res.status(401).json({ error: 'Falta el token de verificación de Firebase Authentication.' });
-      return;
-    }
-    if (newClave.length < 4) {
-      res.status(400).json({ error: 'La nueva contraseña debe tener al menos 4 caracteres.' });
-      return;
-    }
-
-    const apiKey = getFirebaseAppletApiKey();
-    if (!apiKey) {
-      res.status(500).json({ error: 'Configuración de Firebase Authentication no encontrada.' });
-      return;
-    }
-
-    try {
-      const lookupRes = await fetch(
-        `https://identitytoolkit.googleapis.com/v1/accounts:lookup?key=${encodeURIComponent(apiKey)}`,
-        {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ idToken }),
-        }
-      );
-
-      if (!lookupRes.ok) {
-        res.status(401).json({ error: 'El token de Firebase es inválido o venció.' });
-        return;
-      }
-
-      const lookupData = (await lookupRes.json()) as {
-        users?: { email?: string; emailVerified?: boolean }[];
-      };
-      const fbUser = lookupData.users?.[0];
-      const verifiedEmail = String(fbUser?.email || '').trim().toLowerCase();
-
-      const db = loadDb();
-      const configuredEmail = (db.settings.backupGmail || 'cristiandiazdevelez@gmail.com')
-        .trim()
-        .toLowerCase();
-
-      if (!verifiedEmail || verifiedEmail !== configuredEmail) {
-        res.status(403).json({
-          error: 'La cuenta verificada de Firebase no coincide con el Administrador autorizado.',
+  app.post(
+    '/api/auth/verify-admin-recovery-email',
+    asyncRoute(async (req: Request, res: Response) => {
+      if (!checkResetRateLimit(req, 10)) {
+        res.status(429).json({
+          error: 'Demasiados intentos de recuperación. Esperá unos minutos antes de reintentar.',
         });
         return;
       }
 
-      db.settings.adminClaveHash = hashPassword(newClave);
-      db.settings.adminTokenVersion = (db.settings.adminTokenVersion ?? 1) + 1;
-      appendCredentialAudit(db, {
-        action: 'admin_firebase_password_reset',
-        targetType: 'admin',
-        targetId: db.settings.adminId,
-        targetLabel: 'Administrador General',
-        details: 'Contraseña de Administrador restablecida mediante correo de recuperación oficial.',
-        performedBy: db.settings.adminId,
-      });
-      saveDb(db);
+      const email = String(req.body?.email || '').trim().toLowerCase();
+      if (!email || !email.includes('@')) {
+        res.status(400).json({ error: 'Ingresá un correo electrónico válido.' });
+        return;
+      }
 
-      res.json({
-        ok: true,
-        adminId: db.settings.adminId,
-        message:
-          '¡OK! Todo listo. Tu nueva contraseña de Administrador fue guardada de forma segura y ya podés ingresar con tu ID y nueva contraseña.',
-      });
-    } catch (err) {
-      console.error('Error syncing Firebase admin password:', err);
-      res.status(500).json({ error: 'Error inesperado al sincronizar la nueva contraseña.' });
-    }
-  });
+      const db = await loadDb({ fresh: true });
+      const configuredEmail = (db.settings.backupGmail || 'cristiandiazdevelez@gmail.com')
+        .trim()
+        .toLowerCase();
+
+      if (email !== configuredEmail) {
+        res.status(403).json({
+          error: 'El correo ingresado no coincide con el email de recuperación autorizado del Administrador.',
+        });
+        return;
+      }
+
+      res.json({ authorized: true });
+    })
+  );
+
+  // Syncs the Admin's new Firebase Authentication password with the league Admin account
+  // after verifying the Firebase ID Token via Identity Toolkit accounts:lookup.
+  app.post(
+    '/api/auth/sync-firebase-admin-password',
+    asyncRoute(async (req: Request, res: Response) => {
+      if (!checkResetRateLimit(req, 15)) {
+        res.status(429).json({ error: 'Demasiados intentos. Esperá unos minutos.' });
+        return;
+      }
+
+      const authHeader = req.headers.authorization;
+      const idToken =
+        authHeader && authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : '';
+
+      const newClave = String(req.body?.newClave || '').trim();
+      if (!idToken) {
+        res.status(401).json({ error: 'Falta el token de verificación de Firebase Authentication.' });
+        return;
+      }
+      if (newClave.length < 4) {
+        res.status(400).json({ error: 'La nueva contraseña debe tener al menos 4 caracteres.' });
+        return;
+      }
+
+      const apiKey = getFirebaseAppletApiKey();
+      if (!apiKey) {
+        res.status(500).json({ error: 'Configuración de Firebase Authentication no encontrada.' });
+        return;
+      }
+
+      try {
+        const lookupRes = await fetch(
+          `https://identitytoolkit.googleapis.com/v1/accounts:lookup?key=${encodeURIComponent(apiKey)}`,
+          {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ idToken }),
+          }
+        );
+
+        if (!lookupRes.ok) {
+          res.status(401).json({ error: 'El token de Firebase es inválido o venció.' });
+          return;
+        }
+
+        const lookupData = (await lookupRes.json()) as {
+          users?: { email?: string; emailVerified?: boolean }[];
+        };
+        const fbUser = lookupData.users?.[0];
+        const verifiedEmail = String(fbUser?.email || '').trim().toLowerCase();
+
+        const db = await loadDb({ fresh: true });
+        const configuredEmail = (db.settings.backupGmail || 'cristiandiazdevelez@gmail.com')
+          .trim()
+          .toLowerCase();
+
+        if (!verifiedEmail || verifiedEmail !== configuredEmail) {
+          res.status(403).json({
+            error: 'La cuenta verificada de Firebase no coincide con el Administrador autorizado.',
+          });
+          return;
+        }
+
+        db.settings.adminClaveHash = hashPassword(newClave);
+        db.settings.adminTokenVersion = (db.settings.adminTokenVersion ?? 1) + 1;
+        appendCredentialAudit(db, {
+          action: 'admin_firebase_password_reset',
+          targetType: 'admin',
+          targetId: db.settings.adminId,
+          targetLabel: 'Administrador General',
+          details: 'Contraseña de Administrador restablecida mediante correo de recuperación oficial.',
+          performedBy: db.settings.adminId,
+        });
+        await saveDb(db);
+
+        res.json({
+          ok: true,
+          adminId: db.settings.adminId,
+          message:
+            '¡OK! Todo listo. Tu nueva contraseña de Administrador fue guardada de forma segura y ya podés ingresar con tu ID y nueva contraseña.',
+        });
+      } catch (err) {
+        console.error('Error syncing Firebase admin password:', err);
+        res.status(500).json({ error: 'Error inesperado al sincronizar la nueva contraseña.' });
+      }
+    })
+  );
 
   // Member updates own bio (cannot modify ID or password)
-  app.patch('/api/profile', requireAuth, (req: AuthenticatedRequest, res: Response) => {
-    const db = loadDb();
-    const teamId = req.authUser?.teamId;
-    if (!teamId) {
-      res.status(400).json({ error: 'El perfil de equipo solo aplica a miembros.' });
-      return;
-    }
-    const team = db.teams.find((t) => t.id === teamId);
-    if (!team) {
-      res.status(404).json({ error: 'Equipo no encontrado.' });
-      return;
-    }
-    if (typeof req.body?.bio === 'string') {
-      team.bio = req.body.bio.slice(0, 240);
-    }
-    saveDb(db);
-    res.json({ team: sanitizeTeam(team) });
-  });
+  app.patch(
+    '/api/profile',
+    requireAuth,
+    asyncRoute(async (req: AuthenticatedRequest, res: Response) => {
+      const db = await loadDb({ fresh: true });
+      const teamId = req.authUser?.teamId;
+      if (!teamId) {
+        res.status(400).json({ error: 'El perfil de equipo solo aplica a miembros.' });
+        return;
+      }
+      const team = db.teams.find((t) => t.id === teamId);
+      if (!team) {
+        res.status(404).json({ error: 'Equipo no encontrado.' });
+        return;
+      }
+      if (typeof req.body?.bio === 'string') {
+        team.bio = req.body.bio.slice(0, 240);
+      }
+      await saveDb(db);
+      res.json({ team: sanitizeTeam(team) });
+    })
+  );
 
   // Member or Admin uploads a celebration photo to their own profile (subject to moderation + Admin check)
   app.post(
     '/api/profile/celebration',
     requireAuth,
     uploadChampion.single('celebrationImage'),
-    async (req: AuthenticatedRequest, res: Response) => {
-      const db = loadDb();
+    asyncRoute(async (req: AuthenticatedRequest, res: Response) => {
+      const db = await loadDb({ fresh: true });
       const teamId = req.authUser?.teamId;
       if (!teamId) {
-        if (req.file) fs.unlinkSync(req.file.path);
+        safeUnlink(req.file?.path);
         res.status(400).json({ error: 'Necesitás tener un equipo asignado para subir tu foto de festejo.' });
         return;
       }
       const team = db.teams.find((t) => t.id === teamId);
       if (!team) {
-        if (req.file) fs.unlinkSync(req.file.path);
+        safeUnlink(req.file?.path);
         res.status(404).json({ error: 'Equipo no encontrado.' });
         return;
       }
       if (!req.file || !isValidImageFile(req.file)) {
-        if (req.file) fs.unlinkSync(req.file.path);
+        safeUnlink(req.file?.path);
         res.status(400).json({ error: 'Subí una imagen válida (PNG, JPG, WEBP) de festejo deportivo.' });
         return;
       }
@@ -2878,52 +3197,57 @@ async function startServer() {
         'foto de festejo de un equipo de fútbol en su perfil'
       );
       if (!mod.allowed) {
-        try {
-          fs.unlinkSync(req.file.path);
-        } catch {
-          // ignore
-        }
+        safeUnlink(req.file.path);
         res.status(400).json({ error: mod.reason || 'Imagen rechazada por el filtro de contenido.' });
         return;
       }
 
       const isAdmin = req.authUser?.role === 'admin';
-      team.celebrationImageUrl = `/uploads/champions/${req.file.filename}`;
+      team.celebrationImageUrl = await persistUploadedFile(
+        req.file.path,
+        'champions',
+        req.file.filename,
+        req.file.mimetype
+      );
       team.celebrationStatus = isAdmin ? 'approved' : 'pending';
       team.celebrationUploadedAt = new Date().toISOString();
-      saveDb(db);
+      await saveDb(db);
       res.json({ team: sanitizeTeam(team) });
-    }
+    })
   );
 
-  app.delete('/api/profile/celebration', requireAuth, (req: AuthenticatedRequest, res: Response) => {
-    const db = loadDb();
-    const targetTeamId =
-      req.authUser?.role === 'admin' && typeof req.query.teamId === 'string'
-        ? req.query.teamId.trim()
-        : req.authUser?.teamId;
-    if (!targetTeamId) {
-      res.status(400).json({ error: 'Equipo no especificado.' });
-      return;
-    }
-    const team = db.teams.find((t) => t.id === targetTeamId);
-    if (!team) {
-      res.status(404).json({ error: 'Equipo no encontrado.' });
-      return;
-    }
-    team.celebrationImageUrl = undefined;
-    team.celebrationStatus = undefined;
-    team.celebrationUploadedAt = undefined;
-    saveDb(db);
-    res.json({ team: sanitizeTeam(team) });
-  });
+  app.delete(
+    '/api/profile/celebration',
+    requireAuth,
+    asyncRoute(async (req: AuthenticatedRequest, res: Response) => {
+      const db = await loadDb({ fresh: true });
+      const targetTeamId =
+        req.authUser?.role === 'admin' && typeof req.query.teamId === 'string'
+          ? req.query.teamId.trim()
+          : req.authUser?.teamId;
+      if (!targetTeamId) {
+        res.status(400).json({ error: 'Equipo no especificado.' });
+        return;
+      }
+      const team = db.teams.find((t) => t.id === targetTeamId);
+      if (!team) {
+        res.status(404).json({ error: 'Equipo no encontrado.' });
+        return;
+      }
+      team.celebrationImageUrl = undefined;
+      team.celebrationStatus = undefined;
+      team.celebrationUploadedAt = undefined;
+      await saveDb(db);
+      res.json({ team: sanitizeTeam(team) });
+    })
+  );
 
   // Member edits or deletes the message beneath one of their own won trophies
   app.patch(
     '/api/profile/trophies/:trophyId',
     requireAuth,
-    (req: AuthenticatedRequest, res: Response) => {
-      const db = loadDb();
+    asyncRoute(async (req: AuthenticatedRequest, res: Response) => {
+      const db = await loadDb({ fresh: true });
       const teamId = req.authUser?.teamId || (req.authUser?.role === 'admin' ? db.settings.adminTeamId : undefined);
       if (!teamId) {
         res.status(400).json({ error: 'Necesitás tener un equipo asignado para editar mensajes de trofeos.' });
@@ -2940,16 +3264,16 @@ async function startServer() {
         return;
       }
       trophy.message = typeof req.body?.message === 'string' ? req.body.message.trim().slice(0, 280) : '';
-      saveDb(db);
+      await saveDb(db);
       res.json({ trophy, team: sanitizeTeam(team) });
-    }
+    })
   );
 
   app.delete(
     '/api/profile/trophies/:trophyId/message',
     requireAuth,
-    (req: AuthenticatedRequest, res: Response) => {
-      const db = loadDb();
+    asyncRoute(async (req: AuthenticatedRequest, res: Response) => {
+      const db = await loadDb({ fresh: true });
       const teamId = req.authUser?.teamId || (req.authUser?.role === 'admin' ? db.settings.adminTeamId : undefined);
       if (!teamId) {
         res.status(400).json({ error: 'Equipo no encontrado.' });
@@ -2966,9 +3290,9 @@ async function startServer() {
         return;
       }
       trophy.message = '';
-      saveDb(db);
+      await saveDb(db);
       res.json({ trophy, team: sanitizeTeam(team) });
-    }
+    })
   );
 
   // Member uploads personal MP3 tracks for their OWN independent player
@@ -2976,19 +3300,23 @@ async function startServer() {
     '/api/profile/music',
     requireAuth,
     uploadMusic.array('audio', 20),
-    (req: AuthenticatedRequest, res: Response) => {
-      const db = loadDb();
+    asyncRoute(async (req: AuthenticatedRequest, res: Response) => {
+      const db = await loadDb({ fresh: true });
+      const files = (req.files as Express.Multer.File[] | undefined) || [];
+      const cleanupMusic = () => files.forEach((f) => safeUnlink(f.path));
+
       const teamId = req.authUser?.teamId || (req.authUser?.role === 'admin' ? db.settings.adminTeamId : undefined);
       if (!teamId) {
+        cleanupMusic();
         res.status(400).json({ error: 'Necesitás tener un equipo asignado para guardar música personal.' });
         return;
       }
       const team = db.teams.find((t) => t.id === teamId);
       if (!team) {
+        cleanupMusic();
         res.status(404).json({ error: 'Equipo no encontrado.' });
         return;
       }
-      const files = (req.files as Express.Multer.File[] | undefined) || [];
       if (files.length === 0) {
         res.status(400).json({ error: 'Seleccioná uno o más archivos MP3.' });
         return;
@@ -3001,12 +3329,13 @@ async function startServer() {
 
       for (const file of files) {
         const rawName = path.parse(file.originalname).name.replace(/[_-]+/g, ' ').trim();
-        const coverUrl = extractAndSaveMp3Cover(file.path);
+        const coverUrl = await extractAndSaveMp3Cover(file.path);
+        const audioUrl = await persistUploadedFile(file.path, 'music', file.filename, file.mimetype);
         const track: MusicTrack = {
           id: `pm_${Date.now()}_${crypto.randomBytes(3).toString('hex')}`,
           title: customTitle && files.length === 1 ? customTitle : rawName || 'Mi Canción MP3',
           artist: customArtist || team.memberName || 'Mi Reproductor',
-          audioUrl: `/uploads/music/${file.filename}`,
+          audioUrl,
           ...(coverUrl ? { coverUrl } : {}),
           createdAt: new Date().toISOString(),
         };
@@ -3014,54 +3343,58 @@ async function startServer() {
         added.push(track);
       }
 
-      saveDb(db);
+      await saveDb(db);
       res.status(201).json({ tracks: added, personalMusic: team.personalMusic });
-    }
+    })
   );
 
   // Member updates their last listened song (persisted on profile for all visitors)
-  app.post('/api/profile/last-song', requireAuth, (req: AuthenticatedRequest, res: Response) => {
-    const db = loadDb();
-    const teamId = req.authUser?.teamId || (req.authUser?.role === 'admin' ? db.settings.adminTeamId : undefined);
-    if (!teamId) {
-      res.status(400).json({ error: 'Equipo no encontrado.' });
-      return;
-    }
-    const team = db.teams.find((t) => t.id === teamId);
-    if (!team) {
-      res.status(404).json({ error: 'Equipo no encontrado.' });
-      return;
-    }
-    const title = String(req.body?.title || '').trim().slice(0, 140);
-    const artist = String(req.body?.artist || '').trim().slice(0, 120);
-    const rawCover = typeof req.body?.coverUrl === 'string' ? req.body.coverUrl.trim() : '';
-    const audioUrl = typeof req.body?.audioUrl === 'string' ? req.body.audioUrl.trim().slice(0, 400) : '';
-    if (!title) {
-      res.status(400).json({ error: 'Falta el título de la canción.' });
-      return;
-    }
-    // Allow local /uploads URLs, http(s) URLs, or bounded data:image base64 URLs
-    const coverUrl =
-      rawCover && (rawCover.startsWith('/uploads/') || rawCover.startsWith('http') || (rawCover.startsWith('data:image/') && rawCover.length < 180000))
-        ? rawCover
-        : undefined;
+  app.post(
+    '/api/profile/last-song',
+    requireAuth,
+    asyncRoute(async (req: AuthenticatedRequest, res: Response) => {
+      const db = await loadDb({ fresh: true });
+      const teamId = req.authUser?.teamId || (req.authUser?.role === 'admin' ? db.settings.adminTeamId : undefined);
+      if (!teamId) {
+        res.status(400).json({ error: 'Equipo no encontrado.' });
+        return;
+      }
+      const team = db.teams.find((t) => t.id === teamId);
+      if (!team) {
+        res.status(404).json({ error: 'Equipo no encontrado.' });
+        return;
+      }
+      const title = String(req.body?.title || '').trim().slice(0, 140);
+      const artist = String(req.body?.artist || '').trim().slice(0, 120);
+      const rawCover = typeof req.body?.coverUrl === 'string' ? req.body.coverUrl.trim() : '';
+      const audioUrl = typeof req.body?.audioUrl === 'string' ? req.body.audioUrl.trim().slice(0, 400) : '';
+      if (!title) {
+        res.status(400).json({ error: 'Falta el título de la canción.' });
+        return;
+      }
+      // Allow local /uploads URLs, http(s) URLs, or bounded data:image base64 URLs
+      const coverUrl =
+        rawCover && (rawCover.startsWith('/uploads/') || rawCover.startsWith('http') || (rawCover.startsWith('data:image/') && rawCover.length < 180000))
+          ? rawCover
+          : undefined;
 
-    team.lastListenedTrack = {
-      title,
-      artist: artist || 'Liga Master Argentina',
-      ...(coverUrl ? { coverUrl } : {}),
-      ...(audioUrl && !audioUrl.startsWith('blob:') ? { audioUrl } : {}),
-      listenedAt: new Date().toISOString(),
-    };
-    saveDb(db);
-    res.json({ lastListenedTrack: team.lastListenedTrack });
-  });
+      team.lastListenedTrack = {
+        title,
+        artist: artist || 'Liga Master Argentina',
+        ...(coverUrl ? { coverUrl } : {}),
+        ...(audioUrl && !audioUrl.startsWith('blob:') ? { audioUrl } : {}),
+        listenedAt: new Date().toISOString(),
+      };
+      await saveDb(db);
+      res.json({ lastListenedTrack: team.lastListenedTrack });
+    })
+  );
 
   app.delete(
     '/api/profile/music/:trackId',
     requireAuth,
-    (req: AuthenticatedRequest, res: Response) => {
-      const db = loadDb();
+    asyncRoute(async (req: AuthenticatedRequest, res: Response) => {
+      const db = await loadDb({ fresh: true });
       const teamId = req.authUser?.teamId || (req.authUser?.role === 'admin' ? db.settings.adminTeamId : undefined);
       if (!teamId) {
         res.status(400).json({ error: 'Equipo no encontrado.' });
@@ -3079,83 +3412,87 @@ async function startServer() {
         res.status(404).json({ error: 'Canción personal no encontrada.' });
         return;
       }
-      saveDb(db);
+      await saveDb(db);
       res.json({ deleted: true, personalMusic: team.personalMusic });
-    }
+    })
   );
 
   // Admin: crown League Champion (#1 or chosen team) and automatically award the Liga Argentina trophy
-  app.post('/api/admin/award-league-champion', requireAdmin, (req: AuthenticatedRequest, res: Response) => {
-    const db = loadDb();
-    const requestedTeamId = typeof req.body?.teamId === 'string' ? req.body.teamId.trim() : '';
-    const ranked = getRankedStandingsTeams(db.teams, db.matches);
-    const targetTeam = requestedTeamId
-      ? db.teams.find((t) => t.id === requestedTeamId)
-      : ranked[0];
+  app.post(
+    '/api/admin/award-league-champion',
+    requireAdmin,
+    asyncRoute(async (req: AuthenticatedRequest, res: Response) => {
+      const db = await loadDb({ fresh: true });
+      const requestedTeamId = typeof req.body?.teamId === 'string' ? req.body.teamId.trim() : '';
+      const ranked = getRankedStandingsTeams(db.teams, db.matches);
+      const targetTeam = requestedTeamId
+        ? db.teams.find((t) => t.id === requestedTeamId)
+        : ranked[0];
 
-    if (!targetTeam) {
-      res.status(400).json({ error: 'No hay equipos registrados para coronar como Campeón de Liga.' });
-      return;
-    }
+      if (!targetTeam) {
+        res.status(400).json({ error: 'No hay equipos registrados para coronar como Campeón de Liga.' });
+        return;
+      }
 
-    const season =
-      (typeof req.body?.season === 'string' && req.body.season.trim()) ||
-      db.settings.subtitle ||
-      'TEMPORADA 2026-2027';
+      const season =
+        (typeof req.body?.season === 'string' && req.body.season.trim()) ||
+        db.settings.subtitle ||
+        'TEMPORADA 2026-2027';
 
-    const champEntry: ChampionEntry = {
-      id: `champ_liga_${Date.now()}_${crypto.randomBytes(3).toString('hex')}`,
-      season,
-      teamId: targetTeam.id,
-      teamName: targetTeam.name,
-      memberName: targetTeam.memberName,
-      tournamentType: 'liga',
-      notes: 'Campeón Oficial de la Liga Master Argentina.',
-      celebrationImageUrl: LIGA_TROPHY_IMG,
-      createdAt: new Date().toISOString(),
-    };
-    db.champions.unshift(champEntry);
+      const champEntry: ChampionEntry = {
+        id: `champ_liga_${Date.now()}_${crypto.randomBytes(3).toString('hex')}`,
+        season,
+        teamId: targetTeam.id,
+        teamName: targetTeam.name,
+        memberName: targetTeam.memberName,
+        tournamentType: 'liga',
+        notes: 'Campeón Oficial de la Liga Master Argentina.',
+        celebrationImageUrl: LIGA_TROPHY_IMG,
+        createdAt: new Date().toISOString(),
+      };
+      db.champions.unshift(champEntry);
 
-    awardTeamTrophy(db, {
-      teamId: targetTeam.id,
-      teamName: targetTeam.name,
-      memberName: targetTeam.memberName,
-      type: 'liga',
-      title: 'Campeón Liga Argentina',
-      season,
-      sourceKey: `champ_${champEntry.id}`,
-    });
+      awardTeamTrophy(db, {
+        teamId: targetTeam.id,
+        teamName: targetTeam.name,
+        memberName: targetTeam.memberName,
+        type: 'liga',
+        title: 'Campeón Liga Argentina',
+        season,
+        sourceKey: `champ_${champEntry.id}`,
+      });
 
-    // Also update Recopa League Champion slot automatically
-    if (db.cup?.recopa) {
-      db.cup.recopa.leagueChampionName = targetTeam.name;
-      db.cup.recopa.leagueChampionMember = targetTeam.memberName;
-      db.cup.recopa.leagueChampionCrestUrl = targetTeam.crestUrl;
-    }
+      // Also update Recopa League Champion slot automatically
+      if (db.cup?.recopa) {
+        db.cup.recopa.leagueChampionName = targetTeam.name;
+        db.cup.recopa.leagueChampionMember = targetTeam.memberName;
+        db.cup.recopa.leagueChampionCrestUrl = targetTeam.crestUrl;
+      }
 
-    saveDb(db);
-    res.status(201).json({ champion: champEntry, team: sanitizeTeam(targetTeam) });
-  });
+      await saveDb(db);
+      res.status(201).json({ champion: champEntry, team: sanitizeTeam(targetTeam) });
+    })
+  );
 
   // Admin: create or update their own participating team (escudo, equipo, nombre, bio)
   app.put(
     '/api/admin/my-team',
     requireAdmin,
     uploadCrest.single('crest'),
-    async (req: AuthenticatedRequest, res: Response) => {
-      const db = loadDb();
+    asyncRoute(async (req: AuthenticatedRequest, res: Response) => {
+      const db = await loadDb({ fresh: true });
       const name = String(req.body?.name || '').trim();
       const memberName = String(req.body?.memberName || '').trim();
       const bio = typeof req.body?.bio === 'string' ? req.body.bio.trim().slice(0, 240) : undefined;
 
       if (!name || !memberName) {
-        if (req.file) fs.unlinkSync(req.file.path);
+        safeUnlink(req.file?.path);
         res.status(400).json({ error: 'Completá el nombre de tu equipo y tu nombre.' });
         return;
       }
 
       if (req.file && !isValidImageFile(req.file)) {
-        fs.unlinkSync(req.file.path);
+        safeUnlink(req.file.path);
         res.status(400).json({ error: 'El escudo debe ser una imagen válida (PNG, JPG, WEBP, etc.).' });
         return;
       }
@@ -3163,10 +3500,11 @@ async function startServer() {
       let team = db.teams.find((t) => t.id === db.settings.adminTeamId);
 
       if (!team) {
-        if (db.teams.length >= db.settings.maxTeams) {
-          if (req.file) fs.unlinkSync(req.file.path);
+        const effectiveMax = Math.max(Number(db.settings.maxTeams) || 100, 100);
+        if (db.teams.length >= effectiveMax) {
+          safeUnlink(req.file?.path);
           res.status(400).json({
-            error: `Se alcanzó el límite máximo de ${db.settings.maxTeams} equipos en la liga.`,
+            error: `Se alcanzó el límite máximo de ${effectiveMax} equipos en la liga.`,
           });
           return;
         }
@@ -3182,7 +3520,13 @@ async function startServer() {
         let crestUrl = `/api/crest/${encodeURIComponent(candidate)}.svg`;
         if (req.file) {
           const finalName = await normalizePng128(req.file.path);
-          crestUrl = `/uploads/crests/${finalName}`;
+          const finalPath = path.join(path.dirname(req.file.path), finalName);
+          crestUrl = await persistUploadedFile(
+            finalPath,
+            'crests',
+            finalName,
+            finalName.endsWith('.png') ? 'image/png' : req.file.mimetype
+          );
         }
 
         team = {
@@ -3209,13 +3553,19 @@ async function startServer() {
         }
         if (req.file) {
           const finalName = await normalizePng128(req.file.path);
-          team.crestUrl = `/uploads/crests/${finalName}`;
+          const finalPath = path.join(path.dirname(req.file.path), finalName);
+          team.crestUrl = await persistUploadedFile(
+            finalPath,
+            'crests',
+            finalName,
+            finalName.endsWith('.png') ? 'image/png' : req.file.mimetype
+          );
         }
       }
 
-      saveDb(db);
+      await saveDb(db);
       res.json({ team: sanitizeTeam(team), adminTeamId: db.settings.adminTeamId });
-    }
+    })
   );
 
   // Admin: update site branding/settings (Admin credentials are updated strictly via PUT /api/admin/credentials)
@@ -3228,8 +3578,8 @@ async function startServer() {
       { name: 'faviconFile', maxCount: 1 },
       { name: 'backgroundFile', maxCount: 1 },
     ]),
-    (req: AuthenticatedRequest, res: Response) => {
-      const db = loadDb();
+    asyncRoute(async (req: AuthenticatedRequest, res: Response) => {
+      const db = await loadDb({ fresh: true });
       const files = req.files as Record<string, Express.Multer.File[]> | undefined;
       const { title, subtitle, description, calendarMessage, bannerText, adminTeamId, radioName, radioStreamUrl } = req.body as Record<string, string>;
 
@@ -3250,164 +3600,173 @@ async function startServer() {
       }
 
       if (files?.crestFile?.[0]) {
-        db.settings.crestUrl = `/uploads/site/${files.crestFile[0].filename}`;
+        const f = files.crestFile[0];
+        db.settings.crestUrl = await persistUploadedFile(f.path, 'site', f.filename, f.mimetype);
       }
       if (files?.coverFile?.[0]) {
-        db.settings.coverUrl = `/uploads/site/${files.coverFile[0].filename}`;
+        const f = files.coverFile[0];
+        db.settings.coverUrl = await persistUploadedFile(f.path, 'site', f.filename, f.mimetype);
       }
       if (files?.faviconFile?.[0]) {
-        db.settings.faviconUrl = `/uploads/site/${files.faviconFile[0].filename}`;
+        const f = files.faviconFile[0];
+        db.settings.faviconUrl = await persistUploadedFile(f.path, 'site', f.filename, f.mimetype);
       }
       if (files?.backgroundFile?.[0]) {
-        db.settings.backgroundUrl = `/uploads/site/${files.backgroundFile[0].filename}`;
+        const f = files.backgroundFile[0];
+        db.settings.backgroundUrl = await persistUploadedFile(f.path, 'site', f.filename, f.mimetype);
       }
 
-      saveDb(db);
+      await saveDb(db);
       res.json({ settings: sanitizeSettings(db.settings, true) });
-    }
+    })
   );
 
   // Admin: dedicated verified credentials management (requires currentPassword, prevents losing Admin access)
-  app.put('/api/admin/credentials', requireAdmin, (req: AuthenticatedRequest, res: Response) => {
-    const db = loadDb();
-    const currentPassword = String(req.body?.currentPassword || '').trim();
-    const rawNextAdminId = String(req.body?.nextAdminId ?? db.settings.adminId).trim().toUpperCase();
-    const nextPassword = String(req.body?.nextPassword || '').trim();
-    const confirmPassword = String(req.body?.confirmPassword || '').trim();
-    const nextBackupGmail = String(req.body?.nextBackupGmail ?? db.settings.backupGmail ?? '')
-      .trim()
-      .toLowerCase();
+  app.put(
+    '/api/admin/credentials',
+    requireAdmin,
+    asyncRoute(async (req: AuthenticatedRequest, res: Response) => {
+      const db = await loadDb({ fresh: true });
+      const currentPassword = String(req.body?.currentPassword || '').trim();
+      const rawNextAdminId = String(req.body?.nextAdminId ?? db.settings.adminId).trim().toUpperCase();
+      const nextPassword = String(req.body?.nextPassword || '').trim();
+      const confirmPassword = String(req.body?.confirmPassword || '').trim();
+      const nextBackupGmail = String(req.body?.nextBackupGmail ?? db.settings.backupGmail ?? '')
+        .trim()
+        .toLowerCase();
 
-    if (!currentPassword) {
-      res.status(400).json({
-        error: 'Por seguridad, ingresá tu contraseña actual de Administrador para confirmar los cambios.',
-      });
-      return;
-    }
-
-    if (!verifyPassword(currentPassword, db.settings.adminClaveHash)) {
-      res.status(401).json({
-        error: 'Verificación fallida: la contraseña actual del Administrador no es correcta.',
-      });
-      return;
-    }
-
-    if (!/^[A-Z0-9_-]{3,20}$/.test(rawNextAdminId)) {
-      res.status(400).json({
-        error: 'El ID del Administrador debe tener entre 3 y 20 caracteres alfanuméricos (letras, números, - o _).',
-      });
-      return;
-    }
-
-    if (db.teams.some((t) => t.id.toUpperCase() === rawNextAdminId)) {
-      res.status(409).json({
-        error: `El ID "${rawNextAdminId}" pertenece a un participante. Elegí un ID exclusivo para el Administrador para evitar conflictos de acceso.`,
-      });
-      return;
-    }
-
-    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(nextBackupGmail)) {
-      res.status(400).json({
-        error: 'Ingresá un correo electrónico de recuperación válido. Es obligatorio mantener un correo de respaldo activo.',
-      });
-      return;
-    }
-
-    if (nextPassword) {
-      if (nextPassword.length < 6 || nextPassword.length > 64) {
+      if (!currentPassword) {
         res.status(400).json({
-          error: 'La nueva contraseña del Administrador debe tener entre 6 y 64 caracteres.',
+          error: 'Por seguridad, ingresá tu contraseña actual de Administrador para confirmar los cambios.',
         });
         return;
       }
-      if (nextPassword !== confirmPassword) {
-        res.status(400).json({
-          error: 'La nueva contraseña y su confirmación no coinciden.',
+
+      if (!verifyPassword(currentPassword, db.settings.adminClaveHash)) {
+        res.status(401).json({
+          error: 'Verificación fallida: la contraseña actual del Administrador no es correcta.',
         });
         return;
       }
-      if (nextPassword.toUpperCase() === rawNextAdminId) {
+
+      if (!/^[A-Z0-9_-]{3,20}$/.test(rawNextAdminId)) {
         res.status(400).json({
-          error: 'Por seguridad, la contraseña no puede ser igual a tu ID de Administrador.',
+          error: 'El ID del Administrador debe tener entre 3 y 20 caracteres alfanuméricos (letras, números, - o _).',
         });
         return;
       }
-    }
 
-    const changedParts: string[] = [];
-    const oldAdminId = db.settings.adminId;
-    if (rawNextAdminId !== oldAdminId.toUpperCase()) {
-      db.settings.adminId = rawNextAdminId;
-      changedParts.push(`ID (${oldAdminId} → ${rawNextAdminId})`);
-    } else {
-      db.settings.adminId = rawNextAdminId;
-    }
+      if (db.teams.some((t) => t.id.toUpperCase() === rawNextAdminId)) {
+        res.status(409).json({
+          error: `El ID "${rawNextAdminId}" pertenece a un participante. Elegí un ID exclusivo para el Administrador para evitar conflictos de acceso.`,
+        });
+        return;
+      }
 
-    if (nextBackupGmail !== String(db.settings.backupGmail || '').trim().toLowerCase()) {
-      db.settings.backupGmail = nextBackupGmail;
-      changedParts.push('correo de recuperación');
-    }
+      if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(nextBackupGmail)) {
+        res.status(400).json({
+          error: 'Ingresá un correo electrónico de recuperación válido. Es obligatorio mantener un correo de respaldo activo.',
+        });
+        return;
+      }
 
-    if (nextPassword) {
-      db.settings.adminClaveHash = hashPassword(nextPassword);
-      changedParts.push('contraseña administrativa');
-    }
+      if (nextPassword) {
+        if (nextPassword.length < 6 || nextPassword.length > 64) {
+          res.status(400).json({
+            error: 'La nueva contraseña del Administrador debe tener entre 6 y 64 caracteres.',
+          });
+          return;
+        }
+        if (nextPassword !== confirmPassword) {
+          res.status(400).json({
+            error: 'La nueva contraseña y su confirmación no coinciden.',
+          });
+          return;
+        }
+        if (nextPassword.toUpperCase() === rawNextAdminId) {
+          res.status(400).json({
+            error: 'Por seguridad, la contraseña no puede ser igual a tu ID de Administrador.',
+          });
+          return;
+        }
+      }
 
-    if (changedParts.length === 0) {
-      res.status(400).json({
-        error: 'No se detectaron cambios en las credenciales del Administrador.',
+      const changedParts: string[] = [];
+      const oldAdminId = db.settings.adminId;
+      if (rawNextAdminId !== oldAdminId.toUpperCase()) {
+        db.settings.adminId = rawNextAdminId;
+        changedParts.push(`ID (${oldAdminId} → ${rawNextAdminId})`);
+      } else {
+        db.settings.adminId = rawNextAdminId;
+      }
+
+      if (nextBackupGmail !== String(db.settings.backupGmail || '').trim().toLowerCase()) {
+        db.settings.backupGmail = nextBackupGmail;
+        changedParts.push('correo de recuperación');
+      }
+
+      if (nextPassword) {
+        db.settings.adminClaveHash = hashPassword(nextPassword);
+        changedParts.push('contraseña administrativa');
+      }
+
+      if (changedParts.length === 0) {
+        res.status(400).json({
+          error: 'No se detectaron cambios en las credenciales del Administrador.',
+        });
+        return;
+      }
+
+      db.settings.adminTokenVersion = (db.settings.adminTokenVersion ?? 1) + 1;
+      appendCredentialAudit(db, {
+        action: 'update_admin_credentials',
+        targetType: 'admin',
+        targetId: db.settings.adminId,
+        targetLabel: 'Administrador General',
+        details: `Actualización verificada de: ${changedParts.join(', ')}.`,
+        performedBy: oldAdminId,
       });
-      return;
-    }
 
-    db.settings.adminTokenVersion = (db.settings.adminTokenVersion ?? 1) + 1;
-    appendCredentialAudit(db, {
-      action: 'update_admin_credentials',
-      targetType: 'admin',
-      targetId: db.settings.adminId,
-      targetLabel: 'Administrador General',
-      details: `Actualización verificada de: ${changedParts.join(', ')}.`,
-      performedBy: oldAdminId,
-    });
+      await saveDb(db);
 
-    saveDb(db);
+      const adminTeam = db.teams.find((t) => t.id === db.settings.adminTeamId);
+      const nextPayload: TokenPayload = {
+        role: 'admin',
+        id: db.settings.adminId,
+        displayName: adminTeam
+          ? `${adminTeam.memberName} (${adminTeam.name})`
+          : 'Administrador General',
+        teamId: adminTeam?.id,
+        tokenVersion: db.settings.adminTokenVersion,
+        exp: Date.now() + 7 * 24 * 60 * 60 * 1000,
+      };
 
-    const adminTeam = db.teams.find((t) => t.id === db.settings.adminTeamId);
-    const nextPayload: TokenPayload = {
-      role: 'admin',
-      id: db.settings.adminId,
-      displayName: adminTeam
-        ? `${adminTeam.memberName} (${adminTeam.name})`
-        : 'Administrador General',
-      teamId: adminTeam?.id,
-      tokenVersion: db.settings.adminTokenVersion,
-      exp: Date.now() + 7 * 24 * 60 * 60 * 1000,
-    };
-
-    res.json({
-      token: signToken(nextPayload),
-      user: {
-        role: nextPayload.role,
-        id: nextPayload.id,
-        displayName: nextPayload.displayName,
-        teamId: nextPayload.teamId,
-      },
-      settings: sanitizeSettings(db.settings, true),
-      credentialAuditLog: db.credentialAuditLog || [],
-    });
-  });
+      res.json({
+        token: signToken(nextPayload),
+        user: {
+          role: nextPayload.role,
+          id: nextPayload.id,
+          displayName: nextPayload.displayName,
+          teamId: nextPayload.teamId,
+        },
+        settings: sanitizeSettings(db.settings, true),
+        credentialAuditLog: db.credentialAuditLog || [],
+      });
+    })
+  );
 
   // Admin: create participant (hashed password, unique ID, default active status, audit logged)
   app.post(
     '/api/admin/teams',
     requireAdmin,
     uploadCrest.single('crest'),
-    async (req: AuthenticatedRequest, res: Response) => {
-      const db = loadDb();
-      if (db.teams.length >= db.settings.maxTeams) {
-        if (req.file) fs.unlinkSync(req.file.path);
+    asyncRoute(async (req: AuthenticatedRequest, res: Response) => {
+      const db = await loadDb({ fresh: true });
+      const effectiveMax = Math.max(Number(db.settings.maxTeams) || 100, 100);
+      if (db.teams.length >= effectiveMax) {
+        safeUnlink(req.file?.path);
         res.status(400).json({
-          error: `Se alcanzó el límite máximo de ${db.settings.maxTeams} participantes en la liga.`,
+          error: `Se alcanzó el límite máximo de ${effectiveMax} participantes en la liga.`,
         });
         return;
       }
@@ -3419,7 +3778,7 @@ async function startServer() {
       const bio = String(req.body?.bio || '').trim().slice(0, 240);
 
       if (!memberName) {
-        if (req.file) fs.unlinkSync(req.file.path);
+        safeUnlink(req.file?.path);
         res.status(400).json({ error: 'Completá al menos el Nombre del Participante.' });
         return;
       }
@@ -3434,7 +3793,7 @@ async function startServer() {
           id = `LMA${String(nextNum).padStart(2, '0')}`;
         }
       } else if (!/^[A-Z0-9_-]{2,20}$/.test(id)) {
-        if (req.file) fs.unlinkSync(req.file.path);
+        safeUnlink(req.file?.path);
         res.status(400).json({
           error: 'El ID del participante debe tener entre 2 y 20 caracteres alfanuméricos (letras, números, - o _).',
         });
@@ -3444,7 +3803,7 @@ async function startServer() {
       const initialPassword =
         rawClave || `PES6_${crypto.randomBytes(3).toString('hex').toUpperCase()}`;
       if (initialPassword.length < 4 || initialPassword.length > 64) {
-        if (req.file) fs.unlinkSync(req.file.path);
+        safeUnlink(req.file?.path);
         res.status(400).json({
           error: 'La contraseña inicial debe tener entre 4 y 64 caracteres.',
         });
@@ -3454,13 +3813,13 @@ async function startServer() {
       const name = rawName || `Club ${memberName}`;
 
       if (id === db.settings.adminId.toUpperCase()) {
-        if (req.file) fs.unlinkSync(req.file.path);
+        safeUnlink(req.file?.path);
         res.status(409).json({ error: `El ID "${id}" está reservado para el Administrador.` });
         return;
       }
 
       if (db.teams.some((t) => t.id.toUpperCase() === id)) {
-        if (req.file) fs.unlinkSync(req.file.path);
+        safeUnlink(req.file?.path);
         res.status(409).json({ error: `Ya existe un participante con el ID "${id}".` });
         return;
       }
@@ -3468,12 +3827,18 @@ async function startServer() {
       let crestUrl = `/api/crest/${encodeURIComponent(id)}.svg`;
       if (req.file) {
         if (!isValidImageFile(req.file)) {
-          fs.unlinkSync(req.file.path);
+          safeUnlink(req.file.path);
           res.status(400).json({ error: 'El escudo del equipo debe ser una imagen válida (PNG, JPG, WEBP, etc.).' });
           return;
         }
         const finalName = await normalizePng128(req.file.path);
-        crestUrl = `/uploads/crests/${finalName}`;
+        const finalPath = path.join(path.dirname(req.file.path), finalName);
+        crestUrl = await persistUploadedFile(
+          finalPath,
+          'crests',
+          finalName,
+          finalName.endsWith('.png') ? 'image/png' : req.file.mimetype
+        );
       }
 
       const now = new Date().toISOString();
@@ -3502,12 +3867,12 @@ async function startServer() {
         performedBy: req.authUser?.id || db.settings.adminId,
       });
 
-      saveDb(db);
+      await saveDb(db);
       res.status(201).json({
         team: sanitizeAdminTeam(newTeam),
         generatedClave: rawClave ? undefined : initialPassword,
       });
-    }
+    })
   );
 
   // Admin: update existing participant (ID, optional new password reset, team name, memberName, bio, status, crest)
@@ -3515,12 +3880,12 @@ async function startServer() {
     '/api/admin/teams/:teamId',
     requireAdmin,
     uploadCrest.single('crest'),
-    async (req: AuthenticatedRequest, res: Response) => {
-      const db = loadDb();
+    asyncRoute(async (req: AuthenticatedRequest, res: Response) => {
+      const db = await loadDb({ fresh: true });
       const targetId = String(req.params.teamId || '');
       const team = db.teams.find((t) => t.id === targetId);
       if (!team) {
-        if (req.file) fs.unlinkSync(req.file.path);
+        safeUnlink(req.file?.path);
         res.status(404).json({ error: 'Participante no encontrado.' });
         return;
       }
@@ -3528,26 +3893,26 @@ async function startServer() {
       const oldId = team.id;
       const nextId = String(req.body?.id ?? team.id).trim().toUpperCase();
       if (!nextId || !/^[A-Z0-9_-]{2,20}$/.test(nextId)) {
-        if (req.file) fs.unlinkSync(req.file.path);
+        safeUnlink(req.file?.path);
         res.status(400).json({
           error: 'El ID del participante debe tener entre 2 y 20 caracteres alfanuméricos (letras, números, - o _).',
         });
         return;
       }
       if (nextId === db.settings.adminId.toUpperCase()) {
-        if (req.file) fs.unlinkSync(req.file.path);
+        safeUnlink(req.file?.path);
         res.status(409).json({ error: `El ID "${nextId}" está reservado para el Administrador.` });
         return;
       }
       if (nextId !== oldId && db.teams.some((t) => t.id.toUpperCase() === nextId)) {
-        if (req.file) fs.unlinkSync(req.file.path);
+        safeUnlink(req.file?.path);
         res.status(409).json({ error: `El ID "${nextId}" ya está en uso.` });
         return;
       }
 
       const nextPassword = typeof req.body?.clave === 'string' ? req.body.clave.trim() : '';
       if (nextPassword && (nextPassword.length < 4 || nextPassword.length > 64)) {
-        if (req.file) fs.unlinkSync(req.file.path);
+        safeUnlink(req.file?.path);
         res.status(400).json({
           error: 'La nueva contraseña debe tener entre 4 y 64 caracteres (o dejá el campo vacío para mantener la actual).',
         });
@@ -3556,12 +3921,18 @@ async function startServer() {
 
       if (req.file) {
         if (!isValidImageFile(req.file)) {
-          fs.unlinkSync(req.file.path);
+          safeUnlink(req.file.path);
           res.status(400).json({ error: 'El escudo debe ser una imagen válida (PNG, JPG, WEBP, etc.).' });
           return;
         }
         const finalName = await normalizePng128(req.file.path);
-        team.crestUrl = `/uploads/crests/${finalName}`;
+        const finalPath = path.join(path.dirname(req.file.path), finalName);
+        team.crestUrl = await persistUploadedFile(
+          finalPath,
+          'crests',
+          finalName,
+          finalName.endsWith('.png') ? 'image/png' : req.file.mimetype
+        );
       }
 
       const now = new Date().toISOString();
@@ -3656,17 +4027,17 @@ async function startServer() {
         }
       }
 
-      saveDb(db);
+      await saveDb(db);
       res.json({ team: sanitizeAdminTeam(team) });
-    }
+    })
   );
 
   // Admin: activate or block participant account (revokes active sessions when blocked)
   app.patch(
     '/api/admin/teams/:teamId/status',
     requireAdmin,
-    (req: AuthenticatedRequest, res: Response) => {
-      const db = loadDb();
+    asyncRoute(async (req: AuthenticatedRequest, res: Response) => {
+      const db = await loadDb({ fresh: true });
       const targetId = String(req.params.teamId || '');
       const team = db.teams.find((t) => t.id === targetId);
       if (!team) {
@@ -3697,17 +4068,17 @@ async function startServer() {
         performedBy: req.authUser?.id || db.settings.adminId,
       });
 
-      saveDb(db);
+      await saveDb(db);
       res.json({ team: sanitizeAdminTeam(team) });
-    }
+    })
   );
 
   // Admin: reset participant password (custom or generated one-time temporary password)
   app.post(
     '/api/admin/teams/:teamId/reset-password',
     requireAdmin,
-    (req: AuthenticatedRequest, res: Response) => {
-      const db = loadDb();
+    asyncRoute(async (req: AuthenticatedRequest, res: Response) => {
+      const db = await loadDb({ fresh: true });
       const targetId = String(req.params.teamId || '');
       const team = db.teams.find((t) => t.id === targetId);
       if (!team) {
@@ -3743,41 +4114,45 @@ async function startServer() {
         performedBy: req.authUser?.id || db.settings.adminId,
       });
 
-      saveDb(db);
+      await saveDb(db);
       res.json({
         team: sanitizeAdminTeam(team),
         resetPassword: nextPlain,
       });
-    }
+    })
   );
 
   // Admin: delete participant account
-  app.delete('/api/admin/teams/:teamId', requireAdmin, (req: AuthenticatedRequest, res: Response) => {
-    const db = loadDb();
-    const targetId = String(req.params.teamId || '');
-    const target = db.teams.find((t) => t.id === targetId);
-    if (!target) {
-      res.status(404).json({ error: 'Participante no encontrado.' });
-      return;
-    }
-    db.teams = db.teams.filter((t) => t.id !== targetId);
-    if (db.settings.adminTeamId === targetId) {
-      db.settings.adminTeamId = undefined;
-    }
-    db.matches = db.matches.filter((m) => m.homeTeamId !== targetId && m.awayTeamId !== targetId);
+  app.delete(
+    '/api/admin/teams/:teamId',
+    requireAdmin,
+    asyncRoute(async (req: AuthenticatedRequest, res: Response) => {
+      const db = await loadDb({ fresh: true });
+      const targetId = String(req.params.teamId || '');
+      const target = db.teams.find((t) => t.id === targetId);
+      if (!target) {
+        res.status(404).json({ error: 'Participante no encontrado.' });
+        return;
+      }
+      db.teams = db.teams.filter((t) => t.id !== targetId);
+      if (db.settings.adminTeamId === targetId) {
+        db.settings.adminTeamId = undefined;
+      }
+      db.matches = db.matches.filter((m) => m.homeTeamId !== targetId && m.awayTeamId !== targetId);
 
-    appendCredentialAudit(db, {
-      action: 'delete_participant',
-      targetType: 'participant',
-      targetId: target.id,
-      targetLabel: `${target.memberName} (${target.name})`,
-      details: `Cuenta de participante ${target.id} eliminada permanentemente por el Administrador.`,
-      performedBy: req.authUser?.id || db.settings.adminId,
-    });
+      appendCredentialAudit(db, {
+        action: 'delete_participant',
+        targetType: 'participant',
+        targetId: target.id,
+        targetLabel: `${target.memberName} (${target.name})`,
+        details: `Cuenta de participante ${target.id} eliminada permanentemente por el Administrador.`,
+        performedBy: req.authUser?.id || db.settings.adminId,
+      });
 
-    saveDb(db);
-    res.json({ deleted: true });
-  });
+      await saveDb(db);
+      res.json({ deleted: true });
+    })
+  );
 
   // Member or Admin: submit match result (with optional proof & scorer image)
   app.post(
@@ -3787,21 +4162,14 @@ async function startServer() {
       { name: 'proofImage', maxCount: 1 },
       { name: 'scorerImage', maxCount: 1 },
     ]),
-    async (req: AuthenticatedRequest, res: Response) => {
-      const db = loadDb();
+    asyncRoute(async (req: AuthenticatedRequest, res: Response) => {
+      const db = await loadDb({ fresh: true });
       const files = req.files as Record<string, Express.Multer.File[]> | undefined;
       const proofFile = files?.proofImage?.[0];
       const scorerFile = files?.scorerImage?.[0];
       const cleanupFiles = () => {
-        for (const f of [proofFile, scorerFile]) {
-          if (f && fs.existsSync(f.path)) {
-            try {
-              fs.unlinkSync(f.path);
-            } catch {
-              // ignore
-            }
-          }
-        }
+        safeUnlink(proofFile?.path);
+        safeUnlink(scorerFile?.path);
       };
 
       const homeTeamId = String(req.body?.homeTeamId || '').trim();
@@ -3867,7 +4235,12 @@ async function startServer() {
           res.status(400).json({ error: mod.reason || 'Foto de resultado rechazada por contenido inapropiado.' });
           return;
         }
-        proofImageUrl = `/uploads/matches/${proofFile.filename}`;
+        proofImageUrl = await persistUploadedFile(
+          proofFile.path,
+          'matches',
+          proofFile.filename,
+          proofFile.mimetype
+        );
         proofImageStatus = isAdmin ? 'approved' : 'pending';
       }
 
@@ -3887,7 +4260,12 @@ async function startServer() {
           res.status(400).json({ error: mod.reason || 'Foto del goleador rechazada por contenido inapropiado.' });
           return;
         }
-        scorerImageUrl = `/uploads/matches/${scorerFile.filename}`;
+        scorerImageUrl = await persistUploadedFile(
+          scorerFile.path,
+          'matches',
+          scorerFile.filename,
+          scorerFile.mimetype
+        );
         scorerImageStatus = isAdmin ? 'approved' : 'pending';
       }
 
@@ -3932,166 +4310,190 @@ async function startServer() {
           ? syncMatchToCupBracket(db, match)
           : false;
 
-      saveDb(db);
+      await saveDb(db);
       res.status(201).json({ match, cupSynced, cup: cupSynced ? db.cup : undefined });
-    }
+    })
   );
 
   // Admin: validate, reject, or edit match result
-  app.patch('/api/admin/matches/:matchId', requireAdmin, (req: AuthenticatedRequest, res: Response) => {
-    const db = loadDb();
-    const match = db.matches.find((m) => m.id === req.params.matchId);
-    if (!match) {
-      res.status(404).json({ error: 'Partido no encontrado.' });
-      return;
-    }
-
-    if (req.body?.homeGoals !== undefined) {
-      const hg = Number(req.body.homeGoals);
-      if (Number.isInteger(hg) && hg >= 0) match.homeGoals = hg;
-    }
-    if (req.body?.awayGoals !== undefined) {
-      const ag = Number(req.body.awayGoals);
-      if (Number.isInteger(ag) && ag >= 0) match.awayGoals = ag;
-    }
-    if (req.body?.matchday !== undefined) {
-      const md = Number(req.body.matchday);
-      if (Number.isInteger(md) && md >= 1) match.matchday = md;
-    }
-    if (req.body?.leg === 'Ida' || req.body?.leg === 'Vuelta') {
-      match.leg = req.body.leg;
-    }
-    if (typeof req.body?.playedAt === 'string' && req.body.playedAt.trim()) {
-      match.playedAt = req.body.playedAt.trim();
-    }
-    if (typeof req.body?.notes === 'string') {
-      match.notes = req.body.notes.trim();
-    }
-    if (req.body?.status === 'validated' || req.body?.status === 'rejected' || req.body?.status === 'pending') {
-      match.status = req.body.status;
-      if (req.body.status === 'validated') {
-        match.validatedAt = new Date().toISOString();
-        if (match.proofImageUrl && !match.proofImageStatus) match.proofImageStatus = 'approved';
-        if (match.scorerImageUrl && !match.scorerImageStatus) match.scorerImageStatus = 'approved';
+  app.patch(
+    '/api/admin/matches/:matchId',
+    requireAdmin,
+    asyncRoute(async (req: AuthenticatedRequest, res: Response) => {
+      const db = await loadDb({ fresh: true });
+      const match = db.matches.find((m) => m.id === req.params.matchId);
+      if (!match) {
+        res.status(404).json({ error: 'Partido no encontrado.' });
+        return;
       }
-    }
 
-    if (
-      match.status === 'validated' &&
-      (match.competitionType === 'copa' || match.competitionType === 'recopa')
-    ) {
-      syncMatchToCupBracket(db, match);
-    }
+      if (req.body?.homeGoals !== undefined) {
+        const hg = Number(req.body.homeGoals);
+        if (Number.isInteger(hg) && hg >= 0) match.homeGoals = hg;
+      }
+      if (req.body?.awayGoals !== undefined) {
+        const ag = Number(req.body.awayGoals);
+        if (Number.isInteger(ag) && ag >= 0) match.awayGoals = ag;
+      }
+      if (req.body?.matchday !== undefined) {
+        const md = Number(req.body.matchday);
+        if (Number.isInteger(md) && md >= 1) match.matchday = md;
+      }
+      if (req.body?.leg === 'Ida' || req.body?.leg === 'Vuelta') {
+        match.leg = req.body.leg;
+      }
+      if (typeof req.body?.playedAt === 'string' && req.body.playedAt.trim()) {
+        match.playedAt = req.body.playedAt.trim();
+      }
+      if (typeof req.body?.notes === 'string') {
+        match.notes = req.body.notes.trim();
+      }
+      if (req.body?.status === 'validated' || req.body?.status === 'rejected' || req.body?.status === 'pending') {
+        match.status = req.body.status;
+        if (req.body.status === 'validated') {
+          match.validatedAt = new Date().toISOString();
+          if (match.proofImageUrl && !match.proofImageStatus) match.proofImageStatus = 'approved';
+          if (match.scorerImageUrl && !match.scorerImageStatus) match.scorerImageStatus = 'approved';
+        }
+      }
 
-    saveDb(db);
-    res.json({ match });
-  });
+      if (
+        match.status === 'validated' &&
+        (match.competitionType === 'copa' || match.competitionType === 'recopa')
+      ) {
+        syncMatchToCupBracket(db, match);
+      }
+
+      await saveDb(db);
+      res.json({ match });
+    })
+  );
 
   // Admin: delete match
-  app.delete('/api/admin/matches/:matchId', requireAdmin, (req: AuthenticatedRequest, res: Response) => {
-    const db = loadDb();
-    const before = db.matches.length;
-    db.matches = db.matches.filter((m) => m.id !== req.params.matchId);
-    if (db.matches.length === before) {
-      res.status(404).json({ error: 'Partido no encontrado.' });
-      return;
-    }
-    for (const fx of db.fixtures) {
-      if (fx.completedMatchId === req.params.matchId) fx.completedMatchId = undefined;
-    }
-    saveDb(db);
-    res.json({ deleted: true });
-  });
+  app.delete(
+    '/api/admin/matches/:matchId',
+    requireAdmin,
+    asyncRoute(async (req: AuthenticatedRequest, res: Response) => {
+      const db = await loadDb({ fresh: true });
+      const before = db.matches.length;
+      db.matches = db.matches.filter((m) => m.id !== req.params.matchId);
+      if (db.matches.length === before) {
+        res.status(404).json({ error: 'Partido no encontrado.' });
+        return;
+      }
+      for (const fx of db.fixtures) {
+        if (fx.completedMatchId === req.params.matchId) fx.completedMatchId = undefined;
+      }
+      await saveDb(db);
+      res.json({ deleted: true });
+    })
+  );
 
   // Admin: Scheduled Fixtures ("Cruces por Fecha")
-  app.post('/api/admin/fixtures', requireAdmin, (req: AuthenticatedRequest, res: Response) => {
-    const db = loadDb();
-    const matchday = Math.max(1, Number(req.body?.matchday) || 1);
-    const homeTeamId = String(req.body?.homeTeamId || '').trim();
-    const awayTeamId = String(req.body?.awayTeamId || '').trim();
-    const leg: 'Ida' | 'Vuelta' = req.body?.leg === 'Vuelta' ? 'Vuelta' : 'Ida';
-    const scheduledDate = String(req.body?.scheduledDate || '').trim() || undefined;
-    const scheduledTime = String(req.body?.scheduledTime || '').trim() || undefined;
-    const notes = String(req.body?.notes || '').trim() || undefined;
+  app.post(
+    '/api/admin/fixtures',
+    requireAdmin,
+    asyncRoute(async (req: AuthenticatedRequest, res: Response) => {
+      const db = await loadDb({ fresh: true });
+      const matchday = Math.max(1, Number(req.body?.matchday) || 1);
+      const homeTeamId = String(req.body?.homeTeamId || '').trim();
+      const awayTeamId = String(req.body?.awayTeamId || '').trim();
+      const leg: 'Ida' | 'Vuelta' = req.body?.leg === 'Vuelta' ? 'Vuelta' : 'Ida';
+      const scheduledDate = String(req.body?.scheduledDate || '').trim() || undefined;
+      const scheduledTime = String(req.body?.scheduledTime || '').trim() || undefined;
+      const notes = String(req.body?.notes || '').trim() || undefined;
 
-    if (!homeTeamId || !awayTeamId || homeTeamId === awayTeamId) {
-      res.status(400).json({ error: 'Seleccioná dos equipos distintos para el cruce.' });
-      return;
-    }
-    if (!db.teams.some((t) => t.id === homeTeamId) || !db.teams.some((t) => t.id === awayTeamId)) {
-      res.status(400).json({ error: 'Uno de los equipos no existe en la liga.' });
-      return;
-    }
+      if (!homeTeamId || !awayTeamId || homeTeamId === awayTeamId) {
+        res.status(400).json({ error: 'Seleccioná dos equipos distintos para el cruce.' });
+        return;
+      }
+      if (!db.teams.some((t) => t.id === homeTeamId) || !db.teams.some((t) => t.id === awayTeamId)) {
+        res.status(400).json({ error: 'Uno de los equipos no existe en la liga.' });
+        return;
+      }
 
-    const fixture: ScheduledFixture = {
-      id: `fx_${Date.now()}_${crypto.randomBytes(3).toString('hex')}`,
-      matchday,
-      homeTeamId,
-      awayTeamId,
-      leg,
-      scheduledDate,
-      scheduledTime,
-      notes,
-      createdAt: new Date().toISOString(),
-    };
-    db.fixtures.push(fixture);
-    saveDb(db);
-    res.status(201).json({ fixture });
-  });
+      const fixture: ScheduledFixture = {
+        id: `fx_${Date.now()}_${crypto.randomBytes(3).toString('hex')}`,
+        matchday,
+        homeTeamId,
+        awayTeamId,
+        leg,
+        scheduledDate,
+        scheduledTime,
+        notes,
+        createdAt: new Date().toISOString(),
+      };
+      db.fixtures.push(fixture);
+      await saveDb(db);
+      res.status(201).json({ fixture });
+    })
+  );
 
-  app.put('/api/admin/fixtures/:fixtureId', requireAdmin, (req: AuthenticatedRequest, res: Response) => {
-    const db = loadDb();
-    const fixture = db.fixtures.find((f) => f.id === req.params.fixtureId);
-    if (!fixture) {
-      res.status(404).json({ error: 'Cruce no encontrado.' });
-      return;
-    }
-    if (req.body?.matchday !== undefined) {
-      const md = Number(req.body.matchday);
-      if (Number.isInteger(md) && md >= 1) fixture.matchday = md;
-    }
-    if (typeof req.body?.homeTeamId === 'string' && req.body.homeTeamId.trim()) {
-      fixture.homeTeamId = req.body.homeTeamId.trim();
-    }
-    if (typeof req.body?.awayTeamId === 'string' && req.body.awayTeamId.trim()) {
-      fixture.awayTeamId = req.body.awayTeamId.trim();
-    }
-    if (req.body?.leg === 'Ida' || req.body?.leg === 'Vuelta') {
-      fixture.leg = req.body.leg;
-    }
-    if (typeof req.body?.scheduledDate === 'string') {
-      fixture.scheduledDate = req.body.scheduledDate.trim() || undefined;
-    }
-    if (typeof req.body?.scheduledTime === 'string') {
-      fixture.scheduledTime = req.body.scheduledTime.trim() || undefined;
-    }
-    if (typeof req.body?.notes === 'string') {
-      fixture.notes = req.body.notes.trim() || undefined;
-    }
-    saveDb(db);
-    res.json({ fixture });
-  });
+  app.put(
+    '/api/admin/fixtures/:fixtureId',
+    requireAdmin,
+    asyncRoute(async (req: AuthenticatedRequest, res: Response) => {
+      const db = await loadDb({ fresh: true });
+      const fixture = db.fixtures.find((f) => f.id === req.params.fixtureId);
+      if (!fixture) {
+        res.status(404).json({ error: 'Cruce no encontrado.' });
+        return;
+      }
+      if (req.body?.matchday !== undefined) {
+        const md = Number(req.body.matchday);
+        if (Number.isInteger(md) && md >= 1) fixture.matchday = md;
+      }
+      if (typeof req.body?.homeTeamId === 'string' && req.body.homeTeamId.trim()) {
+        fixture.homeTeamId = req.body.homeTeamId.trim();
+      }
+      if (typeof req.body?.awayTeamId === 'string' && req.body.awayTeamId.trim()) {
+        fixture.awayTeamId = req.body.awayTeamId.trim();
+      }
+      if (req.body?.leg === 'Ida' || req.body?.leg === 'Vuelta') {
+        fixture.leg = req.body.leg;
+      }
+      if (typeof req.body?.scheduledDate === 'string') {
+        fixture.scheduledDate = req.body.scheduledDate.trim() || undefined;
+      }
+      if (typeof req.body?.scheduledTime === 'string') {
+        fixture.scheduledTime = req.body.scheduledTime.trim() || undefined;
+      }
+      if (typeof req.body?.notes === 'string') {
+        fixture.notes = req.body.notes.trim() || undefined;
+      }
+      await saveDb(db);
+      res.json({ fixture });
+    })
+  );
 
-  app.delete('/api/admin/fixtures/:fixtureId', requireAdmin, (req: AuthenticatedRequest, res: Response) => {
-    const db = loadDb();
-    const before = db.fixtures.length;
-    db.fixtures = db.fixtures.filter((f) => f.id !== req.params.fixtureId);
-    if (db.fixtures.length === before) {
-      res.status(404).json({ error: 'Cruce no encontrado.' });
-      return;
-    }
-    saveDb(db);
-    res.json({ deleted: true });
-  });
+  app.delete(
+    '/api/admin/fixtures/:fixtureId',
+    requireAdmin,
+    asyncRoute(async (req: AuthenticatedRequest, res: Response) => {
+      const db = await loadDb({ fresh: true });
+      const before = db.fixtures.length;
+      db.fixtures = db.fixtures.filter((f) => f.id !== req.params.fixtureId);
+      if (db.fixtures.length === before) {
+        res.status(404).json({ error: 'Cruce no encontrado.' });
+        return;
+      }
+      await saveDb(db);
+      res.json({ deleted: true });
+    })
+  );
 
   // Admin: Calendar banner message (visible to everyone on CalendarView, editable/deletable only by Admin)
-  app.put('/api/admin/calendar/message', requireAdmin, (req: AuthenticatedRequest, res: Response) => {
-    const db = loadDb();
-    const message = typeof req.body?.message === 'string' ? req.body.message.trim().slice(0, 600) : '';
-    db.settings.calendarMessage = message;
-    saveDb(db);
-    res.json({ calendarMessage: db.settings.calendarMessage });
-  });
+  app.put(
+    '/api/admin/calendar/message',
+    requireAdmin,
+    asyncRoute(async (req: AuthenticatedRequest, res: Response) => {
+      const db = await loadDb({ fresh: true });
+      const message = typeof req.body?.message === 'string' ? req.body.message.trim().slice(0, 600) : '';
+      db.settings.calendarMessage = message;
+      await saveDb(db);
+      res.json({ calendarMessage: db.settings.calendarMessage });
+    })
+  );
 
   // Admin: Calendar Events synchronized with Date/Time, Match Crests, and Copa de la Liga
   app.post(
@@ -4101,22 +4503,15 @@ async function startServer() {
       { name: 'homeCrest', maxCount: 1 },
       { name: 'awayCrest', maxCount: 1 },
     ]),
-    async (req: AuthenticatedRequest, res: Response) => {
-      const db = loadDb();
+    asyncRoute(async (req: AuthenticatedRequest, res: Response) => {
+      const db = await loadDb({ fresh: true });
       if (!Array.isArray(db.calendarEvents)) db.calendarEvents = [];
       const files = req.files as Record<string, Express.Multer.File[]> | undefined;
       const homeCrestFile = files?.homeCrest?.[0];
       const awayCrestFile = files?.awayCrest?.[0];
       const cleanup = () => {
-        for (const f of [homeCrestFile, awayCrestFile]) {
-          if (f && fs.existsSync(f.path)) {
-            try {
-              fs.unlinkSync(f.path);
-            } catch {
-              // ignore
-            }
-          }
-        }
+        safeUnlink(homeCrestFile?.path);
+        safeUnlink(awayCrestFile?.path);
       };
 
       const title = String(req.body?.title || '').trim();
@@ -4171,7 +4566,13 @@ async function startServer() {
           return;
         }
         const finalName = await normalizePng128(homeCrestFile.path);
-        homeCrestUrl = `/uploads/crests/${finalName}`;
+        const finalPath = path.join(path.dirname(homeCrestFile.path), finalName);
+        homeCrestUrl = await persistUploadedFile(
+          finalPath,
+          'crests',
+          finalName,
+          finalName.endsWith('.png') ? 'image/png' : homeCrestFile.mimetype
+        );
       }
       if (awayCrestFile) {
         if (!isValidImageFile(awayCrestFile)) {
@@ -4180,7 +4581,13 @@ async function startServer() {
           return;
         }
         const finalName = await normalizePng128(awayCrestFile.path);
-        awayCrestUrl = `/uploads/crests/${finalName}`;
+        const finalPath = path.join(path.dirname(awayCrestFile.path), finalName);
+        awayCrestUrl = await persistUploadedFile(
+          finalPath,
+          'crests',
+          finalName,
+          finalName.endsWith('.png') ? 'image/png' : awayCrestFile.mimetype
+        );
       }
 
       // Two-way sync if linked to a Cup match or Recopa
@@ -4231,9 +4638,9 @@ async function startServer() {
         createdAt: new Date().toISOString(),
       };
       db.calendarEvents.push(event);
-      saveDb(db);
+      await saveDb(db);
       res.status(201).json({ event, cup: db.cup });
-    }
+    })
   );
 
   app.put(
@@ -4243,23 +4650,16 @@ async function startServer() {
       { name: 'homeCrest', maxCount: 1 },
       { name: 'awayCrest', maxCount: 1 },
     ]),
-    async (req: AuthenticatedRequest, res: Response) => {
-      const db = loadDb();
+    asyncRoute(async (req: AuthenticatedRequest, res: Response) => {
+      const db = await loadDb({ fresh: true });
       if (!Array.isArray(db.calendarEvents)) db.calendarEvents = [];
       const event = db.calendarEvents.find((ev) => ev.id === req.params.eventId);
       const files = req.files as Record<string, Express.Multer.File[]> | undefined;
       const homeCrestFile = files?.homeCrest?.[0];
       const awayCrestFile = files?.awayCrest?.[0];
       const cleanup = () => {
-        for (const f of [homeCrestFile, awayCrestFile]) {
-          if (f && fs.existsSync(f.path)) {
-            try {
-              fs.unlinkSync(f.path);
-            } catch {
-              // ignore
-            }
-          }
-        }
+        safeUnlink(homeCrestFile?.path);
+        safeUnlink(awayCrestFile?.path);
       };
 
       if (!event) {
@@ -4350,7 +4750,13 @@ async function startServer() {
           return;
         }
         const finalName = await normalizePng128(homeCrestFile.path);
-        event.homeCrestUrl = `/uploads/crests/${finalName}`;
+        const finalPath = path.join(path.dirname(homeCrestFile.path), finalName);
+        event.homeCrestUrl = await persistUploadedFile(
+          finalPath,
+          'crests',
+          finalName,
+          finalName.endsWith('.png') ? 'image/png' : homeCrestFile.mimetype
+        );
       }
       if (awayCrestFile) {
         if (!isValidImageFile(awayCrestFile)) {
@@ -4359,7 +4765,13 @@ async function startServer() {
           return;
         }
         const finalName = await normalizePng128(awayCrestFile.path);
-        event.awayCrestUrl = `/uploads/crests/${finalName}`;
+        const finalPath = path.join(path.dirname(awayCrestFile.path), finalName);
+        event.awayCrestUrl = await persistUploadedFile(
+          finalPath,
+          'crests',
+          finalName,
+          finalName.endsWith('.png') ? 'image/png' : awayCrestFile.mimetype
+        );
       }
 
       if (typeof req.body?.notes === 'string') {
@@ -4390,23 +4802,27 @@ async function startServer() {
         }
       }
 
-      saveDb(db);
+      await saveDb(db);
       res.json({ event, cup: db.cup });
-    }
+    })
   );
 
-  app.delete('/api/admin/calendar/:eventId', requireAdmin, (req: AuthenticatedRequest, res: Response) => {
-    const db = loadDb();
-    if (!Array.isArray(db.calendarEvents)) db.calendarEvents = [];
-    const before = db.calendarEvents.length;
-    db.calendarEvents = db.calendarEvents.filter((ev) => ev.id !== req.params.eventId);
-    if (db.calendarEvents.length === before) {
-      res.status(404).json({ error: 'Evento no encontrado.' });
-      return;
-    }
-    saveDb(db);
-    res.json({ deleted: true });
-  });
+  app.delete(
+    '/api/admin/calendar/:eventId',
+    requireAdmin,
+    asyncRoute(async (req: AuthenticatedRequest, res: Response) => {
+      const db = await loadDb({ fresh: true });
+      if (!Array.isArray(db.calendarEvents)) db.calendarEvents = [];
+      const before = db.calendarEvents.length;
+      db.calendarEvents = db.calendarEvents.filter((ev) => ev.id !== req.params.eventId);
+      if (db.calendarEvents.length === before) {
+        res.status(404).json({ error: 'Evento no encontrado.' });
+        return;
+      }
+      await saveDb(db);
+      res.json({ deleted: true });
+    })
+  );
 
   // NOTICIAS! ÚLTIMAS NOVEDADES (Solo el Admin puede publicar, editar colores, subir PNG/MP4 o eliminar)
   app.post(
@@ -4416,8 +4832,8 @@ async function startServer() {
       { name: 'image', maxCount: 1 },
       { name: 'video', maxCount: 1 },
     ]),
-    async (req: AuthenticatedRequest, res: Response) => {
-      const db = loadDb();
+    asyncRoute(async (req: AuthenticatedRequest, res: Response) => {
+      const db = await loadDb({ fresh: true });
       if (!Array.isArray(db.news)) db.news = [];
       const files = req.files as Record<string, Express.Multer.File[]> | undefined;
       const imageFile = files?.image?.[0];
@@ -4435,31 +4851,32 @@ async function startServer() {
       let imageUrl: string | undefined;
       if (imageFile) {
         if (!isValidImageFile(imageFile)) {
-          try {
-            fs.unlinkSync(imageFile.path);
-          } catch {
-            // ignore
-          }
+          safeUnlink(imageFile.path);
+          safeUnlink(videoFile?.path);
           res.status(400).json({ error: 'La imagen debe ser PNG, JPG o WEBP.' });
           return;
         }
-        imageUrl = `/uploads/news/${imageFile.filename}`;
+        imageUrl = await persistUploadedFile(
+          imageFile.path,
+          'news',
+          imageFile.filename,
+          imageFile.mimetype
+        );
       }
 
       let videoUrl: string | undefined;
       if (videoFile) {
         const ext = path.extname(videoFile.originalname).toLowerCase();
         if (!isValidMp4File(videoFile)) {
-          try {
-            fs.unlinkSync(videoFile.path);
-          } catch {
-            // ignore
-          }
+          safeUnlink(videoFile.path);
           res.status(400).json({ error: 'El video adjunto debe estar en formato MP4.' });
           return;
         }
         const playable = await ensurePlayableMp4(videoFile.path, ext);
-        videoUrl = playable ? `/uploads/news/${playable}` : `/uploads/news/${videoFile.filename}`;
+        const finalVideoName = playable || videoFile.filename;
+        const finalVideoPath = path.join(path.dirname(videoFile.path), finalVideoName);
+        videoUrl = await persistUploadedFile(finalVideoPath, 'news', finalVideoName, 'video/mp4');
+        if (playable) safeUnlink(videoFile.path);
       }
 
       const post: NewsPost = {
@@ -4472,9 +4889,9 @@ async function startServer() {
         createdAt: new Date().toISOString(),
       };
       db.news.unshift(post);
-      saveDb(db);
+      await saveDb(db);
       res.status(201).json({ post });
-    }
+    })
   );
 
   app.put(
@@ -4484,18 +4901,19 @@ async function startServer() {
       { name: 'image', maxCount: 1 },
       { name: 'video', maxCount: 1 },
     ]),
-    async (req: AuthenticatedRequest, res: Response) => {
-      const db = loadDb();
+    asyncRoute(async (req: AuthenticatedRequest, res: Response) => {
+      const db = await loadDb({ fresh: true });
       if (!Array.isArray(db.news)) db.news = [];
       const post = db.news.find((n) => n.id === req.params.newsId);
-      if (!post) {
-        res.status(404).json({ error: 'Noticia no encontrada.' });
-        return;
-      }
-
       const files = req.files as Record<string, Express.Multer.File[]> | undefined;
       const imageFile = files?.image?.[0];
       const videoFile = files?.video?.[0];
+      if (!post) {
+        safeUnlink(imageFile?.path);
+        safeUnlink(videoFile?.path);
+        res.status(404).json({ error: 'Noticia no encontrada.' });
+        return;
+      }
 
       if (typeof req.body?.title === 'string' && req.body.title.trim()) {
         post.title = req.body.title.trim();
@@ -4512,40 +4930,60 @@ async function startServer() {
       if (req.body?.clearVideo === 'true') {
         post.videoUrl = undefined;
       }
-      if (imageFile && isValidImageFile(imageFile)) {
-        post.imageUrl = `/uploads/news/${imageFile.filename}`;
+      if (imageFile) {
+        if (isValidImageFile(imageFile)) {
+          post.imageUrl = await persistUploadedFile(
+            imageFile.path,
+            'news',
+            imageFile.filename,
+            imageFile.mimetype
+          );
+        } else {
+          safeUnlink(imageFile.path);
+        }
       }
-      if (videoFile && isValidMp4File(videoFile)) {
-        const ext = path.extname(videoFile.originalname).toLowerCase();
-        const playable = await ensurePlayableMp4(videoFile.path, ext);
-        post.videoUrl = playable ? `/uploads/news/${playable}` : `/uploads/news/${videoFile.filename}`;
+      if (videoFile) {
+        if (isValidMp4File(videoFile)) {
+          const ext = path.extname(videoFile.originalname).toLowerCase();
+          const playable = await ensurePlayableMp4(videoFile.path, ext);
+          const finalVideoName = playable || videoFile.filename;
+          const finalVideoPath = path.join(path.dirname(videoFile.path), finalVideoName);
+          post.videoUrl = await persistUploadedFile(finalVideoPath, 'news', finalVideoName, 'video/mp4');
+          if (playable) safeUnlink(videoFile.path);
+        } else {
+          safeUnlink(videoFile.path);
+        }
       }
 
-      saveDb(db);
+      await saveDb(db);
       res.json({ post });
-    }
+    })
   );
 
-  app.delete('/api/admin/news/:newsId', requireAdmin, (req: AuthenticatedRequest, res: Response) => {
-    const db = loadDb();
-    if (!Array.isArray(db.news)) db.news = [];
-    const before = db.news.length;
-    db.news = db.news.filter((n) => n.id !== req.params.newsId);
-    if (db.news.length === before) {
-      res.status(404).json({ error: 'Noticia no encontrada.' });
-      return;
-    }
-    saveDb(db);
-    res.json({ deleted: true });
-  });
+  app.delete(
+    '/api/admin/news/:newsId',
+    requireAdmin,
+    asyncRoute(async (req: AuthenticatedRequest, res: Response) => {
+      const db = await loadDb({ fresh: true });
+      if (!Array.isArray(db.news)) db.news = [];
+      const before = db.news.length;
+      db.news = db.news.filter((n) => n.id !== req.params.newsId);
+      if (db.news.length === before) {
+        res.status(404).json({ error: 'Noticia no encontrada.' });
+        return;
+      }
+      await saveDb(db);
+      res.json({ deleted: true });
+    })
+  );
 
   // TOP 5 MEJORES GOLES (Elegidos por el Administrador para reproducción continua en el Inicio)
   app.post(
     '/api/admin/top-goals',
     requireAdmin,
     uploadVideo.single('video'),
-    async (req: AuthenticatedRequest, res: Response) => {
-      const db = loadDb();
+    asyncRoute(async (req: AuthenticatedRequest, res: Response) => {
+      const db = await loadDb({ fresh: true });
       if (!Array.isArray(db.topGoals)) db.topGoals = [];
 
       const title = String(req.body?.title || '').trim();
@@ -4557,13 +4995,16 @@ async function startServer() {
 
       if (req.file) {
         if (!isValidMp4File(req.file)) {
-          fs.unlinkSync(req.file.path);
+          safeUnlink(req.file.path);
           res.status(400).json({ error: 'Solo se permiten videos de goles en formato .MP4.' });
           return;
         }
         const ext = path.extname(req.file.originalname).toLowerCase();
         const playable = await ensurePlayableMp4(req.file.path, ext);
-        videoUrl = playable ? `/uploads/videos/${playable}` : `/uploads/videos/${req.file.filename}`;
+        const finalVideoName = playable || req.file.filename;
+        const finalVideoPath = path.join(path.dirname(req.file.path), finalVideoName);
+        videoUrl = await persistUploadedFile(finalVideoPath, 'videos', finalVideoName, 'video/mp4');
+        if (playable) safeUnlink(req.file.path);
       }
 
       if (!videoUrl) {
@@ -4605,123 +5046,147 @@ async function startServer() {
       db.topGoals.sort((a, b) => a.rank - b.rank);
       db.topGoals = db.topGoals.slice(0, 5);
 
-      saveDb(db);
+      await saveDb(db);
       res.status(201).json({ topGoal: item, topGoals: db.topGoals });
-    }
+    })
   );
 
-  app.delete('/api/admin/top-goals/:goalId', requireAdmin, (req: AuthenticatedRequest, res: Response) => {
-    const db = loadDb();
-    if (!Array.isArray(db.topGoals)) db.topGoals = [];
-    const before = db.topGoals.length;
-    db.topGoals = db.topGoals.filter((g) => g.id !== req.params.goalId);
-    if (db.topGoals.length === before) {
-      res.status(404).json({ error: 'Gol del Top 5 no encontrado.' });
-      return;
-    }
-    db.topGoals.sort((a, b) => a.rank - b.rank);
-    saveDb(db);
-    res.json({ deleted: true, topGoals: db.topGoals });
-  });
+  app.delete(
+    '/api/admin/top-goals/:goalId',
+    requireAdmin,
+    asyncRoute(async (req: AuthenticatedRequest, res: Response) => {
+      const db = await loadDb({ fresh: true });
+      if (!Array.isArray(db.topGoals)) db.topGoals = [];
+      const before = db.topGoals.length;
+      db.topGoals = db.topGoals.filter((g) => g.id !== req.params.goalId);
+      if (db.topGoals.length === before) {
+        res.status(404).json({ error: 'Gol del Top 5 no encontrado.' });
+        return;
+      }
+      db.topGoals.sort((a, b) => a.rank - b.rank);
+      await saveDb(db);
+      res.json({ deleted: true, topGoals: db.topGoals });
+    })
+  );
 
   // ME GUSTA (Página, Noticias y Perfiles de Participantes)
-  app.post('/api/likes/page', (_req: Request, res: Response) => {
-    const db = loadDb();
-    db.pageLikes = (typeof db.pageLikes === 'number' ? db.pageLikes : 0) + 1;
-    saveDb(db);
-    res.json({ pageLikes: db.pageLikes });
-  });
+  app.post(
+    '/api/likes/page',
+    asyncRoute(async (_req: Request, res: Response) => {
+      const db = await loadDb({ fresh: true });
+      db.pageLikes = (typeof db.pageLikes === 'number' ? db.pageLikes : 0) + 1;
+      await saveDb(db);
+      res.json({ pageLikes: db.pageLikes });
+    })
+  );
 
-  app.post('/api/news/:newsId/like', (req: Request, res: Response) => {
-    const db = loadDb();
-    if (!Array.isArray(db.news)) db.news = [];
-    const post = db.news.find((n) => n.id === req.params.newsId);
-    if (!post) {
-      res.status(404).json({ error: 'Noticia no encontrada.' });
-      return;
-    }
-    post.likes = (typeof post.likes === 'number' ? post.likes : 0) + 1;
-    saveDb(db);
-    res.json({ newsId: post.id, likes: post.likes });
-  });
+  app.post(
+    '/api/news/:newsId/like',
+    asyncRoute(async (req: Request, res: Response) => {
+      const db = await loadDb({ fresh: true });
+      if (!Array.isArray(db.news)) db.news = [];
+      const post = db.news.find((n) => n.id === req.params.newsId);
+      if (!post) {
+        res.status(404).json({ error: 'Noticia no encontrada.' });
+        return;
+      }
+      post.likes = (typeof post.likes === 'number' ? post.likes : 0) + 1;
+      await saveDb(db);
+      res.json({ newsId: post.id, likes: post.likes });
+    })
+  );
 
-  app.post('/api/teams/:teamId/like', (req: Request, res: Response) => {
-    const db = loadDb();
-    const team = db.teams.find((t) => t.id === req.params.teamId);
-    if (!team) {
-      res.status(404).json({ error: 'Participante no encontrado.' });
-      return;
-    }
-    team.likes = (typeof team.likes === 'number' ? team.likes : 0) + 1;
-    saveDb(db);
-    res.json({ teamId: team.id, likes: team.likes });
-  });
+  app.post(
+    '/api/teams/:teamId/like',
+    asyncRoute(async (req: Request, res: Response) => {
+      const db = await loadDb({ fresh: true });
+      const team = db.teams.find((t) => t.id === req.params.teamId);
+      if (!team) {
+        res.status(404).json({ error: 'Participante no encontrado.' });
+        return;
+      }
+      team.likes = (typeof team.likes === 'number' ? team.likes : 0) + 1;
+      await saveDb(db);
+      res.json({ teamId: team.id, likes: team.likes });
+    })
+  );
 
   // COMENTARIOS DE LA LIGA (Miembros envían → Solo el Administrador aprueba o elimina)
-  app.post('/api/comments', (req: AuthenticatedRequest, res: Response) => {
-    const db = loadDb();
-    if (!Array.isArray(db.comments)) db.comments = [];
+  app.post(
+    '/api/comments',
+    asyncRoute(async (req: AuthenticatedRequest, res: Response) => {
+      const db = await loadDb({ fresh: true });
+      if (!Array.isArray(db.comments)) db.comments = [];
 
-    const message = String(req.body?.message || '').trim();
-    if (!message || message.length < 2) {
-      res.status(400).json({ error: 'Escribí un mensaje antes de enviarlo.' });
-      return;
-    }
-    if (message.length > 600) {
-      res.status(400).json({ error: 'El comentario puede tener hasta 600 caracteres.' });
-      return;
-    }
+      const message = String(req.body?.message || '').trim();
+      if (!message || message.length < 2) {
+        res.status(400).json({ error: 'Escribí un mensaje antes de enviarlo.' });
+        return;
+      }
+      if (message.length > 600) {
+        res.status(400).json({ error: 'El comentario puede tener hasta 600 caracteres.' });
+        return;
+      }
 
-    const userTeam = req.authUser?.teamId
-      ? db.teams.find((t) => t.id === req.authUser?.teamId)
-      : undefined;
+      const userTeam = req.authUser?.teamId
+        ? db.teams.find((t) => t.id === req.authUser?.teamId)
+        : undefined;
 
-    const authorName =
-      String(req.body?.authorName || '').trim() ||
-      userTeam?.memberName ||
-      req.authUser?.displayName ||
-      'Miembro de la Liga';
+      const authorName =
+        String(req.body?.authorName || '').trim() ||
+        userTeam?.memberName ||
+        req.authUser?.displayName ||
+        'Miembro de la Liga';
 
-    const isAdmin = req.authUser?.role === 'admin';
-    const comment: LeagueComment = {
-      id: `cmt_${crypto.randomUUID().slice(0, 8)}`,
-      authorName: authorName.slice(0, 60),
-      authorTeamName: userTeam?.name,
-      authorTeamId: userTeam?.id,
-      message,
-      status: isAdmin ? 'approved' : 'pending',
-      createdAt: new Date().toISOString(),
-    };
-    db.comments.unshift(comment);
-    saveDb(db);
-    res.status(201).json({ comment, pendingApproval: comment.status === 'pending' });
-  });
+      const isAdmin = req.authUser?.role === 'admin';
+      const comment: LeagueComment = {
+        id: `cmt_${crypto.randomUUID().slice(0, 8)}`,
+        authorName: authorName.slice(0, 60),
+        authorTeamName: userTeam?.name,
+        authorTeamId: userTeam?.id,
+        message,
+        status: isAdmin ? 'approved' : 'pending',
+        createdAt: new Date().toISOString(),
+      };
+      db.comments.unshift(comment);
+      await saveDb(db);
+      res.status(201).json({ comment, pendingApproval: comment.status === 'pending' });
+    })
+  );
 
-  app.patch('/api/admin/comments/:commentId', requireAdmin, (req: AuthenticatedRequest, res: Response) => {
-    const db = loadDb();
-    if (!Array.isArray(db.comments)) db.comments = [];
-    const comment = db.comments.find((c) => c.id === req.params.commentId);
-    if (!comment) {
-      res.status(404).json({ error: 'Comentario no encontrado.' });
-      return;
-    }
-    comment.status = 'approved';
-    saveDb(db);
-    res.json({ comment });
-  });
+  app.patch(
+    '/api/admin/comments/:commentId',
+    requireAdmin,
+    asyncRoute(async (req: AuthenticatedRequest, res: Response) => {
+      const db = await loadDb({ fresh: true });
+      if (!Array.isArray(db.comments)) db.comments = [];
+      const comment = db.comments.find((c) => c.id === req.params.commentId);
+      if (!comment) {
+        res.status(404).json({ error: 'Comentario no encontrado.' });
+        return;
+      }
+      comment.status = 'approved';
+      await saveDb(db);
+      res.json({ comment });
+    })
+  );
 
-  app.delete('/api/admin/comments/:commentId', requireAdmin, (req: AuthenticatedRequest, res: Response) => {
-    const db = loadDb();
-    if (!Array.isArray(db.comments)) db.comments = [];
-    const before = db.comments.length;
-    db.comments = db.comments.filter((c) => c.id !== req.params.commentId);
-    if (db.comments.length === before) {
-      res.status(404).json({ error: 'Comentario no encontrado.' });
-      return;
-    }
-    saveDb(db);
-    res.json({ deleted: true });
-  });
+  app.delete(
+    '/api/admin/comments/:commentId',
+    requireAdmin,
+    asyncRoute(async (req: AuthenticatedRequest, res: Response) => {
+      const db = await loadDb({ fresh: true });
+      if (!Array.isArray(db.comments)) db.comments = [];
+      const before = db.comments.length;
+      db.comments = db.comments.filter((c) => c.id !== req.params.commentId);
+      if (db.comments.length === before) {
+        res.status(404).json({ error: 'Comentario no encontrado.' });
+        return;
+      }
+      await saveDb(db);
+      res.json({ deleted: true });
+    })
+  );
 
   // RECLAMOS (Claims: yellow/red cards photo + .mp4 video evidence -> Admin verdict)
   app.post(
@@ -4731,21 +5196,14 @@ async function startServer() {
       { name: 'cardPhoto', maxCount: 1 },
       { name: 'videoFile', maxCount: 1 },
     ]),
-    async (req: AuthenticatedRequest, res: Response) => {
-      const db = loadDb();
+    asyncRoute(async (req: AuthenticatedRequest, res: Response) => {
+      const db = await loadDb({ fresh: true });
       const files = req.files as Record<string, Express.Multer.File[]> | undefined;
       const cardPhotoFile = files?.cardPhoto?.[0];
       const videoFile = files?.videoFile?.[0];
       const cleanup = () => {
-        for (const f of [cardPhotoFile, videoFile]) {
-          if (f && fs.existsSync(f.path)) {
-            try {
-              fs.unlinkSync(f.path);
-            } catch {
-              // ignore
-            }
-          }
-        }
+        safeUnlink(cardPhotoFile?.path);
+        safeUnlink(videoFile?.path);
       };
 
       const reasonRaw = String(req.body?.reasonType || 'juego_sucio').trim();
@@ -4782,7 +5240,12 @@ async function startServer() {
           res.status(400).json({ error: mod.reason || 'Imagen rechazada por el filtro de contenido.' });
           return;
         }
-        cardPhotoUrl = `/uploads/claims/${cardPhotoFile.filename}`;
+        cardPhotoUrl = await persistUploadedFile(
+          cardPhotoFile.path,
+          'claims',
+          cardPhotoFile.filename,
+          cardPhotoFile.mimetype
+        );
         cardPhotoStatus = isAdmin ? 'approved' : 'pending';
       }
 
@@ -4794,7 +5257,10 @@ async function startServer() {
           return;
         }
         const playable = await ensurePlayableMp4(videoFile.path, '.mp4');
-        videoUrl = playable ? `/uploads/claims/${playable}` : `/uploads/claims/${videoFile.filename}`;
+        const finalVideoName = playable || videoFile.filename;
+        const finalVideoPath = path.join(path.dirname(videoFile.path), finalVideoName);
+        videoUrl = await persistUploadedFile(finalVideoPath, 'claims', finalVideoName, 'video/mp4');
+        if (playable) safeUnlink(videoFile.path);
       } else if (externalVideoUrl) {
         const cleanUrl = externalVideoUrl.split('?')[0].toLowerCase();
         if (!cleanUrl.endsWith('.mp4')) {
@@ -4831,133 +5297,145 @@ async function startServer() {
       };
 
       db.claims.unshift(claim);
-      saveDb(db);
+      await saveDb(db);
       res.status(201).json({ claim });
-    }
+    })
   );
 
   // Admin rules on a Claim (Valid Match / Invalid Match / Dismissed)
-  app.patch('/api/admin/claims/:claimId', requireAdmin, (req: AuthenticatedRequest, res: Response) => {
-    const db = loadDb();
-    const claim = db.claims.find((c) => c.id === req.params.claimId);
-    if (!claim) {
-      res.status(404).json({ error: 'Reclamo no encontrado.' });
-      return;
-    }
+  app.patch(
+    '/api/admin/claims/:claimId',
+    requireAdmin,
+    asyncRoute(async (req: AuthenticatedRequest, res: Response) => {
+      const db = await loadDb({ fresh: true });
+      const claim = db.claims.find((c) => c.id === req.params.claimId);
+      if (!claim) {
+        res.status(404).json({ error: 'Reclamo no encontrado.' });
+        return;
+      }
 
-    const nextStatus = req.body?.status;
-    if (
-      nextStatus === 'valid_match' ||
-      nextStatus === 'invalid_match' ||
-      nextStatus === 'dismissed' ||
-      nextStatus === 'pending'
-    ) {
-      claim.status = nextStatus;
-      claim.resolvedAt = nextStatus === 'pending' ? undefined : new Date().toISOString();
-      if (claim.matchId) {
-        const linked = db.matches.find((m) => m.id === claim.matchId);
-        if (linked) {
-          if (nextStatus === 'invalid_match') linked.status = 'rejected';
-          if (nextStatus === 'valid_match') {
-            linked.status = 'validated';
-            linked.validatedAt = new Date().toISOString();
+      const nextStatus = req.body?.status;
+      if (
+        nextStatus === 'valid_match' ||
+        nextStatus === 'invalid_match' ||
+        nextStatus === 'dismissed' ||
+        nextStatus === 'pending'
+      ) {
+        claim.status = nextStatus;
+        claim.resolvedAt = nextStatus === 'pending' ? undefined : new Date().toISOString();
+        if (claim.matchId) {
+          const linked = db.matches.find((m) => m.id === claim.matchId);
+          if (linked) {
+            if (nextStatus === 'invalid_match') linked.status = 'rejected';
+            if (nextStatus === 'valid_match') {
+              linked.status = 'validated';
+              linked.validatedAt = new Date().toISOString();
+            }
           }
         }
       }
-    }
-    if (typeof req.body?.adminResolutionNote === 'string') {
-      claim.adminResolutionNote = req.body.adminResolutionNote.trim();
-    }
+      if (typeof req.body?.adminResolutionNote === 'string') {
+        claim.adminResolutionNote = req.body.adminResolutionNote.trim();
+      }
 
-    saveDb(db);
-    res.json({ claim });
-  });
+      await saveDb(db);
+      res.json({ claim });
+    })
+  );
 
-  app.delete('/api/admin/claims/:claimId', requireAdmin, (req: AuthenticatedRequest, res: Response) => {
-    const db = loadDb();
-    const before = db.claims.length;
-    db.claims = db.claims.filter((c) => c.id !== req.params.claimId);
-    if (db.claims.length === before) {
-      res.status(404).json({ error: 'Reclamo no encontrado.' });
-      return;
-    }
-    saveDb(db);
-    res.json({ deleted: true });
-  });
+  app.delete(
+    '/api/admin/claims/:claimId',
+    requireAdmin,
+    asyncRoute(async (req: AuthenticatedRequest, res: Response) => {
+      const db = await loadDb({ fresh: true });
+      const before = db.claims.length;
+      db.claims = db.claims.filter((c) => c.id !== req.params.claimId);
+      if (db.claims.length === before) {
+        res.status(404).json({ error: 'Reclamo no encontrado.' });
+        return;
+      }
+      await saveDb(db);
+      res.json({ deleted: true });
+    })
+  );
 
   // Admin unified media verification (approve or remove ANY uploaded photo across profiles, matches, claims)
-  app.patch('/api/admin/moderation/media', requireAdmin, (req: AuthenticatedRequest, res: Response) => {
-    const db = loadDb();
-    const kind = String(req.body?.kind || '');
-    const targetId = String(req.body?.targetId || '');
-    const action = req.body?.action === 'remove' ? 'remove' : 'approve';
+  app.patch(
+    '/api/admin/moderation/media',
+    requireAdmin,
+    asyncRoute(async (req: AuthenticatedRequest, res: Response) => {
+      const db = await loadDb({ fresh: true });
+      const kind = String(req.body?.kind || '');
+      const targetId = String(req.body?.targetId || '');
+      const action = req.body?.action === 'remove' ? 'remove' : 'approve';
 
-    if (kind === 'team_celebration') {
-      const team = db.teams.find((t) => t.id === targetId);
-      if (!team) {
-        res.status(404).json({ error: 'Equipo no encontrado.' });
-        return;
-      }
-      if (action === 'remove') {
-        team.celebrationImageUrl = undefined;
-        team.celebrationStatus = 'rejected';
+      if (kind === 'team_celebration') {
+        const team = db.teams.find((t) => t.id === targetId);
+        if (!team) {
+          res.status(404).json({ error: 'Equipo no encontrado.' });
+          return;
+        }
+        if (action === 'remove') {
+          team.celebrationImageUrl = undefined;
+          team.celebrationStatus = 'rejected';
+        } else {
+          team.celebrationStatus = 'approved';
+        }
+      } else if (kind === 'match_proof') {
+        const match = db.matches.find((m) => m.id === targetId);
+        if (!match) {
+          res.status(404).json({ error: 'Partido no encontrado.' });
+          return;
+        }
+        if (action === 'remove') {
+          match.proofImageUrl = undefined;
+          match.proofImageStatus = 'rejected';
+        } else {
+          match.proofImageStatus = 'approved';
+        }
+      } else if (kind === 'match_scorer') {
+        const match = db.matches.find((m) => m.id === targetId);
+        if (!match) {
+          res.status(404).json({ error: 'Partido no encontrado.' });
+          return;
+        }
+        if (action === 'remove') {
+          match.scorerImageUrl = undefined;
+          match.scorerName = undefined;
+          match.scorerImageStatus = 'rejected';
+        } else {
+          match.scorerImageStatus = 'approved';
+        }
+      } else if (kind === 'claim_card') {
+        const claim = db.claims.find((c) => c.id === targetId);
+        if (!claim) {
+          res.status(404).json({ error: 'Reclamo no encontrado.' });
+          return;
+        }
+        if (action === 'remove') {
+          claim.cardPhotoUrl = undefined;
+          claim.cardPhotoStatus = 'rejected';
+        } else {
+          claim.cardPhotoStatus = 'approved';
+        }
+      } else if (kind === 'claim_video') {
+        const claim = db.claims.find((c) => c.id === targetId);
+        if (!claim) {
+          res.status(404).json({ error: 'Reclamo no encontrado.' });
+          return;
+        }
+        if (action === 'remove') {
+          claim.videoUrl = undefined;
+        }
       } else {
-        team.celebrationStatus = 'approved';
-      }
-    } else if (kind === 'match_proof') {
-      const match = db.matches.find((m) => m.id === targetId);
-      if (!match) {
-        res.status(404).json({ error: 'Partido no encontrado.' });
+        res.status(400).json({ error: 'Tipo de archivo no reconocido.' });
         return;
       }
-      if (action === 'remove') {
-        match.proofImageUrl = undefined;
-        match.proofImageStatus = 'rejected';
-      } else {
-        match.proofImageStatus = 'approved';
-      }
-    } else if (kind === 'match_scorer') {
-      const match = db.matches.find((m) => m.id === targetId);
-      if (!match) {
-        res.status(404).json({ error: 'Partido no encontrado.' });
-        return;
-      }
-      if (action === 'remove') {
-        match.scorerImageUrl = undefined;
-        match.scorerName = undefined;
-        match.scorerImageStatus = 'rejected';
-      } else {
-        match.scorerImageStatus = 'approved';
-      }
-    } else if (kind === 'claim_card') {
-      const claim = db.claims.find((c) => c.id === targetId);
-      if (!claim) {
-        res.status(404).json({ error: 'Reclamo no encontrado.' });
-        return;
-      }
-      if (action === 'remove') {
-        claim.cardPhotoUrl = undefined;
-        claim.cardPhotoStatus = 'rejected';
-      } else {
-        claim.cardPhotoStatus = 'approved';
-      }
-    } else if (kind === 'claim_video') {
-      const claim = db.claims.find((c) => c.id === targetId);
-      if (!claim) {
-        res.status(404).json({ error: 'Reclamo no encontrado.' });
-        return;
-      }
-      if (action === 'remove') {
-        claim.videoUrl = undefined;
-      }
-    } else {
-      res.status(400).json({ error: 'Tipo de archivo no reconocido.' });
-      return;
-    }
 
-    saveDb(db);
-    res.json({ ok: true });
-  });
+      await saveDb(db);
+      res.json({ ok: true });
+    })
+  );
 
   // ImageKit.io authentication parameters for direct member video upload (.mp4 ONLY)
   app.get('/api/imagekit/auth', requireAuth, (_req: AuthenticatedRequest, res: Response) => {
@@ -4982,62 +5460,66 @@ async function startServer() {
   });
 
   // Register a video uploaded directly to ImageKit.io (STRICTLY .MP4)
-  app.post('/api/videos/register', requireAuth, (req: AuthenticatedRequest, res: Response) => {
-    const db = loadDb();
-    const rawUrl = String(req.body?.url || '').trim();
-    const filePath = String(req.body?.filePath || '').trim();
-    const fileId = String(req.body?.fileId || '').trim();
-    const fileName = String(req.body?.fileName || '').trim();
-    const title = String(req.body?.title || path.parse(fileName || filePath || 'video').name).trim();
-    const description = String(req.body?.description || '').trim();
-    const requestedFormat = String(req.body?.originalFormat || '').toUpperCase();
+  app.post(
+    '/api/videos/register',
+    requireAuth,
+    asyncRoute(async (req: AuthenticatedRequest, res: Response) => {
+      const db = await loadDb({ fresh: true });
+      const rawUrl = String(req.body?.url || '').trim();
+      const filePath = String(req.body?.filePath || '').trim();
+      const fileId = String(req.body?.fileId || '').trim();
+      const fileName = String(req.body?.fileName || '').trim();
+      const title = String(req.body?.title || path.parse(fileName || filePath || 'video').name).trim();
+      const description = String(req.body?.description || '').trim();
+      const requestedFormat = String(req.body?.originalFormat || '').toUpperCase();
 
-    if (!rawUrl.startsWith(IMAGEKIT_URL_ENDPOINT) && !filePath) {
-      res.status(400).json({ error: 'URL de ImageKit inválida para el video.' });
-      return;
-    }
+      if (!rawUrl.startsWith(IMAGEKIT_URL_ENDPOINT) && !filePath) {
+        res.status(400).json({ error: 'URL de ImageKit inválida para el video.' });
+        return;
+      }
 
-    const checkSource = (fileName || filePath || rawUrl).split('?')[0].toLowerCase();
-    if (requestedFormat === 'AVI' || (!checkSource.endsWith('.mp4') && requestedFormat !== 'MP4')) {
-      res.status(400).json({ error: 'Solo se permiten videos en formato .MP4 en toda la página.' });
-      return;
-    }
+      const checkSource = (fileName || filePath || rawUrl).split('?')[0].toLowerCase();
+      if (requestedFormat === 'AVI' || (!checkSource.endsWith('.mp4') && requestedFormat !== 'MP4')) {
+        res.status(400).json({ error: 'Solo se permiten videos en formato .MP4 en toda la página.' });
+        return;
+      }
 
-    const videoUrl = buildImageKitMp4Url(filePath, rawUrl);
-    const downloadUrl = rawUrl || `${IMAGEKIT_URL_ENDPOINT}/${filePath.replace(/^\/+/, '')}`;
+      const videoUrl = buildImageKitMp4Url(filePath, rawUrl);
+      const downloadUrl = rawUrl || `${IMAGEKIT_URL_ENDPOINT}/${filePath.replace(/^\/+/, '')}`;
 
-    const entry: GalleryVideo = {
-      id: `vid_${Date.now()}_${crypto.randomBytes(3).toString('hex')}`,
-      title: title || 'Jugada Liga Master Argentina',
-      description,
-      videoUrl,
-      downloadUrl,
-      imagekitFileId: fileId || undefined,
-      originalFormat: 'MP4',
-      uploadedBy: req.authUser?.displayName || 'Miembro',
-      featured: db.videos.length === 0,
-      createdAt: new Date().toISOString(),
-    };
+      const entry: GalleryVideo = {
+        id: `vid_${Date.now()}_${crypto.randomBytes(3).toString('hex')}`,
+        title: title || 'Jugada Liga Master Argentina',
+        description,
+        videoUrl,
+        downloadUrl,
+        imagekitFileId: fileId || undefined,
+        originalFormat: 'MP4',
+        uploadedBy: req.authUser?.displayName || 'Miembro',
+        featured: db.videos.length === 0,
+        createdAt: new Date().toISOString(),
+      };
 
-    db.videos.unshift(entry);
-    saveDb(db);
-    res.status(201).json({ video: entry });
-  });
+      db.videos.unshift(entry);
+      await saveDb(db);
+      res.status(201).json({ video: entry });
+    })
+  );
 
   // Upload gallery video (STRICTLY .MP4)
   app.post(
     '/api/videos',
     requireAuth,
     uploadVideo.single('video'),
-    async (req: AuthenticatedRequest, res: Response) => {
-      const db = loadDb();
+    asyncRoute(async (req: AuthenticatedRequest, res: Response) => {
+      const db = await loadDb({ fresh: true });
       if (!req.file) {
         res.status(400).json({ error: 'Seleccioná un archivo de video en formato .MP4.' });
         return;
       }
 
       if (!isValidMp4File(req.file)) {
-        fs.unlinkSync(req.file.path);
+        safeUnlink(req.file.path);
         res.status(400).json({ error: 'Solo se permiten videos en formato .MP4 en toda la página.' });
         return;
       }
@@ -5045,8 +5527,8 @@ async function startServer() {
       const title = String(req.body?.title || path.parse(req.file.originalname).name).trim();
       const description = String(req.body?.description || '').trim();
 
-      let downloadUrl = `/uploads/videos/${req.file.filename}`;
-      let videoUrl = downloadUrl;
+      let downloadUrl = '';
+      let videoUrl = '';
       let imagekitFileId: string | undefined;
 
       if (imagekitClient) {
@@ -5057,16 +5539,12 @@ async function startServer() {
             folder: IMAGEKIT_VIDEO_FOLDER,
             useUniqueFileName: true,
           });
-          try {
-            fs.unlinkSync(req.file.path);
-          } catch {
-            // ignore cleanup failure
-          }
+          safeUnlink(req.file.path);
           downloadUrl = uploaded.url;
           videoUrl = buildImageKitMp4Url(uploaded.filePath, uploaded.url);
           imagekitFileId = uploaded.fileId;
         } catch (err) {
-          fs.unlinkSync(req.file.path);
+          safeUnlink(req.file.path);
           res.status(502).json({
             error:
               err instanceof Error
@@ -5077,9 +5555,11 @@ async function startServer() {
         }
       } else {
         const playable = await ensurePlayableMp4(req.file.path, '.mp4');
-        if (playable) {
-          videoUrl = `/uploads/videos/${playable}`;
-        }
+        const finalVideoName = playable || req.file.filename;
+        const finalVideoPath = path.join(path.dirname(req.file.path), finalVideoName);
+        downloadUrl = await persistUploadedFile(finalVideoPath, 'videos', finalVideoName, 'video/mp4');
+        videoUrl = downloadUrl;
+        if (playable) safeUnlink(req.file.path);
       }
 
       const entry: GalleryVideo = {
@@ -5096,9 +5576,9 @@ async function startServer() {
       };
 
       db.videos.unshift(entry);
-      saveDb(db);
+      await saveDb(db);
       res.status(201).json({ video: entry });
-    }
+    })
   );
 
   // Public community videos proxy (reads Firestore videos_comunidad server-side to avoid browser RPC network blocks)
@@ -5170,123 +5650,143 @@ async function startServer() {
   });
 
   // Admin: select favorite/featured video for Home page (supports community Firestore videos & local videos)
-  app.put('/api/admin/featured-video', requireAdmin, (req: AuthenticatedRequest, res: Response) => {
-    const db = loadDb();
-    const id = String(req.body?.id || '').trim();
-    const source = req.body?.source === 'local' ? 'local' : 'community';
-    const title = String(req.body?.title || '').trim();
-    const author = String(req.body?.author || 'Miembro').trim();
-    const videoUrl = String(req.body?.videoUrl || '').trim();
-    const downloadUrl = typeof req.body?.downloadUrl === 'string' ? req.body.downloadUrl.trim() : undefined;
-    const originalFormat =
-      req.body?.originalFormat === 'AVI' || req.body?.originalFormat === 'MP4'
-        ? req.body.originalFormat
-        : undefined;
-    const fechaLabel = typeof req.body?.fechaLabel === 'string' ? req.body.fechaLabel.trim() : undefined;
+  app.put(
+    '/api/admin/featured-video',
+    requireAdmin,
+    asyncRoute(async (req: AuthenticatedRequest, res: Response) => {
+      const db = await loadDb({ fresh: true });
+      const id = String(req.body?.id || '').trim();
+      const source = req.body?.source === 'local' ? 'local' : 'community';
+      const title = String(req.body?.title || '').trim();
+      const author = String(req.body?.author || 'Miembro').trim();
+      const videoUrl = String(req.body?.videoUrl || '').trim();
+      const downloadUrl = typeof req.body?.downloadUrl === 'string' ? req.body.downloadUrl.trim() : undefined;
+      const originalFormat =
+        req.body?.originalFormat === 'AVI' || req.body?.originalFormat === 'MP4'
+          ? req.body.originalFormat
+          : undefined;
+      const fechaLabel = typeof req.body?.fechaLabel === 'string' ? req.body.fechaLabel.trim() : undefined;
 
-    if (!id || !title || !videoUrl) {
-      res.status(400).json({ error: 'Datos incompletos para destacar el video.' });
-      return;
-    }
+      if (!id || !title || !videoUrl) {
+        res.status(400).json({ error: 'Datos incompletos para destacar el video.' });
+        return;
+      }
 
-    db.settings.featuredVideo = {
-      id,
-      source,
-      title,
-      author,
-      videoUrl,
-      downloadUrl: downloadUrl || videoUrl,
-      originalFormat,
-      fechaLabel,
-    };
+      db.settings.featuredVideo = {
+        id,
+        source,
+        title,
+        author,
+        videoUrl,
+        downloadUrl: downloadUrl || videoUrl,
+        originalFormat,
+        fechaLabel,
+      };
 
-    db.videos = db.videos.map((v) => ({
-      ...v,
-      featured: source === 'local' && v.id === id,
-    }));
+      db.videos = db.videos.map((v) => ({
+        ...v,
+        featured: source === 'local' && v.id === id,
+      }));
 
-    saveDb(db);
-    res.json({ featuredVideo: db.settings.featuredVideo });
-  });
+      await saveDb(db);
+      res.json({ featuredVideo: db.settings.featuredVideo });
+    })
+  );
 
-  app.delete('/api/admin/featured-video', requireAdmin, (_req: AuthenticatedRequest, res: Response) => {
-    const db = loadDb();
-    db.settings.featuredVideo = null;
-    db.videos = db.videos.map((v) => ({ ...v, featured: false }));
-    saveDb(db);
-    res.json({ featuredVideo: null });
-  });
-
-  app.patch('/api/admin/videos/:videoId/featured', requireAdmin, (req: AuthenticatedRequest, res: Response) => {
-    const db = loadDb();
-    const targetId = String(req.params.videoId || '');
-    const target = db.videos.find((v) => v.id === targetId);
-    if (!target) {
-      res.status(404).json({ error: 'Video no encontrado.' });
-      return;
-    }
-    db.videos = db.videos.map((v) => ({
-      ...v,
-      featured: v.id === targetId,
-    }));
-    db.settings.featuredVideo = {
-      id: target.id,
-      source: 'local',
-      title: target.title,
-      author: target.uploadedBy,
-      videoUrl: target.videoUrl,
-      downloadUrl: target.downloadUrl,
-      originalFormat: target.originalFormat,
-    };
-    saveDb(db);
-    res.json({ featuredId: targetId, featuredVideo: db.settings.featuredVideo });
-  });
-
-  app.patch('/api/admin/videos/:videoId', requireAdmin, (req: AuthenticatedRequest, res: Response) => {
-    const db = loadDb();
-    const video = db.videos.find((v) => v.id === req.params.videoId);
-    if (!video) {
-      res.status(404).json({ error: 'Video no encontrado.' });
-      return;
-    }
-    if (typeof req.body?.title === 'string' && req.body.title.trim()) {
-      video.title = req.body.title.trim();
-    }
-    if (typeof req.body?.description === 'string') {
-      video.description = req.body.description.trim();
-    }
-    if (db.settings.featuredVideo?.id === video.id) {
-      db.settings.featuredVideo.title = video.title;
-    }
-    saveDb(db);
-    res.json({ video });
-  });
-
-  app.delete('/api/admin/videos/:videoId', requireAdmin, async (req: AuthenticatedRequest, res: Response) => {
-    const db = loadDb();
-    const target = db.videos.find((v) => v.id === req.params.videoId);
-    if (!target) {
-      res.status(404).json({ error: 'Video no encontrado.' });
-      return;
-    }
-    if (target.imagekitFileId && imagekitClient) {
-      await imagekitClient.deleteFile(target.imagekitFileId).catch(() => undefined);
-    }
-    db.videos = db.videos.filter((v) => v.id !== req.params.videoId);
-    if (db.settings.featuredVideo?.id === target.id) {
+  app.delete(
+    '/api/admin/featured-video',
+    requireAdmin,
+    asyncRoute(async (_req: AuthenticatedRequest, res: Response) => {
+      const db = await loadDb({ fresh: true });
       db.settings.featuredVideo = null;
-    }
-    saveDb(db);
-    res.json({ deleted: true });
-  });
+      db.videos = db.videos.map((v) => ({ ...v, featured: false }));
+      await saveDb(db);
+      res.json({ featuredVideo: null });
+    })
+  );
+
+  app.patch(
+    '/api/admin/videos/:videoId/featured',
+    requireAdmin,
+    asyncRoute(async (req: AuthenticatedRequest, res: Response) => {
+      const db = await loadDb({ fresh: true });
+      const targetId = String(req.params.videoId || '');
+      const target = db.videos.find((v) => v.id === targetId);
+      if (!target) {
+        res.status(404).json({ error: 'Video no encontrado.' });
+        return;
+      }
+      db.videos = db.videos.map((v) => ({
+        ...v,
+        featured: v.id === targetId,
+      }));
+      db.settings.featuredVideo = {
+        id: target.id,
+        source: 'local',
+        title: target.title,
+        author: target.uploadedBy,
+        videoUrl: target.videoUrl,
+        downloadUrl: target.downloadUrl,
+        originalFormat: target.originalFormat,
+      };
+      await saveDb(db);
+      res.json({ featuredId: targetId, featuredVideo: db.settings.featuredVideo });
+    })
+  );
+
+  app.patch(
+    '/api/admin/videos/:videoId',
+    requireAdmin,
+    asyncRoute(async (req: AuthenticatedRequest, res: Response) => {
+      const db = await loadDb({ fresh: true });
+      const video = db.videos.find((v) => v.id === req.params.videoId);
+      if (!video) {
+        res.status(404).json({ error: 'Video no encontrado.' });
+        return;
+      }
+      if (typeof req.body?.title === 'string' && req.body.title.trim()) {
+        video.title = req.body.title.trim();
+      }
+      if (typeof req.body?.description === 'string') {
+        video.description = req.body.description.trim();
+      }
+      if (db.settings.featuredVideo?.id === video.id) {
+        db.settings.featuredVideo.title = video.title;
+      }
+      await saveDb(db);
+      res.json({ video });
+    })
+  );
+
+  app.delete(
+    '/api/admin/videos/:videoId',
+    requireAdmin,
+    asyncRoute(async (req: AuthenticatedRequest, res: Response) => {
+      const db = await loadDb({ fresh: true });
+      const target = db.videos.find((v) => v.id === req.params.videoId);
+      if (!target) {
+        res.status(404).json({ error: 'Video no encontrado.' });
+        return;
+      }
+      if (target.imagekitFileId && imagekitClient) {
+        await imagekitClient.deleteFile(target.imagekitFileId).catch(() => undefined);
+      }
+      db.videos = db.videos.filter((v) => v.id !== req.params.videoId);
+      if (db.settings.featuredVideo?.id === target.id) {
+        db.settings.featuredVideo = null;
+      }
+      await saveDb(db);
+      res.json({ deleted: true });
+    })
+  );
 
   // Champions History (PNG celebration image — STRICTLY Admin only)
   app.post(
     '/api/champions',
     requireAdmin,
     uploadChampion.single('celebrationImage'),
-    (req: AuthenticatedRequest, res: Response) => {
-      const db = loadDb();
+    asyncRoute(async (req: AuthenticatedRequest, res: Response) => {
+      const db = await loadDb({ fresh: true });
       const season = String(req.body?.season || '').trim();
       const teamName = String(req.body?.teamName || '').trim();
       const memberName = String(req.body?.memberName || '').trim();
@@ -5296,7 +5796,7 @@ async function startServer() {
         rawType === 'copa' ? 'copa' : rawType === 'recopa' ? 'recopa' : 'liga';
 
       if (!season || !teamName || !memberName) {
-        if (req.file) fs.unlinkSync(req.file.path);
+        safeUnlink(req.file?.path);
         res.status(400).json({ error: 'Completá Temporada, Equipo Campeón y Nombre del Miembro.' });
         return;
       }
@@ -5308,10 +5808,17 @@ async function startServer() {
 
       const ext = path.extname(req.file.originalname).toLowerCase();
       if (ext !== '.png' && req.file.mimetype !== 'image/png') {
-        fs.unlinkSync(req.file.path);
+        safeUnlink(req.file.path);
         res.status(400).json({ error: 'La imagen de los festejos debe estar en formato PNG.' });
         return;
       }
+
+      const celebrationImageUrl = await persistUploadedFile(
+        req.file.path,
+        'champions',
+        req.file.filename,
+        'image/png'
+      );
 
       const matchedTeam = findTeamForChampion(db.teams, { teamName, memberName });
       const entry: ChampionEntry = {
@@ -5322,7 +5829,7 @@ async function startServer() {
         memberName,
         tournamentType,
         notes,
-        celebrationImageUrl: `/uploads/champions/${req.file.filename}`,
+        celebrationImageUrl,
         createdAt: new Date().toISOString(),
       };
 
@@ -5336,20 +5843,20 @@ async function startServer() {
         celebrationImageUrl: entry.celebrationImageUrl,
         sourceKey: `champ_${entry.id}`,
       });
-      saveDb(db);
+      await saveDb(db);
       res.status(201).json({ champion: entry });
-    }
+    })
   );
 
   app.put(
     '/api/admin/champions/:champId',
     requireAdmin,
     uploadChampion.single('celebrationImage'),
-    (req: AuthenticatedRequest, res: Response) => {
-      const db = loadDb();
+    asyncRoute(async (req: AuthenticatedRequest, res: Response) => {
+      const db = await loadDb({ fresh: true });
       const champ = db.champions.find((c) => c.id === req.params.champId);
       if (!champ) {
-        if (req.file) fs.unlinkSync(req.file.path);
+        safeUnlink(req.file?.path);
         res.status(404).json({ error: 'Registro de campeón no encontrado.' });
         return;
       }
@@ -5357,11 +5864,16 @@ async function startServer() {
       if (req.file) {
         const ext = path.extname(req.file.originalname).toLowerCase();
         if (ext !== '.png' && req.file.mimetype !== 'image/png') {
-          fs.unlinkSync(req.file.path);
+          safeUnlink(req.file.path);
           res.status(400).json({ error: 'La imagen de los festejos debe estar en formato PNG.' });
           return;
         }
-        champ.celebrationImageUrl = `/uploads/champions/${req.file.filename}`;
+        champ.celebrationImageUrl = await persistUploadedFile(
+          req.file.path,
+          'champions',
+          req.file.filename,
+          'image/png'
+        );
       }
 
       if (typeof req.body?.season === 'string' && req.body.season.trim()) {
@@ -5398,57 +5910,65 @@ async function startServer() {
         sourceKey: `champ_${champ.id}`,
       });
 
-      saveDb(db);
+      await saveDb(db);
       res.json({ champion: champ });
-    }
+    })
   );
 
-  app.delete('/api/admin/champions/:champId', requireAdmin, (req: AuthenticatedRequest, res: Response) => {
-    const db = loadDb();
-    const before = db.champions.length;
-    db.champions = db.champions.filter((c) => c.id !== req.params.champId);
-    if (db.champions.length === before) {
-      res.status(404).json({ error: 'Registro no encontrado.' });
-      return;
-    }
-    removeTrophyBySourceKey(db, `champ_${req.params.champId}`);
-    saveDb(db);
-    res.json({ deleted: true });
-  });
+  app.delete(
+    '/api/admin/champions/:champId',
+    requireAdmin,
+    asyncRoute(async (req: AuthenticatedRequest, res: Response) => {
+      const db = await loadDb({ fresh: true });
+      const before = db.champions.length;
+      db.champions = db.champions.filter((c) => c.id !== req.params.champId);
+      if (db.champions.length === before) {
+        res.status(404).json({ error: 'Registro no encontrado.' });
+        return;
+      }
+      removeTrophyBySourceKey(db, `champ_${req.params.champId}`);
+      await saveDb(db);
+      res.json({ deleted: true });
+    })
+  );
 
   // Admin: update Rules & Game Mode & Cup Rules
-  app.put('/api/admin/rules', requireAdmin, (req: AuthenticatedRequest, res: Response) => {
-    const db = loadDb();
-    const { prohibitedRules, generalNotes, gameMode, cupRules } = req.body as Partial<RulesConfig>;
-    if (Array.isArray(prohibitedRules)) {
-      db.rules.prohibitedRules = prohibitedRules.map((r) => String(r).trim()).filter(Boolean);
-    }
-    if (typeof generalNotes === 'string') {
-      db.rules.generalNotes = generalNotes.trim();
-    }
-    if (gameMode && typeof gameMode === 'object') {
-      db.rules.gameMode = {
-        partidos: String(gameMode.partidos ?? db.rules.gameMode.partidos).trim(),
-        tiempo: String(gameMode.tiempo ?? db.rules.gameMode.tiempo).trim(),
-        condicion: String(gameMode.condicion ?? db.rules.gameMode.condicion).trim(),
-        lesiones: String(gameMode.lesiones ?? db.rules.gameMode.lesiones).trim(),
-        cambios: String(gameMode.cambios ?? db.rules.gameMode.cambios).trim(),
-        pausas: String(gameMode.pausas ?? db.rules.gameMode.pausas).trim(),
-        clima: String(gameMode.clima ?? db.rules.gameMode.clima).trim(),
-      };
-    }
-    if (cupRules && typeof cupRules === 'object') {
-      const current = db.rules.cupRules || defaultCupRules();
-      db.rules.cupRules = {
-        format: String(cupRules.format ?? current.format).trim(),
-        extraTime: String(cupRules.extraTime ?? current.extraTime).trim(),
-        penalties: String(cupRules.penalties ?? current.penalties).trim(),
-        notes: String(cupRules.notes ?? current.notes).trim(),
-      };
-    }
-    saveDb(db);
-    res.json({ rules: db.rules });
-  });
+  app.put(
+    '/api/admin/rules',
+    requireAdmin,
+    asyncRoute(async (req: AuthenticatedRequest, res: Response) => {
+      const db = await loadDb({ fresh: true });
+      const { prohibitedRules, generalNotes, gameMode, cupRules } = req.body as Partial<RulesConfig>;
+      if (Array.isArray(prohibitedRules)) {
+        db.rules.prohibitedRules = prohibitedRules.map((r) => String(r).trim()).filter(Boolean);
+      }
+      if (typeof generalNotes === 'string') {
+        db.rules.generalNotes = generalNotes.trim();
+      }
+      if (gameMode && typeof gameMode === 'object') {
+        db.rules.gameMode = {
+          partidos: String(gameMode.partidos ?? db.rules.gameMode.partidos).trim(),
+          tiempo: String(gameMode.tiempo ?? db.rules.gameMode.tiempo).trim(),
+          condicion: String(gameMode.condicion ?? db.rules.gameMode.condicion).trim(),
+          lesiones: String(gameMode.lesiones ?? db.rules.gameMode.lesiones).trim(),
+          cambios: String(gameMode.cambios ?? db.rules.gameMode.cambios).trim(),
+          pausas: String(gameMode.pausas ?? db.rules.gameMode.pausas).trim(),
+          clima: String(gameMode.clima ?? db.rules.gameMode.clima).trim(),
+        };
+      }
+      if (cupRules && typeof cupRules === 'object') {
+        const current = db.rules.cupRules || defaultCupRules();
+        db.rules.cupRules = {
+          format: String(cupRules.format ?? current.format).trim(),
+          extraTime: String(cupRules.extraTime ?? current.extraTime).trim(),
+          penalties: String(cupRules.penalties ?? current.penalties).trim(),
+          notes: String(cupRules.notes ?? current.notes).trim(),
+        };
+      }
+      await saveDb(db);
+      res.json({ rules: db.rules });
+    })
+  );
 
   // =========================================================================
   // Admin: Copa de la Liga (16 equipos, llaves 8vos->4tos->Semis->Final + Recopa)
@@ -5458,8 +5978,8 @@ async function startServer() {
     '/api/admin/cup/settings',
     requireAdmin,
     uploadCrest.single('championCrest'),
-    async (req: AuthenticatedRequest, res: Response) => {
-      const db = loadDb();
+    asyncRoute(async (req: AuthenticatedRequest, res: Response) => {
+      const db = await loadDb({ fresh: true });
       const cup = db.cup;
 
       if (typeof req.body?.editionName === 'string' && req.body.editionName.trim()) {
@@ -5489,19 +6009,25 @@ async function startServer() {
       }
       if (req.file) {
         if (!isValidImageFile(req.file)) {
-          fs.unlinkSync(req.file.path);
+          safeUnlink(req.file.path);
           res.status(400).json({ error: 'El escudo debe ser una imagen válida (PNG, JPG, WEBP).' });
           return;
         }
         const finalName = await normalizePng128(req.file.path);
-        cup.championCrestUrl = `/uploads/crests/${finalName}`;
+        const finalPath = path.join(path.dirname(req.file.path), finalName);
+        cup.championCrestUrl = await persistUploadedFile(
+          finalPath,
+          'crests',
+          finalName,
+          finalName.endsWith('.png') ? 'image/png' : req.file.mimetype
+        );
         cup.recopa.cupChampionCrestUrl = cup.championCrestUrl;
       }
 
       cup.updatedAt = new Date().toISOString();
-      saveDb(db);
+      await saveDb(db);
       res.json({ cup });
-    }
+    })
   );
 
   // Update a single Cup participant slot (1..16) with optional PNG 128x128 crest — NEVER mutates db.teams
@@ -5509,18 +6035,18 @@ async function startServer() {
     '/api/admin/cup/participants/:slot',
     requireAdmin,
     uploadCrest.single('crest'),
-    async (req: AuthenticatedRequest, res: Response) => {
-      const db = loadDb();
+    asyncRoute(async (req: AuthenticatedRequest, res: Response) => {
+      const db = await loadDb({ fresh: true });
       const slot = Number(req.params.slot);
       if (!Number.isInteger(slot) || slot < 1 || slot > 16) {
-        if (req.file) fs.unlinkSync(req.file.path);
+        safeUnlink(req.file?.path);
         res.status(400).json({ error: 'El cupo debe estar entre 1 y 16.' });
         return;
       }
 
       const participant = db.cup.participants.find((p) => p.slot === slot);
       if (!participant) {
-        if (req.file) fs.unlinkSync(req.file.path);
+        safeUnlink(req.file?.path);
         res.status(404).json({ error: 'Cupo de copa no encontrado.' });
         return;
       }
@@ -5554,426 +6080,456 @@ async function startServer() {
 
       if (req.file) {
         if (!isValidImageFile(req.file)) {
-          fs.unlinkSync(req.file.path);
+          safeUnlink(req.file.path);
           res.status(400).json({ error: 'El escudo debe ser una imagen válida (se convierte a PNG 128x128).' });
           return;
         }
         const finalName = await normalizePng128(req.file.path);
-        participant.crestUrl = `/uploads/crests/${finalName}`;
+        const finalPath = path.join(path.dirname(req.file.path), finalName);
+        participant.crestUrl = await persistUploadedFile(
+          finalPath,
+          'crests',
+          finalName,
+          finalName.endsWith('.png') ? 'image/png' : req.file.mimetype
+        );
       }
 
       syncCupNodeNames(db.cup);
       db.cup.updatedAt = new Date().toISOString();
-      saveDb(db);
+      await saveDb(db);
       res.json({ cup: db.cup, participant });
-    }
+    })
   );
 
   // Clear/remove participant from a cup slot (1..16)
-  app.delete('/api/admin/cup/participants/:slot', requireAdmin, (req: AuthenticatedRequest, res: Response) => {
-    const db = loadDb();
-    const slot = Number(req.params.slot);
-    if (!Number.isInteger(slot) || slot < 1 || slot > 16) {
-      res.status(400).json({ error: 'El cupo debe estar entre 1 y 16.' });
-      return;
-    }
-
-    const participant = db.cup.participants.find((p) => p.slot === slot);
-    if (!participant) {
-      res.status(404).json({ error: 'Cupo no encontrado.' });
-      return;
-    }
-
-    participant.teamId = undefined;
-    participant.teamName = `Cupo Libre #${slot}`;
-    participant.memberName = 'Por definir';
-    participant.crestUrl = '';
-
-    for (const m of db.cup.matches) {
-      if (m.round !== 'r16') {
-        if (m.homeSlot === slot) m.homeSlot = null;
-        if (m.awaySlot === slot) m.awaySlot = null;
+  app.delete(
+    '/api/admin/cup/participants/:slot',
+    requireAdmin,
+    asyncRoute(async (req: AuthenticatedRequest, res: Response) => {
+      const db = await loadDb({ fresh: true });
+      const slot = Number(req.params.slot);
+      if (!Number.isInteger(slot) || slot < 1 || slot > 16) {
+        res.status(400).json({ error: 'El cupo debe estar entre 1 y 16.' });
+        return;
       }
-      if (m.winnerSlot === slot) m.winnerSlot = null;
-    }
-    if (db.cup.championSlot === slot) {
-      db.cup.championSlot = null;
-      db.cup.championTeamName = '';
-      db.cup.championMemberName = '';
-      db.cup.championCrestUrl = '';
-    }
 
-    syncCupNodeNames(db.cup);
-    db.cup.updatedAt = new Date().toISOString();
-    saveDb(db);
-    res.json({ cup: db.cup });
-  });
+      const participant = db.cup.participants.find((p) => p.slot === slot);
+      if (!participant) {
+        res.status(404).json({ error: 'Cupo no encontrado.' });
+        return;
+      }
+
+      participant.teamId = undefined;
+      participant.teamName = `Cupo Libre #${slot}`;
+      participant.memberName = 'Por definir';
+      participant.crestUrl = '';
+
+      for (const m of db.cup.matches) {
+        if (m.round !== 'r16') {
+          if (m.homeSlot === slot) m.homeSlot = null;
+          if (m.awaySlot === slot) m.awaySlot = null;
+        }
+        if (m.winnerSlot === slot) m.winnerSlot = null;
+      }
+      if (db.cup.championSlot === slot) {
+        db.cup.championSlot = null;
+        db.cup.championTeamName = '';
+        db.cup.championMemberName = '';
+        db.cup.championCrestUrl = '';
+      }
+
+      syncCupNodeNames(db.cup);
+      db.cup.updatedAt = new Date().toISOString();
+      await saveDb(db);
+      res.json({ cup: db.cup });
+    })
+  );
 
   // Swap two participant slots (1..16) to move members anywhere in the bracket
-  app.post('/api/admin/cup/participants/swap', requireAdmin, (req: AuthenticatedRequest, res: Response) => {
-    const db = loadDb();
-    const slotA = Number(req.body?.slotA);
-    const slotB = Number(req.body?.slotB);
-    if (
-      !Number.isInteger(slotA) ||
-      !Number.isInteger(slotB) ||
-      slotA < 1 ||
-      slotA > 16 ||
-      slotB < 1 ||
-      slotB > 16 ||
-      slotA === slotB
-    ) {
-      res.status(400).json({ error: 'Seleccioná dos puestos distintos entre 1 y 16 para intercambiar.' });
-      return;
-    }
+  app.post(
+    '/api/admin/cup/participants/swap',
+    requireAdmin,
+    asyncRoute(async (req: AuthenticatedRequest, res: Response) => {
+      const db = await loadDb({ fresh: true });
+      const slotA = Number(req.body?.slotA);
+      const slotB = Number(req.body?.slotB);
+      if (
+        !Number.isInteger(slotA) ||
+        !Number.isInteger(slotB) ||
+        slotA < 1 ||
+        slotA > 16 ||
+        slotB < 1 ||
+        slotB > 16 ||
+        slotA === slotB
+      ) {
+        res.status(400).json({ error: 'Seleccioná dos puestos distintos entre 1 y 16 para intercambiar.' });
+        return;
+      }
 
-    const pA = db.cup.participants.find((p) => p.slot === slotA);
-    const pB = db.cup.participants.find((p) => p.slot === slotB);
-    if (!pA || !pB) {
-      res.status(404).json({ error: 'Cupo no encontrado.' });
-      return;
-    }
+      const pA = db.cup.participants.find((p) => p.slot === slotA);
+      const pB = db.cup.participants.find((p) => p.slot === slotB);
+      if (!pA || !pB) {
+        res.status(404).json({ error: 'Cupo no encontrado.' });
+        return;
+      }
 
-    const temp = {
-      teamId: pA.teamId,
-      teamName: pA.teamName,
-      memberName: pA.memberName,
-      crestUrl: pA.crestUrl,
-    };
-    pA.teamId = pB.teamId;
-    pA.teamName = pB.teamName;
-    pA.memberName = pB.memberName;
-    pA.crestUrl = pB.crestUrl;
+      const temp = {
+        teamId: pA.teamId,
+        teamName: pA.teamName,
+        memberName: pA.memberName,
+        crestUrl: pA.crestUrl,
+      };
+      pA.teamId = pB.teamId;
+      pA.teamName = pB.teamName;
+      pA.memberName = pB.memberName;
+      pA.crestUrl = pB.crestUrl;
 
-    pB.teamId = temp.teamId;
-    pB.teamName = temp.teamName;
-    pB.memberName = temp.memberName;
-    pB.crestUrl = temp.crestUrl;
+      pB.teamId = temp.teamId;
+      pB.teamName = temp.teamName;
+      pB.memberName = temp.memberName;
+      pB.crestUrl = temp.crestUrl;
 
-    syncCupNodeNames(db.cup);
-    db.cup.updatedAt = new Date().toISOString();
-    saveDb(db);
-    res.json({ cup: db.cup });
-  });
+      syncCupNodeNames(db.cup);
+      db.cup.updatedAt = new Date().toISOString();
+      await saveDb(db);
+      res.json({ cup: db.cup });
+    })
+  );
 
   // Auto-seed Top 16 from League Standings into the Cup slots
-  app.post('/api/admin/cup/seed-standings', requireAdmin, (req: AuthenticatedRequest, res: Response) => {
-    const db = loadDb();
-    const mode = req.body?.mode === 'sequential' ? 'sequential' : 'seeded';
-    const ranked = getRankedStandingsTeams(db.teams, db.matches).slice(0, 16);
+  app.post(
+    '/api/admin/cup/seed-standings',
+    requireAdmin,
+    asyncRoute(async (req: AuthenticatedRequest, res: Response) => {
+      const db = await loadDb({ fresh: true });
+      const mode = req.body?.mode === 'sequential' ? 'sequential' : 'seeded';
+      const ranked = getRankedStandingsTeams(db.teams, db.matches).slice(0, 16);
 
-    // Classic 16-team bracket seeding pairs (1v16, 8v9, 5v12, 4v13, 3v14, 6v11, 7v10, 2v15)
-    const seededOrder = [0, 15, 7, 8, 4, 11, 3, 12, 2, 13, 5, 10, 6, 9, 1, 14];
+      // Classic 16-team bracket seeding pairs (1v16, 8v9, 5v12, 4v13, 3v14, 6v11, 7v10, 2v15)
+      const seededOrder = [0, 15, 7, 8, 4, 11, 3, 12, 2, 13, 5, 10, 6, 9, 1, 14];
 
-    db.cup.participants = Array.from({ length: 16 }, (_, idx) => {
-      const slot = idx + 1;
-      const teamIdx = mode === 'seeded' ? seededOrder[idx] : idx;
-      const t = ranked[teamIdx];
-      if (t) {
+      db.cup.participants = Array.from({ length: 16 }, (_, idx) => {
+        const slot = idx + 1;
+        const teamIdx = mode === 'seeded' ? seededOrder[idx] : idx;
+        const t = ranked[teamIdx];
+        if (t) {
+          return {
+            slot,
+            teamId: t.id,
+            teamName: t.name,
+            memberName: t.memberName,
+            crestUrl: t.crestUrl,
+          };
+        }
         return {
           slot,
-          teamId: t.id,
-          teamName: t.name,
-          memberName: t.memberName,
-          crestUrl: t.crestUrl,
+          teamName: `Cupo Libre #${slot}`,
+          memberName: 'Por definir',
+          crestUrl: '',
         };
-      }
-      return {
-        slot,
-        teamName: `Cupo Libre #${slot}`,
-        memberName: 'Por definir',
-        crestUrl: '',
-      };
-    });
+      });
 
-    syncCupNodeNames(db.cup);
-    db.cup.updatedAt = new Date().toISOString();
-    saveDb(db);
-    res.json({ cup: db.cup });
-  });
+      syncCupNodeNames(db.cup);
+      db.cup.updatedAt = new Date().toISOString();
+      await saveDb(db);
+      res.json({ cup: db.cup });
+    })
+  );
 
   // Update a Cup match node (scores, ET, penalties, manual slot overrides, auto-advance winner)
-  app.put('/api/admin/cup/matches/:matchId', requireAdmin, (req: AuthenticatedRequest, res: Response) => {
-    const db = loadDb();
-    const match = db.cup.matches.find((m) => m.id === req.params.matchId);
-    if (!match) {
-      res.status(404).json({ error: 'Llave de copa no encontrada.' });
-      return;
-    }
+  app.put(
+    '/api/admin/cup/matches/:matchId',
+    requireAdmin,
+    asyncRoute(async (req: AuthenticatedRequest, res: Response) => {
+      const db = await loadDb({ fresh: true });
+      const match = db.cup.matches.find((m) => m.id === req.params.matchId);
+      if (!match) {
+        res.status(404).json({ error: 'Llave de copa no encontrada.' });
+        return;
+      }
 
-    if (req.body?.homeSlot !== undefined) {
-      match.homeSlot = req.body.homeSlot === null || req.body.homeSlot === '' ? null : Number(req.body.homeSlot);
-    }
-    if (req.body?.awaySlot !== undefined) {
-      match.awaySlot = req.body.awaySlot === null || req.body.awaySlot === '' ? null : Number(req.body.awaySlot);
-    }
+      if (req.body?.homeSlot !== undefined) {
+        match.homeSlot = req.body.homeSlot === null || req.body.homeSlot === '' ? null : Number(req.body.homeSlot);
+      }
+      if (req.body?.awaySlot !== undefined) {
+        match.awaySlot = req.body.awaySlot === null || req.body.awaySlot === '' ? null : Number(req.body.awaySlot);
+      }
 
-    const parseNullableNum = (v: unknown): number | null => {
-      if (v === null || v === undefined || v === '') return null;
-      const n = Number(v);
-      return Number.isInteger(n) && n >= 0 ? n : null;
-    };
+      const parseNullableNum = (v: unknown): number | null => {
+        if (v === null || v === undefined || v === '') return null;
+        const n = Number(v);
+        return Number.isInteger(n) && n >= 0 ? n : null;
+      };
 
-    if (req.body?.homeGoals !== undefined) match.homeGoals = parseNullableNum(req.body.homeGoals);
-    if (req.body?.awayGoals !== undefined) match.awayGoals = parseNullableNum(req.body.awayGoals);
-    if (req.body?.homePenalties !== undefined) match.homePenalties = parseNullableNum(req.body.homePenalties);
-    if (req.body?.awayPenalties !== undefined) match.awayPenalties = parseNullableNum(req.body.awayPenalties);
-    if (typeof req.body?.extraTime === 'boolean') match.extraTime = req.body.extraTime;
-    if (typeof req.body?.scheduledDate === 'string') {
-      match.scheduledDate = req.body.scheduledDate.trim() || undefined;
-    }
-    if (typeof req.body?.scheduledTime === 'string') {
-      match.scheduledTime = req.body.scheduledTime.trim() || undefined;
-    }
+      if (req.body?.homeGoals !== undefined) match.homeGoals = parseNullableNum(req.body.homeGoals);
+      if (req.body?.awayGoals !== undefined) match.awayGoals = parseNullableNum(req.body.awayGoals);
+      if (req.body?.homePenalties !== undefined) match.homePenalties = parseNullableNum(req.body.homePenalties);
+      if (req.body?.awayPenalties !== undefined) match.awayPenalties = parseNullableNum(req.body.awayPenalties);
+      if (typeof req.body?.extraTime === 'boolean') match.extraTime = req.body.extraTime;
+      if (typeof req.body?.scheduledDate === 'string') {
+        match.scheduledDate = req.body.scheduledDate.trim() || undefined;
+      }
+      if (typeof req.body?.scheduledTime === 'string') {
+        match.scheduledTime = req.body.scheduledTime.trim() || undefined;
+      }
 
-    if (req.body?.winnerSlot !== undefined) {
-      match.winnerSlot =
-        req.body.winnerSlot === null || req.body.winnerSlot === '' ? null : Number(req.body.winnerSlot);
-    } else if (match.homeGoals !== null && match.awayGoals !== null) {
-      if (match.homeGoals > match.awayGoals && match.homeSlot) {
-        match.winnerSlot = match.homeSlot;
-      } else if (match.awayGoals > match.homeGoals && match.awaySlot) {
-        match.winnerSlot = match.awaySlot;
-      } else if (
-        match.homeGoals === match.awayGoals &&
-        match.homePenalties !== null &&
-        match.awayPenalties !== null
-      ) {
-        if (match.homePenalties > match.awayPenalties && match.homeSlot) {
+      if (req.body?.winnerSlot !== undefined) {
+        match.winnerSlot =
+          req.body.winnerSlot === null || req.body.winnerSlot === '' ? null : Number(req.body.winnerSlot);
+      } else if (match.homeGoals !== null && match.awayGoals !== null) {
+        if (match.homeGoals > match.awayGoals && match.homeSlot) {
           match.winnerSlot = match.homeSlot;
-        } else if (match.awayPenalties > match.homePenalties && match.awaySlot) {
+        } else if (match.awayGoals > match.homeGoals && match.awaySlot) {
           match.winnerSlot = match.awaySlot;
+        } else if (
+          match.homeGoals === match.awayGoals &&
+          match.homePenalties !== null &&
+          match.awayPenalties !== null
+        ) {
+          if (match.homePenalties > match.awayPenalties && match.homeSlot) {
+            match.winnerSlot = match.homeSlot;
+          } else if (match.awayPenalties > match.homePenalties && match.awaySlot) {
+            match.winnerSlot = match.awaySlot;
+          }
+        }
+      } else if (
+        match.winnerSlot !== null &&
+        match.winnerSlot !== match.homeSlot &&
+        match.winnerSlot !== match.awaySlot
+      ) {
+        match.winnerSlot = null;
+      }
+
+      if (typeof req.body?.played === 'boolean') {
+        match.played = req.body.played;
+      } else {
+        match.played = Boolean(match.winnerSlot || (match.homeGoals !== null && match.awayGoals !== null));
+      }
+
+      propagateCupMatchWinner(db.cup, match);
+      if (match.id === 'final') {
+        const sourceKey = `cup_${db.cup.editionNumber}`;
+        if (db.cup.championTeamName) {
+          const winnerParticipant = db.cup.participants.find((p) => p.slot === db.cup.championSlot);
+          awardTeamTrophy(db, {
+            teamId: winnerParticipant?.teamId,
+            teamName: db.cup.championTeamName,
+            memberName: db.cup.championMemberName,
+            type: 'copa',
+            season: db.cup.editionName || `Edición #${db.cup.editionNumber}`,
+            sourceKey,
+          });
+        } else {
+          removeTrophyBySourceKey(db, sourceKey);
         }
       }
-    } else if (
-      match.winnerSlot !== null &&
-      match.winnerSlot !== match.homeSlot &&
-      match.winnerSlot !== match.awaySlot
-    ) {
-      match.winnerSlot = null;
-    }
-
-    if (typeof req.body?.played === 'boolean') {
-      match.played = req.body.played;
-    } else {
-      match.played = Boolean(match.winnerSlot || (match.homeGoals !== null && match.awayGoals !== null));
-    }
-
-    propagateCupMatchWinner(db.cup, match);
-    if (match.id === 'final') {
-      const sourceKey = `cup_${db.cup.editionNumber}`;
-      if (db.cup.championTeamName) {
-        const winnerParticipant = db.cup.participants.find((p) => p.slot === db.cup.championSlot);
-        awardTeamTrophy(db, {
-          teamId: winnerParticipant?.teamId,
-          teamName: db.cup.championTeamName,
-          memberName: db.cup.championMemberName,
-          type: 'copa',
-          season: db.cup.editionName || `Edición #${db.cup.editionNumber}`,
-          sourceKey,
-        });
-      } else {
-        removeTrophyBySourceKey(db, sourceKey);
-      }
-    }
-    db.cup.updatedAt = new Date().toISOString();
-    saveDb(db);
-    res.json({ cup: db.cup, match });
-  });
+      db.cup.updatedAt = new Date().toISOString();
+      await saveDb(db);
+      res.json({ cup: db.cup, match });
+    })
+  );
 
   // Update Recopa Final (League Champion vs Cup Champion -> Gran Campeón de la Liga Master Argentina)
-  app.put('/api/admin/cup/recopa', requireAdmin, (req: AuthenticatedRequest, res: Response) => {
-    const db = loadDb();
-    const recopa = db.cup.recopa;
+  app.put(
+    '/api/admin/cup/recopa',
+    requireAdmin,
+    asyncRoute(async (req: AuthenticatedRequest, res: Response) => {
+      const db = await loadDb({ fresh: true });
+      const recopa = db.cup.recopa;
 
-    if (req.body?.clearLeague) {
-      recopa.leagueChampionName = '';
-      recopa.leagueChampionMember = '';
-      recopa.leagueChampionCrestUrl = '';
-      recopa.leagueGoals = null;
-      recopa.leaguePenalties = null;
-      if (recopa.grandChampionSide === 'league') {
+      if (req.body?.clearLeague) {
+        recopa.leagueChampionName = '';
+        recopa.leagueChampionMember = '';
+        recopa.leagueChampionCrestUrl = '';
+        recopa.leagueGoals = null;
+        recopa.leaguePenalties = null;
+        if (recopa.grandChampionSide === 'league') {
+          recopa.grandChampionSide = null;
+          recopa.grandChampionName = '';
+          recopa.grandChampionMember = '';
+          recopa.grandChampionCrestUrl = '';
+          recopa.played = false;
+        }
+      }
+
+      if (req.body?.clearCup) {
+        recopa.cupChampionName = '';
+        recopa.cupChampionMember = '';
+        recopa.cupChampionCrestUrl = '';
+        recopa.cupGoals = null;
+        recopa.cupPenalties = null;
+        if (recopa.grandChampionSide === 'cup') {
+          recopa.grandChampionSide = null;
+          recopa.grandChampionName = '';
+          recopa.grandChampionMember = '';
+          recopa.grandChampionCrestUrl = '';
+          recopa.played = false;
+        }
+      }
+
+      if (req.body?.pullLeagueLeader) {
+        const ranked = getRankedStandingsTeams(db.teams, db.matches);
+        if (ranked[0]) {
+          recopa.leagueChampionName = ranked[0].name;
+          recopa.leagueChampionMember = ranked[0].memberName;
+          recopa.leagueChampionCrestUrl = ranked[0].crestUrl;
+        }
+      }
+
+      if (typeof req.body?.leagueTeamId === 'string' && req.body.leagueTeamId.trim()) {
+        const found = db.teams.find((t) => t.id === req.body.leagueTeamId.trim());
+        if (found) {
+          recopa.leagueChampionName = found.name;
+          recopa.leagueChampionMember = found.memberName;
+          recopa.leagueChampionCrestUrl = found.crestUrl;
+        }
+      }
+
+      if (typeof req.body?.cupTeamId === 'string' && req.body.cupTeamId.trim()) {
+        const found = db.teams.find((t) => t.id === req.body.cupTeamId.trim());
+        if (found) {
+          recopa.cupChampionName = found.name;
+          recopa.cupChampionMember = found.memberName;
+          recopa.cupChampionCrestUrl = found.crestUrl;
+        }
+      }
+
+      if (typeof req.body?.leagueChampionName === 'string') {
+        recopa.leagueChampionName = req.body.leagueChampionName.trim();
+      }
+      if (typeof req.body?.leagueChampionMember === 'string') {
+        recopa.leagueChampionMember = req.body.leagueChampionMember.trim();
+      }
+      if (typeof req.body?.leagueChampionCrestUrl === 'string') {
+        recopa.leagueChampionCrestUrl = req.body.leagueChampionCrestUrl.trim();
+      }
+      if (typeof req.body?.cupChampionName === 'string') {
+        recopa.cupChampionName = req.body.cupChampionName.trim();
+      }
+      if (typeof req.body?.cupChampionMember === 'string') {
+        recopa.cupChampionMember = req.body.cupChampionMember.trim();
+      }
+      if (typeof req.body?.cupChampionCrestUrl === 'string') {
+        recopa.cupChampionCrestUrl = req.body.cupChampionCrestUrl.trim();
+      }
+
+      const parseNullableNum = (v: unknown): number | null => {
+        if (v === null || v === undefined || v === '') return null;
+        const n = Number(v);
+        return Number.isInteger(n) && n >= 0 ? n : null;
+      };
+
+      if (req.body?.leagueGoals !== undefined) recopa.leagueGoals = parseNullableNum(req.body.leagueGoals);
+      if (req.body?.cupGoals !== undefined) recopa.cupGoals = parseNullableNum(req.body.cupGoals);
+      if (req.body?.leaguePenalties !== undefined) {
+        recopa.leaguePenalties = parseNullableNum(req.body.leaguePenalties);
+      }
+      if (req.body?.cupPenalties !== undefined) {
+        recopa.cupPenalties = parseNullableNum(req.body.cupPenalties);
+      }
+      if (typeof req.body?.extraTime === 'boolean') recopa.extraTime = req.body.extraTime;
+
+      let side: 'league' | 'cup' | null = recopa.grandChampionSide;
+      if (req.body?.grandChampionSide === 'league' || req.body?.grandChampionSide === 'cup' || req.body?.grandChampionSide === null) {
+        side = req.body.grandChampionSide;
+      } else if (recopa.leagueGoals !== null && recopa.cupGoals !== null) {
+        if (recopa.leagueGoals > recopa.cupGoals) side = 'league';
+        else if (recopa.cupGoals > recopa.leagueGoals) side = 'cup';
+        else if (recopa.leaguePenalties !== null && recopa.cupPenalties !== null) {
+          if (recopa.leaguePenalties > recopa.cupPenalties) side = 'league';
+          else if (recopa.cupPenalties > recopa.leaguePenalties) side = 'cup';
+        }
+      }
+
+      recopa.grandChampionSide = side;
+      if (side === 'league' && recopa.leagueChampionName) {
+        recopa.grandChampionName = recopa.leagueChampionName;
+        recopa.grandChampionMember = recopa.leagueChampionMember;
+        recopa.grandChampionCrestUrl = recopa.leagueChampionCrestUrl;
+        recopa.played = true;
+      } else if (side === 'cup' && recopa.cupChampionName) {
+        recopa.grandChampionName = recopa.cupChampionName;
+        recopa.grandChampionMember = recopa.cupChampionMember;
+        recopa.grandChampionCrestUrl = recopa.cupChampionCrestUrl;
+        recopa.played = true;
+      } else if (typeof req.body?.grandChampionName === 'string') {
+        recopa.grandChampionName = req.body.grandChampionName.trim();
+        recopa.grandChampionMember = typeof req.body?.grandChampionMember === 'string'
+          ? req.body.grandChampionMember.trim()
+          : '';
+        recopa.played = Boolean(recopa.grandChampionName);
+      } else {
         recopa.grandChampionSide = null;
         recopa.grandChampionName = '';
         recopa.grandChampionMember = '';
         recopa.grandChampionCrestUrl = '';
         recopa.played = false;
       }
-    }
 
-    if (req.body?.clearCup) {
-      recopa.cupChampionName = '';
-      recopa.cupChampionMember = '';
-      recopa.cupChampionCrestUrl = '';
-      recopa.cupGoals = null;
-      recopa.cupPenalties = null;
-      if (recopa.grandChampionSide === 'cup') {
-        recopa.grandChampionSide = null;
-        recopa.grandChampionName = '';
-        recopa.grandChampionMember = '';
-        recopa.grandChampionCrestUrl = '';
-        recopa.played = false;
+      if (typeof req.body?.greeting === 'string') {
+        recopa.greeting = req.body.greeting.trim() || '¡Felicitaciones Campeón de la Recopa!';
+      } else if (!recopa.greeting) {
+        recopa.greeting = '¡Felicitaciones Campeón de la Recopa!';
       }
-    }
-
-    if (req.body?.pullLeagueLeader) {
-      const ranked = getRankedStandingsTeams(db.teams, db.matches);
-      if (ranked[0]) {
-        recopa.leagueChampionName = ranked[0].name;
-        recopa.leagueChampionMember = ranked[0].memberName;
-        recopa.leagueChampionCrestUrl = ranked[0].crestUrl;
+      if (typeof req.body?.scheduledDate === 'string') {
+        recopa.scheduledDate = req.body.scheduledDate.trim() || undefined;
       }
-    }
-
-    if (typeof req.body?.leagueTeamId === 'string' && req.body.leagueTeamId.trim()) {
-      const found = db.teams.find((t) => t.id === req.body.leagueTeamId.trim());
-      if (found) {
-        recopa.leagueChampionName = found.name;
-        recopa.leagueChampionMember = found.memberName;
-        recopa.leagueChampionCrestUrl = found.crestUrl;
+      if (typeof req.body?.scheduledTime === 'string') {
+        recopa.scheduledTime = req.body.scheduledTime.trim() || undefined;
       }
-    }
 
-    if (typeof req.body?.cupTeamId === 'string' && req.body.cupTeamId.trim()) {
-      const found = db.teams.find((t) => t.id === req.body.cupTeamId.trim());
-      if (found) {
-        recopa.cupChampionName = found.name;
-        recopa.cupChampionMember = found.memberName;
-        recopa.cupChampionCrestUrl = found.crestUrl;
+      const recopaSourceKey = `recopa_${db.cup.editionNumber}`;
+      if (recopa.played && recopa.grandChampionName) {
+        awardTeamTrophy(db, {
+          teamName: recopa.grandChampionName,
+          memberName: recopa.grandChampionMember,
+          type: 'recopa',
+          season: `Recopa · ${db.cup.editionName || `Edición #${db.cup.editionNumber}`}`,
+          sourceKey: recopaSourceKey,
+        });
+      } else {
+        removeTrophyBySourceKey(db, recopaSourceKey);
       }
-    }
 
-    if (typeof req.body?.leagueChampionName === 'string') {
-      recopa.leagueChampionName = req.body.leagueChampionName.trim();
-    }
-    if (typeof req.body?.leagueChampionMember === 'string') {
-      recopa.leagueChampionMember = req.body.leagueChampionMember.trim();
-    }
-    if (typeof req.body?.leagueChampionCrestUrl === 'string') {
-      recopa.leagueChampionCrestUrl = req.body.leagueChampionCrestUrl.trim();
-    }
-    if (typeof req.body?.cupChampionName === 'string') {
-      recopa.cupChampionName = req.body.cupChampionName.trim();
-    }
-    if (typeof req.body?.cupChampionMember === 'string') {
-      recopa.cupChampionMember = req.body.cupChampionMember.trim();
-    }
-    if (typeof req.body?.cupChampionCrestUrl === 'string') {
-      recopa.cupChampionCrestUrl = req.body.cupChampionCrestUrl.trim();
-    }
-
-    const parseNullableNum = (v: unknown): number | null => {
-      if (v === null || v === undefined || v === '') return null;
-      const n = Number(v);
-      return Number.isInteger(n) && n >= 0 ? n : null;
-    };
-
-    if (req.body?.leagueGoals !== undefined) recopa.leagueGoals = parseNullableNum(req.body.leagueGoals);
-    if (req.body?.cupGoals !== undefined) recopa.cupGoals = parseNullableNum(req.body.cupGoals);
-    if (req.body?.leaguePenalties !== undefined) {
-      recopa.leaguePenalties = parseNullableNum(req.body.leaguePenalties);
-    }
-    if (req.body?.cupPenalties !== undefined) {
-      recopa.cupPenalties = parseNullableNum(req.body.cupPenalties);
-    }
-    if (typeof req.body?.extraTime === 'boolean') recopa.extraTime = req.body.extraTime;
-
-    let side: 'league' | 'cup' | null = recopa.grandChampionSide;
-    if (req.body?.grandChampionSide === 'league' || req.body?.grandChampionSide === 'cup' || req.body?.grandChampionSide === null) {
-      side = req.body.grandChampionSide;
-    } else if (recopa.leagueGoals !== null && recopa.cupGoals !== null) {
-      if (recopa.leagueGoals > recopa.cupGoals) side = 'league';
-      else if (recopa.cupGoals > recopa.leagueGoals) side = 'cup';
-      else if (recopa.leaguePenalties !== null && recopa.cupPenalties !== null) {
-        if (recopa.leaguePenalties > recopa.cupPenalties) side = 'league';
-        else if (recopa.cupPenalties > recopa.leaguePenalties) side = 'cup';
-      }
-    }
-
-    recopa.grandChampionSide = side;
-    if (side === 'league' && recopa.leagueChampionName) {
-      recopa.grandChampionName = recopa.leagueChampionName;
-      recopa.grandChampionMember = recopa.leagueChampionMember;
-      recopa.grandChampionCrestUrl = recopa.leagueChampionCrestUrl;
-      recopa.played = true;
-    } else if (side === 'cup' && recopa.cupChampionName) {
-      recopa.grandChampionName = recopa.cupChampionName;
-      recopa.grandChampionMember = recopa.cupChampionMember;
-      recopa.grandChampionCrestUrl = recopa.cupChampionCrestUrl;
-      recopa.played = true;
-    } else if (typeof req.body?.grandChampionName === 'string') {
-      recopa.grandChampionName = req.body.grandChampionName.trim();
-      recopa.grandChampionMember = typeof req.body?.grandChampionMember === 'string'
-        ? req.body.grandChampionMember.trim()
-        : '';
-      recopa.played = Boolean(recopa.grandChampionName);
-    } else {
-      recopa.grandChampionSide = null;
-      recopa.grandChampionName = '';
-      recopa.grandChampionMember = '';
-      recopa.grandChampionCrestUrl = '';
-      recopa.played = false;
-    }
-
-    if (typeof req.body?.greeting === 'string') {
-      recopa.greeting = req.body.greeting.trim() || '¡Felicitaciones Campeón de la Recopa!';
-    } else if (!recopa.greeting) {
-      recopa.greeting = '¡Felicitaciones Campeón de la Recopa!';
-    }
-    if (typeof req.body?.scheduledDate === 'string') {
-      recopa.scheduledDate = req.body.scheduledDate.trim() || undefined;
-    }
-    if (typeof req.body?.scheduledTime === 'string') {
-      recopa.scheduledTime = req.body.scheduledTime.trim() || undefined;
-    }
-
-    const recopaSourceKey = `recopa_${db.cup.editionNumber}`;
-    if (recopa.played && recopa.grandChampionName) {
-      awardTeamTrophy(db, {
-        teamName: recopa.grandChampionName,
-        memberName: recopa.grandChampionMember,
-        type: 'recopa',
-        season: `Recopa · ${db.cup.editionName || `Edición #${db.cup.editionNumber}`}`,
-        sourceKey: recopaSourceKey,
-      });
-    } else {
-      removeTrophyBySourceKey(db, recopaSourceKey);
-    }
-
-    db.cup.updatedAt = new Date().toISOString();
-    saveDb(db);
-    res.json({ cup: db.cup });
-  });
+      db.cup.updatedAt = new Date().toISOString();
+      await saveDb(db);
+      res.json({ cup: db.cup });
+    })
+  );
 
   // Reset cup from scratch to start the next edition
-  app.post('/api/admin/cup/reset', requireAdmin, (req: AuthenticatedRequest, res: Response) => {
-    const db = loadDb();
-    const clearParticipants = req.body?.clearParticipants !== false;
-    const nextEdition = (db.cup?.editionNumber || 1) + 1;
-    const ranked = getRankedStandingsTeams(db.teams, db.matches);
-    const freshCup = createInitialCup(nextEdition, [], ranked[0]);
+  app.post(
+    '/api/admin/cup/reset',
+    requireAdmin,
+    asyncRoute(async (req: AuthenticatedRequest, res: Response) => {
+      const db = await loadDb({ fresh: true });
+      const clearParticipants = req.body?.clearParticipants !== false;
+      const nextEdition = (db.cup?.editionNumber || 1) + 1;
+      const ranked = getRankedStandingsTeams(db.teams, db.matches);
+      const freshCup = createInitialCup(nextEdition, [], ranked[0]);
 
-    if (!clearParticipants && db.cup?.participants?.length === 16) {
-      freshCup.participants = db.cup.participants.map((p) => ({ ...p }));
-      syncCupNodeNames(freshCup);
-    }
+      if (!clearParticipants && db.cup?.participants?.length === 16) {
+        freshCup.participants = db.cup.participants.map((p) => ({ ...p }));
+        syncCupNodeNames(freshCup);
+      }
 
-    if (typeof req.body?.editionName === 'string' && req.body.editionName.trim()) {
-      freshCup.editionName = req.body.editionName.trim();
-    }
+      if (typeof req.body?.editionName === 'string' && req.body.editionName.trim()) {
+        freshCup.editionName = req.body.editionName.trim();
+      }
 
-    db.cup = freshCup;
-    saveDb(db);
-    res.json({ cup: db.cup });
-  });
+      db.cup = freshCup;
+      await saveDb(db);
+      res.json({ cup: db.cup });
+    })
+  );
 
   // Admin: add one or multiple music tracks (upload MP3/audio files OR provide external URL)
   app.post(
     '/api/admin/music',
     requireAdmin,
     uploadMusic.array('audio', 30),
-    (req: AuthenticatedRequest, res: Response) => {
-      const db = loadDb();
+    asyncRoute(async (req: AuthenticatedRequest, res: Response) => {
+      const db = await loadDb({ fresh: true });
       const files = (req.files as Express.Multer.File[] | undefined) || [];
       const customTitle = String(req.body?.title || '').trim();
       const customArtist = String(req.body?.artist || '').trim();
@@ -5988,12 +6544,18 @@ async function startServer() {
 
       for (const file of files) {
         const rawName = path.parse(file.originalname).name.replace(/[_-]+/g, ' ').trim();
-        const coverUrl = extractAndSaveMp3Cover(file.path);
+        const coverUrl = await extractAndSaveMp3Cover(file.path);
+        const audioUrl = await persistUploadedFile(
+          file.path,
+          'music',
+          file.filename,
+          file.mimetype || inferMimeTypeFromPath(file.filename)
+        );
         const track: MusicTrack = {
           id: `trk_${Date.now()}_${crypto.randomBytes(3).toString('hex')}`,
           title: customTitle && files.length === 1 ? customTitle : rawName || 'Canción MP3',
           artist: customArtist || 'Liga Master Argentina',
-          audioUrl: `/uploads/music/${file.filename}`,
+          audioUrl,
           ...(coverUrl ? { coverUrl } : {}),
           createdAt: new Date().toISOString(),
         };
@@ -6013,22 +6575,26 @@ async function startServer() {
         addedTracks.push(track);
       }
 
-      saveDb(db);
+      await saveDb(db);
       res.status(201).json({ tracks: addedTracks, track: addedTracks[0] });
-    }
+    })
   );
 
-  app.delete('/api/admin/music/:trackId', requireAdmin, (req: AuthenticatedRequest, res: Response) => {
-    const db = loadDb();
-    const before = db.music.length;
-    db.music = db.music.filter((t) => t.id !== req.params.trackId);
-    if (db.music.length === before) {
-      res.status(404).json({ error: 'Canción no encontrada.' });
-      return;
-    }
-    saveDb(db);
-    res.json({ deleted: true });
-  });
+  app.delete(
+    '/api/admin/music/:trackId',
+    requireAdmin,
+    asyncRoute(async (req: AuthenticatedRequest, res: Response) => {
+      const db = await loadDb({ fresh: true });
+      const before = db.music.length;
+      db.music = db.music.filter((t) => t.id !== req.params.trackId);
+      if (db.music.length === before) {
+        res.status(404).json({ error: 'Canción no encontrada.' });
+        return;
+      }
+      await saveDb(db);
+      res.json({ deleted: true });
+    })
+  );
 
   // Unmatched /api routes always return JSON (never fall through to HTML 404)
   app.use('/api', (req: Request, res: Response) => {
@@ -6046,6 +6612,26 @@ async function startServer() {
       500;
     res.status(status).json({ error: err.message || 'Error procesando la solicitud en el servidor.' });
   });
+
+  return app;
+}
+
+let cachedExpressApp: express.Express | null = null;
+
+export async function getExpressApp(): Promise<express.Express> {
+  if (!cachedExpressApp) {
+    cachedExpressApp = buildApiApp();
+    // Warm up database connection and automatic seed check without blocking errors
+    await loadDb().catch((err) => {
+      console.error('Error inicializando base de datos:', err);
+    });
+  }
+  return cachedExpressApp;
+}
+
+async function startServer() {
+  const app = buildApiApp();
+  const httpServer = http.createServer(app);
 
   // Frontend serving (Vite middleware in dev, static dist in production)
   if (process.env.NODE_ENV !== 'production') {
@@ -6072,11 +6658,18 @@ async function startServer() {
   }
 
   httpServer.listen(PORT, '0.0.0.0', () => {
-    console.log(`Liga Master Argentina PES6 corriendo en http://0.0.0.0:${PORT}`);
+    console.log(
+      `Liga Master Argentina PES6 corriendo en http://0.0.0.0:${PORT} (${
+        isSupabaseDbConfigured() ? 'Supabase PostgreSQL + Storage' : 'Archivo local data/league.json'
+      })`
+    );
   });
 }
 
-startServer().catch((err) => {
-  console.error('Error iniciando servidor:', err);
-  process.exit(1);
-});
+if (!IS_VERCEL && !process.env.SKIP_SERVER_LISTEN) {
+  startServer().catch((err) => {
+    console.error('Error iniciando servidor:', err);
+    process.exit(1);
+  });
+}
+

@@ -8,7 +8,9 @@ import {
   CheckCircle2,
   Copy,
   Crown,
+  Database,
   Disc3,
+  Download,
   Edit3,
   Eye,
   Film,
@@ -40,8 +42,6 @@ import {
   Users,
   X,
 } from 'lucide-react';
-import { deleteDoc, doc } from 'firebase/firestore/lite';
-import { db, notifyCommunityVideosChanged } from '../firebase';
 import type {
   AuthUser,
   ChampionEntry,
@@ -52,9 +52,11 @@ import type {
   CupTournament,
   GalleryVideo,
   LastListenedTrack,
+  LeagueBackupRecord,
   LeagueComment,
   LeagueSettings,
   Match,
+  MemberInvite,
   ModerationStatus,
   MusicTrack,
   NewsPost,
@@ -65,8 +67,68 @@ import type {
   Team,
   TopGoalItem,
 } from '../types';
-import { apiFetch, setStoredToken } from '../utils/api';
+import {
+  addLeagueMusicFirestore,
+  addPersonalMusicFirestore,
+  addUserPersonalMusicFirestore,
+  approveCommentFirestore,
+  buildLiveLeagueSnapshot,
+  createChampionFirestore,
+  createFirestoreBackup,
+  createFixtureFirestore,
+  createNewsFirestore,
+  createTeamFirestore,
+  deleteChampionFirestore,
+  deleteClaimFirestore,
+  deleteCommentFirestore,
+  deleteCommunityVideoFirestore,
+  deleteFixtureFirestore,
+  deleteLeagueMusicFirestore,
+  deleteMatchFirestore,
+  deleteMyCelebrationFirestore,
+  deleteNewsFirestore,
+  deleteOfficialVideoFirestore,
+  deletePersonalMusicFirestore,
+  deleteTeamFirestore,
+  deleteTopGoalFirestore,
+  deleteUserPersonalMusicFirestore,
+  listFirestoreBackups,
+  moderateMediaFirestore,
+  resolveClaimFirestore,
+  restoreFirestoreBackup,
+  restoreSnapshotPayloadFirestore,
+  reviewMatchFirestore,
+  saveAdminOwnTeamFirestore,
+  saveFeaturedVideoFirestore,
+  saveRulesFirestore,
+  saveSettingsFirestore,
+  saveUserMusicModeFirestore,
+  toggleFeaturedOfficialVideoFirestore,
+  updateChampionFirestore,
+  updateCupEditionNameFirestore,
+  updateMyBioFirestore,
+  updateMyCelebrationFirestore,
+  updateNewsFirestore,
+  updateOfficialVideoFirestore,
+  updateTeamFirestore,
+  updateTeamStatusFirestore,
+  updateTrophyMessageFirestore,
+  upsertTopGoalFirestore,
+} from '../services/firestoreLeague';
+import {
+  COPA_TROPHY_IMG,
+  LIGA_TROPHY_IMG,
+  RECOPA_TROPHY_IMG,
+} from '../services/cupHelpers';
+import { apiFetch, setStoredToken, uploadMediaFile } from '../utils/api';
 import { resolveAssetUrl } from '../utils/assetUrl';
+import {
+  CUSTOM_TITLE_GROUPS,
+  DEFAULT_CUSTOM_TITLES,
+  buildDraftCustomTitles,
+  sanitizeCustomTitles,
+  type CustomTitleKey,
+} from '../utils/customTitles';
 import {
   deletePersonalLocalTrack,
   loadPersonalLocalTracks,
@@ -113,6 +175,9 @@ interface ProfileViewProps {
   comments?: LeagueComment[];
   likedTeams?: Record<string, boolean>;
   credentialAuditLog?: CredentialAuditEntry[];
+  memberInvites?: MemberInvite[];
+  userPersonalMusic?: MusicTrack[];
+  backupGmail?: string;
   initialAdminTab?: AdminSection;
   onOpenAuth: () => void;
   onLogout: () => void;
@@ -134,15 +199,7 @@ const DEFAULT_CUP_RULES: CupRulesSettings = {
 
 function getTeamLastListened(team?: PublicTeam): LastListenedTrack | undefined {
   if (!team) return undefined;
-  if (team.lastListenedTrack?.title) return team.lastListenedTrack;
-  try {
-    const raw = localStorage.getItem(`lma_last_song_${team.id}`);
-    if (!raw) return undefined;
-    const parsed = JSON.parse(raw) as LastListenedTrack;
-    return parsed?.title ? parsed : undefined;
-  } catch {
-    return undefined;
-  }
+  return team.lastListenedTrack?.title ? team.lastListenedTrack : undefined;
 }
 
 export function ProfileView({
@@ -165,6 +222,9 @@ export function ProfileView({
   comments = [],
   likedTeams = {},
   credentialAuditLog = [],
+  memberInvites = [],
+  userPersonalMusic = [],
+  backupGmail: backupGmailProp = '',
   initialAdminTab,
   onOpenAuth,
   onLogout,
@@ -176,6 +236,9 @@ export function ProfileView({
   const [adminTab, setAdminTab] = useState<AdminSection>(initialAdminTab || 'equipos');
   const [participantsSearch, setParticipantsSearch] = useState('');
   const [likingTeamId, setLikingTeamId] = useState<string | null>(null);
+  const [quickLikeError, setQuickLikeError] = useState<string | null>(null);
+  const effectiveMaxTeams =
+    Number(settings.maxTeams) > 50 ? Math.min(500, Number(settings.maxTeams)) : 100;
   const [teamStatusFilter, setTeamStatusFilter] = useState<'all' | 'active' | 'blocked'>('all');
   const [oneTimeCredentialBanner, setOneTimeCredentialBanner] = useState<{
     title: string;
@@ -201,6 +264,7 @@ export function ProfileView({
   const newsImageInputRef = useRef<HTMLInputElement | null>(null);
   const newsVideoInputRef = useRef<HTMLInputElement | null>(null);
   const [savingNews, setSavingNews] = useState(false);
+  const [deletingNewsId, setDeletingNewsId] = useState<string | null>(null);
   const [newsMsg, setNewsMsg] = useState<{ type: 'ok' | 'err'; text: string } | null>(null);
 
   // Admin: Comentarios moderation state
@@ -232,6 +296,10 @@ export function ProfileView({
   useEffect(() => {
     let active = true;
     const refreshLocal = async () => {
+      if (user?.firebaseAuthenticated) {
+        if (active) setLocalPersonalSongs([]);
+        return;
+      }
       const list = await loadPersonalLocalTracks(personalOwnerKey);
       if (active) setLocalPersonalSongs(list);
     };
@@ -244,7 +312,7 @@ export function ProfileView({
       active = false;
       window.removeEventListener('lma:personal-music-changed', onChanged);
     };
-  }, [personalOwnerKey]);
+  }, [personalOwnerKey, user?.firebaseAuthenticated]);
 
   useEffect(() => {
     if (initialAdminTab) {
@@ -327,6 +395,7 @@ export function ProfileView({
   const [newTeamClave, setNewTeamClave] = useState('');
   const [newTeamName, setNewTeamName] = useState('');
   const [newMemberName, setNewMemberName] = useState('');
+  const [newMemberEmail, setNewMemberEmail] = useState('');
   const [newTeamBio, setNewTeamBio] = useState('');
   const [newCrestFile, setNewCrestFile] = useState<File | null>(null);
   const [newCrestPreview, setNewCrestPreview] = useState<string | null>(null);
@@ -342,6 +411,7 @@ export function ProfileView({
   const [editClave, setEditClave] = useState('');
   const [editName, setEditName] = useState('');
   const [editMember, setEditMember] = useState('');
+  const [editMemberEmail, setEditMemberEmail] = useState('');
   const [editBio, setEditBio] = useState('');
   const [editCrestFile, setEditCrestFile] = useState<File | null>(null);
   const [editCrestPreview, setEditCrestPreview] = useState<string | null>(null);
@@ -435,7 +505,7 @@ export function ProfileView({
   const [adminConfirmPassword, setAdminConfirmPassword] = useState('');
   const [savingAdminCredentials, setSavingAdminCredentials] = useState(false);
   const [adminCredMsg, setAdminCredMsg] = useState<{ type: 'ok' | 'err'; text: string } | null>(null);
-  const [backupGmail, setBackupGmail] = useState(settings.backupGmail || '');
+  const [backupGmail, setBackupGmail] = useState(backupGmailProp || settings.backupGmail || '');
   const [radioName, setRadioName] = useState(
     settings.radioName || 'FM 101.5 Pop Radio (Bs. As.)'
   );
@@ -444,10 +514,66 @@ export function ProfileView({
   );
   const [adminTeamId, setAdminTeamId] = useState(settings.adminTeamId || '');
   const [siteCrestFile, setSiteCrestFile] = useState<File | null>(null);
+  const [siteCrestUrlInput, setSiteCrestUrlInput] = useState(settings.crestUrl || '');
+  const [siteCrestPreview, setSiteCrestPreview] = useState<string>('');
+  const [applyingCrest, setApplyingCrest] = useState(false);
   const [siteFaviconFile, setSiteFaviconFile] = useState<File | null>(null);
   const [siteCoverFile, setSiteCoverFile] = useState<File | null>(null);
   const [siteBackgroundFile, setSiteBackgroundFile] = useState<File | null>(null);
+  const [maxTeamsInput, setMaxTeamsInput] = useState<string>(() =>
+    String(Number(settings.maxTeams) > 50 ? Math.min(500, Number(settings.maxTeams)) : 100)
+  );
+  const [ligaTrophyFile, setLigaTrophyFile] = useState<File | null>(null);
+  const [ligaTrophyUrlInput, setLigaTrophyUrlInput] = useState(settings.ligaTrophyUrl || '');
+  const [copaTrophyFile, setCopaTrophyFile] = useState<File | null>(null);
+  const [copaTrophyUrlInput, setCopaTrophyUrlInput] = useState(settings.copaTrophyUrl || '');
+  const [recopaTrophyFile, setRecopaTrophyFile] = useState<File | null>(null);
+  const [recopaTrophyUrlInput, setRecopaTrophyUrlInput] = useState(settings.recopaTrophyUrl || '');
+  const [customTitlesDraft, setCustomTitlesDraft] = useState<Record<CustomTitleKey, string>>(() =>
+    buildDraftCustomTitles(settings)
+  );
+  const [cupEditionNameDraft, setCupEditionNameDraft] = useState(cup.editionName || '');
   const [siteMsg, setSiteMsg] = useState<{ type: 'ok' | 'err'; text: string } | null>(null);
+
+  // Admin: Cloud Firestore Backups & Recovery state
+  const [backupsList, setBackupsList] = useState<LeagueBackupRecord[]>([]);
+  const [loadingBackups, setLoadingBackups] = useState(false);
+  const [backupLabelInput, setBackupLabelInput] = useState('');
+  const [creatingBackup, setCreatingBackup] = useState(false);
+  const [restoringBackupId, setRestoringBackupId] = useState<string | null>(null);
+  const [confirmRestoreId, setConfirmRestoreId] = useState<string | null>(null);
+  const [backupMsg, setBackupMsg] = useState<{ type: 'ok' | 'err'; text: string } | null>(null);
+  const backupImportInputRef = useRef<HTMLInputElement | null>(null);
+
+  const loadBackupsList = async () => {
+    setLoadingBackups(true);
+    try {
+      const list = await listFirestoreBackups();
+      setBackupsList(list);
+    } catch {
+      // Ignore if non-admin or not yet verified
+    } finally {
+      setLoadingBackups(false);
+    }
+  };
+
+  useEffect(() => {
+    if (user?.role === 'admin' && user?.firebaseAuthenticated && adminTab === 'general') {
+      void loadBackupsList();
+    }
+  }, [user?.role, user?.firebaseAuthenticated, adminTab]);
+
+  useEffect(() => {
+    if (!siteCrestFile) {
+      setSiteCrestPreview('');
+      return;
+    }
+    const objectUrl = URL.createObjectURL(siteCrestFile);
+    setSiteCrestPreview(objectUrl);
+    return () => {
+      URL.revokeObjectURL(objectUrl);
+    };
+  }, [siteCrestFile]);
 
   useEffect(() => {
     setSiteTitle(settings.title);
@@ -455,13 +581,25 @@ export function ProfileView({
     setSiteDescription(settings.description || '');
     setSiteBanner(settings.bannerText);
     setAdminLoginId(settings.adminId);
-    setBackupGmail(settings.backupGmail || '');
+    setBackupGmail(backupGmailProp || settings.backupGmail || '');
     setRadioName(settings.radioName || 'FM 101.5 Pop Radio (Bs. As.)');
     setRadioStreamUrl(
       settings.radioStreamUrl || 'https://popradio.stweb.tv/popradio/live/playlist.m3u8'
     );
     setAdminTeamId(settings.adminTeamId || '');
-  }, [settings]);
+    setSiteCrestUrlInput(settings.crestUrl || '');
+    setMaxTeamsInput(
+      String(Number(settings.maxTeams) > 50 ? Math.min(500, Number(settings.maxTeams)) : 100)
+    );
+    setLigaTrophyUrlInput(settings.ligaTrophyUrl || '');
+    setCopaTrophyUrlInput(settings.copaTrophyUrl || '');
+    setRecopaTrophyUrlInput(settings.recopaTrophyUrl || '');
+    setCustomTitlesDraft(buildDraftCustomTitles(settings));
+  }, [settings, backupGmailProp]);
+
+  useEffect(() => {
+    setCupEditionNameDraft(cup.editionName || '');
+  }, [cup.editionName]);
 
   const myHistoryMatches = useMemo(() => {
     if (!myTeam) return [];
@@ -664,10 +802,15 @@ export function ProfileView({
   });
 
   const handleQuickLikeTeam = async (teamId: string) => {
-    if (!onLikeTeam || likingTeamId) return;
+    if (!onLikeTeam || likingTeamId || likedTeams[teamId]) return;
     setLikingTeamId(teamId);
+    setQuickLikeError(null);
     try {
       await onLikeTeam(teamId);
+    } catch (err) {
+      setQuickLikeError(
+        err instanceof Error ? err.message : 'No se pudo registrar tu Me Gusta.'
+      );
     } finally {
       setLikingTeamId(null);
     }
@@ -696,6 +839,12 @@ export function ProfileView({
           />
         </div>
       </div>
+
+      {quickLikeError && (
+        <div className="p-3 text-xs rounded-xl bg-rose-950/70 border border-rose-400/50 text-rose-200">
+          {quickLikeError}
+        </div>
+      )}
 
       {filteredParticipants.length === 0 ? (
         <div className="py-8 text-center text-xs text-sky-200/70">
@@ -794,14 +943,19 @@ export function ProfileView({
                   {onLikeTeam && (
                     <button
                       type="button"
-                      disabled={likingTeamId === team.id}
+                      disabled={likingTeamId === team.id || hasLiked}
                       onClick={() => handleQuickLikeTeam(team.id)}
+                      aria-pressed={hasLiked}
                       className={`inline-flex items-center justify-center gap-1.5 px-3 py-1.5 text-xs font-semibold rounded-lg border transition-colors ${
                         hasLiked
-                          ? 'bg-rose-500/25 border-rose-400/70 text-rose-200'
-                          : 'bg-rose-500/10 hover:bg-rose-500/20 border-rose-400/40 text-rose-200'
+                          ? 'bg-rose-500/25 border-rose-400/70 text-rose-200 cursor-not-allowed'
+                          : 'bg-rose-500/10 hover:bg-rose-500/20 border-rose-400/40 text-rose-200 disabled:opacity-60'
                       }`}
-                      title="Dejar Me Gusta"
+                      title={
+                        hasLiked
+                          ? 'Ya dejaste tu corazón (1 por miembro)'
+                          : 'Dejar Me Gusta (1 corazón por miembro)'
+                      }
                     >
                       <Heart className={`w-3.5 h-3.5 ${hasLiked ? 'fill-rose-500 text-rose-400' : ''}`} />
                       <span className="font-mono tabular-nums">{team.likes ?? 0}</span>
@@ -846,13 +1000,15 @@ export function ProfileView({
 
   const handleSaveBio = async (e: FormEvent) => {
     e.preventDefault();
-    await apiFetch('/api/profile', {
-      method: 'PATCH',
-      body: JSON.stringify({ bio }),
-    });
-    setBioSaved(true);
-    await onRefresh();
-    window.setTimeout(() => setBioSaved(false), 2500);
+    if (!myTeam) return;
+    try {
+      await updateMyBioFirestore(myTeam.id, bio);
+      setBioSaved(true);
+      await onRefresh();
+      window.setTimeout(() => setBioSaved(false), 2500);
+    } catch {
+      // Save error toast already surfaced by runConfirmedWrite
+    }
   };
 
   const handleSaveAdminMyTeam = async (e: FormEvent) => {
@@ -860,21 +1016,24 @@ export function ProfileView({
     setAdminMyTeamMsg(null);
     setSavingAdminMyTeam(true);
     try {
-      const form = new FormData();
-      form.append('name', adminTeamName.trim());
-      form.append('memberName', adminMemberName.trim());
-      form.append('bio', adminTeamBio.trim());
+      let crestUrl = myTeam?.crestUrl;
       if (adminCrestFile) {
-        form.append('crest', adminCrestFile);
+        crestUrl = await uploadMediaFile('crests', adminCrestFile);
       }
-      await apiFetch('/api/admin/my-team', { method: 'PUT', body: form });
+      await saveAdminOwnTeamFirestore({
+        existingTeamId: settings.adminTeamId || myTeam?.id,
+        name: adminTeamName.trim(),
+        memberName: adminMemberName.trim(),
+        bio: adminTeamBio.trim(),
+        crestUrl,
+      });
       setAdminCrestFile(null);
       if (adminCrestInputRef.current) adminCrestInputRef.current.value = '';
       setEditingMyAdminTeam(false);
       await onRefresh();
       setAdminMyTeamMsg({
         type: 'ok',
-        text: 'Tu escudo, equipo y nombre quedaron guardados y publicados en la Tabla de Posiciones.',
+        text: 'Tu escudo, equipo y nombre quedaron guardados en Cloud Firestore y publicados en la Tabla de Posiciones.',
       });
       window.setTimeout(() => setAdminMyTeamMsg(null), 4000);
     } catch (err) {
@@ -888,7 +1047,7 @@ export function ProfileView({
   };
 
   const handleCopyCredentials = async (id: string, password: string) => {
-    const text = `ID de usuario: ${id} | Contraseña: ${password}`;
+    const text = `ID de usuario: ${id} | Info: ${password}`;
     try {
       await navigator.clipboard.writeText(text);
       setCopiedCredentialId(id);
@@ -903,44 +1062,51 @@ export function ProfileView({
     setTeamMsg(null);
     setSavingTeam(true);
     try {
-      const manualPassword = newTeamClave.trim();
-      const form = new FormData();
-      form.append('id', newTeamId.trim());
-      form.append('clave', manualPassword);
-      form.append('name', newTeamName.trim());
-      form.append('memberName', newMemberName.trim());
-      form.append('bio', newTeamBio.trim());
-      if (newCrestFile) {
-        form.append('crest', newCrestFile);
+      const existingIds = new Set(adminTeams.map((t) => t.id.toUpperCase()));
+      let resolvedId = newTeamId.trim().toUpperCase();
+      if (!resolvedId) {
+        let nextNum = adminTeams.length + 1;
+        resolvedId = `LMA${String(nextNum).padStart(2, '0')}`;
+        while (existingIds.has(resolvedId)) {
+          nextNum += 1;
+          resolvedId = `LMA${String(nextNum).padStart(2, '0')}`;
+        }
       }
-      const data = await apiFetch<{ team: Team; generatedClave?: string }>('/api/admin/teams', {
-        method: 'POST',
-        body: form,
+      let crestUrl: string | undefined;
+      if (newCrestFile) {
+        crestUrl = await uploadMediaFile('crests', newCrestFile);
+      }
+      const created = await createTeamFirestore({
+        id: resolvedId,
+        name: newTeamName.trim() || newMemberName.trim(),
+        memberName: newMemberName.trim(),
+        crestUrl,
+        bio: newTeamBio.trim(),
+        linkedEmail: newMemberEmail.trim() || undefined,
       });
-      const assignedPassword = data?.generatedClave || manualPassword;
+
+      const invitedEmail = newMemberEmail.trim().toLowerCase();
       setNewTeamId('');
       setNewTeamClave('');
       setNewTeamName('');
       setNewMemberName('');
+      setNewMemberEmail('');
       setNewTeamBio('');
       setNewCrestFile(null);
       if (newCrestInputRef.current) newCrestInputRef.current.value = '';
       await onRefresh();
-      const created = data?.team;
-      if (created && assignedPassword) {
+      if (invitedEmail) {
         setOneTimeCredentialBanner({
-          title: 'Participante creado · Credenciales iniciales listas para entregar',
+          title: 'Participante creado en Cloud Firestore · Acceso Google Autorizado',
           id: created.id,
           memberName: created.memberName,
           teamName: created.name,
-          password: assignedPassword,
+          password: `Google Auth: ${invitedEmail}`,
         });
       }
       setTeamMsg({
         type: 'ok',
-        text: created
-          ? `Participante "${created.memberName}" (${created.name} · ID: ${created.id}) creado con contraseña cifrada y publicado en la Tabla de Posiciones.`
-          : 'Participante y equipo creados y publicados en la Tabla de Posiciones.',
+        text: `Participante "${created.memberName}" (${created.name} · ID: ${created.id}) guardado permanentemente en Cloud Firestore y publicado en la Tabla de Posiciones.`,
       });
     } catch (err) {
       setTeamMsg({
@@ -957,11 +1123,13 @@ export function ProfileView({
       setEditingTeam(null);
       return;
     }
+    const existingInvite = memberInvites.find((inv) => inv.teamId === team.id);
     setEditingTeam(team);
     setEditId(team.id);
     setEditClave('');
     setEditName(team.name);
     setEditMember(team.memberName);
+    setEditMemberEmail(existingInvite?.email || '');
     setEditBio(team.bio || '');
     setEditCrestFile(null);
   };
@@ -972,43 +1140,28 @@ export function ProfileView({
     setTeamMsg(null);
     setSavingEditTeam(true);
     try {
-      const nextNewPass = editClave.trim();
-      const form = new FormData();
-      form.append('id', editId.trim().toUpperCase());
-      if (nextNewPass) {
-        form.append('clave', nextNewPass);
-      }
-      form.append('name', editName.trim());
-      form.append('memberName', editMember.trim());
-      form.append('bio', editBio);
+      let crestUrl = editingTeam.crestUrl;
       if (editCrestFile) {
-        form.append('crest', editCrestFile);
+        crestUrl = await uploadMediaFile('crests', editCrestFile);
       }
-      const res = await apiFetch<{ team: Team }>(
-        `/api/admin/teams/${encodeURIComponent(editingTeam.id)}`,
-        {
-          method: 'PUT',
-          body: form,
-        }
-      );
-      const updated = res?.team;
+      const cleanInvite = editMemberEmail.trim().toLowerCase();
+      await updateTeamFirestore(editingTeam.id, {
+        name: editName.trim(),
+        memberName: editMember.trim(),
+        bio: editBio,
+        crestUrl,
+        linkedEmail: cleanInvite || undefined,
+      });
+      const editedTeamId = editingTeam.id;
       setEditingTeam(null);
       setEditClave('');
+      setEditMemberEmail('');
       await onRefresh();
-      if (nextNewPass) {
-        setOneTimeCredentialBanner({
-          title: 'Contraseña actualizada · Copiala para entregarla al participante',
-          id: updated?.id || editId.trim().toUpperCase(),
-          memberName: updated?.memberName || editMember.trim(),
-          teamName: updated?.name || editName.trim(),
-          password: nextNewPass,
-        });
-      }
       setTeamMsg({
         type: 'ok',
-        text: nextNewPass
-          ? `Datos, ID (${editId.trim().toUpperCase()}) y nueva contraseña cifrada guardados para ${editMember.trim()}.`
-          : `Datos e ID (${editId.trim().toUpperCase()}) actualizados para ${editMember.trim()} (se mantuvo la contraseña actual).`,
+        text: cleanInvite
+          ? `Datos actualizados en Cloud Firestore para ${editMember.trim()} (${editedTeamId}) y correo Google autorizado: ${cleanInvite}.`
+          : `Datos actualizados en Cloud Firestore para ${editMember.trim()} (${editedTeamId}).`,
       });
     } catch (err) {
       setTeamMsg({
@@ -1025,16 +1178,13 @@ export function ProfileView({
     setStatusBusyTeamId(team.id);
     try {
       const nextStatus = team.accountStatus === 'blocked' ? 'active' : 'blocked';
-      await apiFetch(`/api/admin/teams/${encodeURIComponent(team.id)}/status`, {
-        method: 'PATCH',
-        body: JSON.stringify({ status: nextStatus }),
-      });
+      await updateTeamStatusFirestore(team.id, nextStatus);
       await onRefresh();
       setTeamMsg({
         type: 'ok',
         text:
           nextStatus === 'blocked'
-            ? `Cuenta ${team.id} (${team.memberName}) bloqueada. Sus sesiones activas fueron cerradas.`
+            ? `Cuenta ${team.id} (${team.memberName}) bloqueada en Cloud Firestore.`
             : `Cuenta ${team.id} (${team.memberName}) activada nuevamente.`,
       });
     } catch (err) {
@@ -1048,34 +1198,12 @@ export function ProfileView({
   };
 
   const handleResetParticipantPassword = async (team: Team) => {
-    setTeamMsg(null);
     setResetBusyTeamId(team.id);
     try {
-      const res = await apiFetch<{ team: Team; resetPassword: string }>(
-        `/api/admin/teams/${encodeURIComponent(team.id)}/reset-password`,
-        {
-          method: 'POST',
-          body: JSON.stringify({ generate: true }),
-        }
-      );
-      await onRefresh();
-      if (res?.resetPassword) {
-        setOneTimeCredentialBanner({
-          title: 'Credenciales restablecidas · Nueva contraseña temporal lista',
-          id: team.id,
-          memberName: team.memberName,
-          teamName: team.name,
-          password: res.resetPassword,
-        });
-      }
+      startEditTeam(team);
       setTeamMsg({
         type: 'ok',
-        text: `Contraseña restablecida para ${team.memberName} (${team.id}). Copiá la nueva contraseña del aviso superior para entregársela.`,
-      });
-    } catch (err) {
-      setTeamMsg({
-        type: 'err',
-        text: err instanceof Error ? err.message : 'No se pudo restablecer la contraseña.',
+        text: `Editando ${team.memberName} (${team.id}): asigná o actualizá su correo de Google en el panel abierto abajo para vincular su acceso seguro por Firebase Auth.`,
       });
     } finally {
       setResetBusyTeamId(null);
@@ -1085,13 +1213,13 @@ export function ProfileView({
   const handleDeleteTeam = async (id: string) => {
     setTeamMsg(null);
     try {
-      await apiFetch(`/api/admin/teams/${encodeURIComponent(id)}`, { method: 'DELETE' });
+      await deleteTeamFirestore(id);
       setConfirmDeleteTeamId(null);
       if (editingTeam?.id === id) setEditingTeam(null);
       await onRefresh();
       setTeamMsg({
         type: 'ok',
-        text: `Cuenta ${id} eliminada permanentemente.`,
+        text: `Cuenta ${id} eliminada permanentemente de Cloud Firestore.`,
       });
     } catch (err) {
       setTeamMsg({
@@ -1102,62 +1230,90 @@ export function ProfileView({
   };
 
   const handleSetAdminTeam = async (id: string) => {
-    const form = new FormData();
-    form.append('adminTeamId', id);
-    await apiFetch('/api/admin/settings', { method: 'PUT', body: form });
-    setAdminTeamId(id);
-    await onRefresh();
-    setTeamMsg({
-      type: 'ok',
-      text: `El equipo ${id} ahora es el equipo oficial del Administrador en la liga.`,
-    });
+    setTeamMsg(null);
+    try {
+      await saveSettingsFirestore({ adminTeamId: id });
+      setAdminTeamId(id);
+      await onRefresh();
+      setTeamMsg({
+        type: 'ok',
+        text: `El equipo ${id} ahora es el equipo oficial del Administrador en la liga.`,
+      });
+    } catch (err) {
+      setTeamMsg({
+        type: 'err',
+        text: err instanceof Error ? err.message : 'No se pudo asignar el equipo del Administrador.',
+      });
+    }
   };
 
   const handleValidateMatch = async (matchId: string, status: 'validated' | 'rejected' | 'pending') => {
-    await apiFetch(`/api/admin/matches/${matchId}`, {
-      method: 'PATCH',
-      body: JSON.stringify({ status }),
-    });
-    await onRefresh();
-    setValidationMsg(
-      status === 'validated'
-        ? 'Resultado validado y publicado oficialmente en Partidos y Tabla de Posiciones.'
-        : status === 'rejected'
-        ? 'Resultado marcado como rechazado.'
-        : 'Resultado pasado nuevamente a Pendiente.'
-    );
-    window.setTimeout(() => setValidationMsg(null), 3500);
+    try {
+      await reviewMatchFirestore(matchId, {
+        status,
+        cup,
+        teams,
+        allMatches: matches,
+      });
+      await onRefresh();
+      setValidationMsg(
+        status === 'validated'
+          ? 'Resultado validado y publicado oficialmente en Partidos y Tabla de Posiciones.'
+          : status === 'rejected'
+          ? 'Resultado marcado como rechazado.'
+          : 'Resultado pasado nuevamente a Pendiente.'
+      );
+      window.setTimeout(() => setValidationMsg(null), 3500);
+    } catch (err) {
+      setValidationMsg(
+        err instanceof Error ? err.message : 'No se pudo actualizar el estado del partido.'
+      );
+      window.setTimeout(() => setValidationMsg(null), 4000);
+    }
   };
 
   const handleSaveMatchScore = async (matchId: string, alsoValidate = false) => {
-    const payload: Record<string, unknown> = {
-      homeGoals: Number(editHomeGoals),
-      awayGoals: Number(editAwayGoals),
-      matchday: Number(editMatchday) || 1,
-      leg: editLeg,
-      playedAt: editPlayedAt.trim(),
-      notes: editMatchNotes.trim(),
-    };
-    if (alsoValidate) payload.status = 'validated';
-    await apiFetch(`/api/admin/matches/${matchId}`, {
-      method: 'PATCH',
-      body: JSON.stringify(payload),
-    });
-    setEditingMatchId(null);
-    await onRefresh();
-    setValidationMsg(
-      alsoValidate
-        ? 'Partido actualizado, validado y sumado a la Tabla de Posiciones.'
-        : 'Datos y marcador del partido actualizados correctamente.'
-    );
-    window.setTimeout(() => setValidationMsg(null), 3500);
+    try {
+      await reviewMatchFirestore(matchId, {
+        homeGoals: Number(editHomeGoals),
+        awayGoals: Number(editAwayGoals),
+        matchday: Number(editMatchday) || 1,
+        leg: editLeg,
+        playedAt: editPlayedAt.trim(),
+        notes: editMatchNotes.trim(),
+        ...(alsoValidate ? { status: 'validated' as const } : {}),
+        cup,
+        teams,
+        allMatches: matches,
+      });
+      setEditingMatchId(null);
+      await onRefresh();
+      setValidationMsg(
+        alsoValidate
+          ? 'Partido actualizado, validado y sumado a la Tabla de Posiciones.'
+          : 'Datos y marcador del partido actualizados correctamente.'
+      );
+      window.setTimeout(() => setValidationMsg(null), 3500);
+    } catch (err) {
+      setValidationMsg(
+        err instanceof Error ? err.message : 'No se pudo guardar el marcador del partido.'
+      );
+      window.setTimeout(() => setValidationMsg(null), 4000);
+    }
   };
 
   const handleDeleteMatch = async (matchId: string) => {
-    await apiFetch(`/api/admin/matches/${matchId}`, { method: 'DELETE' });
-    await onRefresh();
-    setValidationMsg('Partido eliminado.');
-    window.setTimeout(() => setValidationMsg(null), 3000);
+    try {
+      await deleteMatchFirestore(matchId);
+      await onRefresh();
+      setValidationMsg('Partido eliminado.');
+      window.setTimeout(() => setValidationMsg(null), 3000);
+    } catch (err) {
+      setValidationMsg(
+        err instanceof Error ? err.message : 'No se pudo eliminar el partido.'
+      );
+      window.setTimeout(() => setValidationMsg(null), 4000);
+    }
   };
 
   const handleSuggestIdClave = () => {
@@ -1175,18 +1331,20 @@ export function ProfileView({
 
   const handleSaveRules = async (e: FormEvent) => {
     e.preventDefault();
-    await apiFetch('/api/admin/rules', {
-      method: 'PUT',
-      body: JSON.stringify({
+    try {
+      await saveRulesFirestore({
         prohibitedRules: rulesList,
         generalNotes,
         gameMode,
         cupRules,
-      }),
-    });
-    await onRefresh();
-    setRulesMsg('Reglamento, Copa y Modo de Juego actualizados.');
-    window.setTimeout(() => setRulesMsg(null), 3000);
+      });
+      await onRefresh();
+      setRulesMsg('Reglamento, Copa y Modo de Juego actualizados en Cloud Firestore.');
+      window.setTimeout(() => setRulesMsg(null), 3000);
+    } catch (err) {
+      setRulesMsg(err instanceof Error ? err.message : 'No se pudo guardar el reglamento.');
+      window.setTimeout(() => setRulesMsg(null), 4000);
+    }
   };
 
   const handleAddMusic = async (e: FormEvent) => {
@@ -1194,18 +1352,27 @@ export function ProfileView({
     setMusicMsg(null);
     setUploadingMusic(true);
     try {
-      const form = new FormData();
-      if (trackFiles && trackFiles.length > 0) {
-        for (const file of Array.from(trackFiles)) {
-          form.append('audio', file);
-        }
+      const filesArr = trackFiles ? Array.from(trackFiles) : [];
+      for (const file of filesArr) {
+        const audioUrl = await uploadMediaFile('music', file);
+        const cleanTitle = file.name.replace(/\.[^/.]+$/, '').replace(/[_-]+/g, ' ').trim();
+        await addLeagueMusicFirestore({
+          title: cleanTitle || 'Tema Oficial',
+          artist: 'Liga Master Argentina',
+          audioUrl,
+        });
       }
-      if (trackUrl.trim()) form.append('audioUrl', trackUrl.trim());
-      await apiFetch('/api/admin/music', { method: 'POST', body: form });
+      if (trackUrl.trim()) {
+        await addLeagueMusicFirestore({
+          title: trackUrl.trim().split('/').pop()?.replace(/\.[^/.]+$/, '') || 'Tema Oficial',
+          artist: 'Liga Master Argentina',
+          audioUrl: trackUrl.trim(),
+        });
+      }
       setTrackUrl('');
       setTrackFiles(null);
       await onRefresh();
-      setMusicMsg('Canciones agregadas a la lista oficial del sitio.');
+      setMusicMsg('Canciones agregadas a la lista oficial del sitio en Cloud Firestore.');
     } catch (err) {
       setMusicMsg(err instanceof Error ? err.message : 'No se pudieron subir las canciones.');
     } finally {
@@ -1214,29 +1381,28 @@ export function ProfileView({
   };
 
   const handleDeleteMusic = async (id: string) => {
-    await apiFetch(`/api/admin/music/${id}`, { method: 'DELETE' });
+    await deleteLeagueMusicFirestore(id);
     await onRefresh();
   };
 
   const handleFeatureVideo = async (id: string) => {
-    await apiFetch(`/api/admin/videos/${id}/featured`, { method: 'PATCH' });
+    const target = videos.find((v) => v.id === id);
+    if (!target) return;
+    await toggleFeaturedOfficialVideoFirestore(target, videos);
     await onRefresh();
     setVideoMsg('Video destacado actualizado en la página de Inicio.');
     window.setTimeout(() => setVideoMsg(null), 3000);
   };
 
   const handleFeatureCommunityVideo = async (cv: CommunityVideo) => {
-    await apiFetch('/api/admin/featured-video', {
-      method: 'PUT',
-      body: JSON.stringify({
-        id: cv.id,
-        source: 'community',
-        title: cv.titulo,
-        author: cv.autor,
-        videoUrl: cv.videoUrl,
-        downloadUrl: cv.videoUrl,
-        fechaLabel: cv.fechaLabel,
-      }),
+    await saveFeaturedVideoFirestore({
+      id: cv.id,
+      source: 'community',
+      title: cv.titulo,
+      author: cv.autor,
+      videoUrl: cv.videoUrl,
+      downloadUrl: cv.videoUrl,
+      fechaLabel: cv.fechaLabel,
     });
     await onRefresh();
     setVideoMsg(`"${cv.titulo}" elegido como video destacado en la página de Inicio.`);
@@ -1244,24 +1410,17 @@ export function ProfileView({
   };
 
   const handleDeleteCommunityVideo = async (id: string) => {
-    await deleteDoc(doc(db, 'videos_comunidad', id));
-    notifyCommunityVideosChanged();
-    if (settings.featuredVideo?.id === id) {
-      await apiFetch('/api/admin/featured-video', { method: 'DELETE' }).catch(() => undefined);
-      await onRefresh();
-    }
+    await deleteCommunityVideoFirestore(id, settings.featuredVideo?.id);
+    await onRefresh();
     setVideoMsg('Video de la comunidad eliminado.');
     window.setTimeout(() => setVideoMsg(null), 3000);
   };
 
   const handleSaveVideoMeta = async (id: string) => {
     if (!editVideoTitle.trim()) return;
-    await apiFetch(`/api/admin/videos/${id}`, {
-      method: 'PATCH',
-      body: JSON.stringify({
-        title: editVideoTitle.trim(),
-        description: editVideoDesc.trim(),
-      }),
+    await updateOfficialVideoFirestore(id, {
+      title: editVideoTitle.trim(),
+      description: editVideoDesc.trim(),
     });
     setEditingVideoId(null);
     await onRefresh();
@@ -1270,7 +1429,7 @@ export function ProfileView({
   };
 
   const handleDeleteVideo = async (id: string) => {
-    await apiFetch(`/api/admin/videos/${id}`, { method: 'DELETE' });
+    await deleteOfficialVideoFirestore(id);
     await onRefresh();
   };
 
@@ -1283,14 +1442,15 @@ export function ProfileView({
     setChampMsg(null);
     setSavingChamp(true);
     try {
-      const form = new FormData();
-      form.append('tournamentType', newChampType);
-      form.append('season', newChampSeason.trim());
-      form.append('teamName', newChampTeam.trim());
-      form.append('memberName', newChampMember.trim());
-      form.append('notes', newChampNotes.trim());
-      form.append('celebrationImage', newChampFile);
-      await apiFetch('/api/champions', { method: 'POST', body: form });
+      const celebrationImageUrl = await uploadMediaFile('champions', newChampFile);
+      await createChampionFirestore({
+        tournamentType: newChampType,
+        season: newChampSeason.trim(),
+        teamName: newChampTeam.trim(),
+        memberName: newChampMember.trim(),
+        notes: newChampNotes.trim(),
+        celebrationImageUrl,
+      });
       setNewChampTeam('');
       setNewChampMember('');
       setNewChampNotes('');
@@ -1314,18 +1474,17 @@ export function ProfileView({
     setChampMsg(null);
     setSavingEditChamp(true);
     try {
-      const form = new FormData();
-      form.append('tournamentType', editChampType);
-      form.append('season', editChampSeason.trim());
-      form.append('teamName', editChampTeam.trim());
-      form.append('memberName', editChampMember.trim());
-      form.append('notes', editChampNotes.trim());
+      let celebrationImageUrl: string | undefined;
       if (editChampFile) {
-        form.append('celebrationImage', editChampFile);
+        celebrationImageUrl = await uploadMediaFile('champions', editChampFile);
       }
-      await apiFetch(`/api/admin/champions/${encodeURIComponent(editingChampId)}`, {
-        method: 'PUT',
-        body: form,
+      await updateChampionFirestore(editingChampId, {
+        tournamentType: editChampType,
+        season: editChampSeason.trim(),
+        teamName: editChampTeam.trim(),
+        memberName: editChampMember.trim(),
+        notes: editChampNotes.trim(),
+        ...(celebrationImageUrl ? { celebrationImageUrl } : {}),
       });
       setEditingChampId(null);
       setEditChampFile(null);
@@ -1342,12 +1501,21 @@ export function ProfileView({
   };
 
   const handleDeleteChampion = async (id: string) => {
-    await apiFetch(`/api/admin/champions/${encodeURIComponent(id)}`, { method: 'DELETE' });
-    await onRefresh();
+    setChampMsg(null);
+    try {
+      await deleteChampionFirestore(id);
+      await onRefresh();
+    } catch (err) {
+      setChampMsg({
+        type: 'err',
+        text: err instanceof Error ? err.message : 'No se pudo eliminar el campeón.',
+      });
+    }
   };
 
   const handleUploadMyCelebration = async (e: FormEvent) => {
     e.preventDefault();
+    if (!myTeam) return;
     if (!celebFile) {
       setCelebMsg({ type: 'err', text: 'Seleccioná una foto de festejo deportivo (JPG, PNG o WEBP).' });
       return;
@@ -1355,9 +1523,8 @@ export function ProfileView({
     setCelebMsg(null);
     setUploadingCeleb(true);
     try {
-      const form = new FormData();
-      form.append('celebrationImage', celebFile);
-      await apiFetch('/api/profile/celebration', { method: 'POST', body: form });
+      const celebrationImageUrl = await uploadMediaFile('champions', celebFile);
+      await updateMyCelebrationFirestore(myTeam.id, celebrationImageUrl, user?.role === 'admin');
       setCelebFile(null);
       if (celebInputRef.current) celebInputRef.current.value = '';
       await onRefresh();
@@ -1366,7 +1533,7 @@ export function ProfileView({
         text:
           user?.role === 'admin'
             ? 'Foto de festejo publicada en tu perfil.'
-            : 'Foto de festejo subida. Quedó visible y sujeta a verificación del Administrador.',
+            : 'Foto de festejo subida a Cloud Firestore y sujeta a verificación del Administrador.',
       });
     } catch (err) {
       setCelebMsg({
@@ -1379,9 +1546,18 @@ export function ProfileView({
   };
 
   const handleRemoveMyCelebration = async () => {
-    await apiFetch('/api/profile/celebration', { method: 'DELETE' });
-    await onRefresh();
-    setCelebMsg({ type: 'ok', text: 'Foto de festejo quitada de tu perfil.' });
+    if (!myTeam) return;
+    setCelebMsg(null);
+    try {
+      await deleteMyCelebrationFirestore(myTeam.id);
+      await onRefresh();
+      setCelebMsg({ type: 'ok', text: 'Foto de festejo quitada de tu perfil.' });
+    } catch (err) {
+      setCelebMsg({
+        type: 'err',
+        text: err instanceof Error ? err.message : 'No se pudo quitar la foto de festejo.',
+      });
+    }
   };
 
   const handleCreateFixture = async (e: FormEvent) => {
@@ -1389,17 +1565,14 @@ export function ProfileView({
     setFxMsg(null);
     setSavingFx(true);
     try {
-      await apiFetch('/api/admin/fixtures', {
-        method: 'POST',
-        body: JSON.stringify({
-          matchday: Number(fxMatchday) || 1,
-          leg: fxLeg,
-          homeTeamId: fxHomeTeamId,
-          awayTeamId: fxAwayTeamId,
-          scheduledDate: fxDate.trim() || undefined,
-          scheduledTime: fxTime.trim() || undefined,
-          notes: fxNotes.trim() || undefined,
-        }),
+      await createFixtureFirestore({
+        matchday: Number(fxMatchday) || 1,
+        leg: fxLeg,
+        homeTeamId: fxHomeTeamId,
+        awayTeamId: fxAwayTeamId,
+        scheduledDate: fxDate.trim() || undefined,
+        scheduledTime: fxTime.trim() || undefined,
+        notes: fxNotes.trim() || undefined,
       });
       setFxNotes('');
       await onRefresh();
@@ -1415,7 +1588,7 @@ export function ProfileView({
   };
 
   const handleDeleteFixture = async (fixtureId: string) => {
-    await apiFetch(`/api/admin/fixtures/${encodeURIComponent(fixtureId)}`, { method: 'DELETE' });
+    await deleteFixtureFirestore(fixtureId);
     await onRefresh();
   };
 
@@ -1423,13 +1596,7 @@ export function ProfileView({
     claimId: string,
     status: 'valid_match' | 'invalid_match' | 'dismissed'
   ) => {
-    await apiFetch(`/api/admin/claims/${encodeURIComponent(claimId)}`, {
-      method: 'PATCH',
-      body: JSON.stringify({
-        status,
-        adminResolutionNote: (claimNoteDrafts[claimId] || '').trim(),
-      }),
-    });
+    await resolveClaimFirestore(claimId, status, (claimNoteDrafts[claimId] || '').trim());
     await onRefresh();
     setClaimsMsg(
       status === 'valid_match'
@@ -1442,7 +1609,7 @@ export function ProfileView({
   };
 
   const handleDeleteClaim = async (claimId: string) => {
-    await apiFetch(`/api/admin/claims/${encodeURIComponent(claimId)}`, { method: 'DELETE' });
+    await deleteClaimFirestore(claimId);
     await onRefresh();
   };
 
@@ -1451,9 +1618,10 @@ export function ProfileView({
     targetId: string,
     action: 'approve' | 'remove'
   ) => {
-    await apiFetch('/api/admin/moderation/media', {
-      method: 'PATCH',
-      body: JSON.stringify({ kind, targetId, action }),
+    await moderateMediaFirestore({
+      targetType: kind,
+      targetId,
+      action,
     });
     await onRefresh();
     setModerationMsg(
@@ -1464,31 +1632,104 @@ export function ProfileView({
     window.setTimeout(() => setModerationMsg(null), 3500);
   };
 
+  const handleQuickApplyCrest = async () => {
+    setSiteMsg(null);
+    const manualUrl = siteCrestUrlInput.trim();
+    if (!siteCrestFile && !manualUrl) {
+      setSiteMsg({
+        type: 'err',
+        text: 'Seleccioná una imagen de escudo desde tu dispositivo o pegá una URL válida.',
+      });
+      return;
+    }
+    setApplyingCrest(true);
+    try {
+      const crestUrl = siteCrestFile ? await uploadMediaFile('site', siteCrestFile) : manualUrl;
+      await saveSettingsFirestore({ crestUrl });
+      setSiteCrestFile(null);
+      setSiteCrestUrlInput(crestUrl);
+      await onRefresh();
+      setSiteMsg({
+        type: 'ok',
+        text: 'Escudo oficial de la Intro y de la Liga actualizado en Cloud Firestore para todos.',
+      });
+      window.setTimeout(() => setSiteMsg(null), 4000);
+    } catch (err) {
+      setSiteMsg({
+        type: 'err',
+        text: err instanceof Error ? err.message : 'No se pudo aplicar el escudo de inicio.',
+      });
+    } finally {
+      setApplyingCrest(false);
+    }
+  };
+
   const handleSaveSettings = async (e: FormEvent) => {
     e.preventDefault();
     setSiteMsg(null);
     try {
-      const form = new FormData();
-      form.append('title', siteTitle);
-      form.append('subtitle', siteSubtitle);
-      form.append('description', siteDescription);
-      form.append('bannerText', siteBanner);
-      form.append('adminTeamId', adminTeamId);
-      form.append('radioName', radioName.trim());
-      form.append('radioStreamUrl', radioStreamUrl.trim());
-      if (siteCrestFile) form.append('crestFile', siteCrestFile);
-      if (siteFaviconFile) form.append('faviconFile', siteFaviconFile);
-      if (siteCoverFile) form.append('coverFile', siteCoverFile);
-      if (siteBackgroundFile) form.append('backgroundFile', siteBackgroundFile);
+      let crestUrl = siteCrestUrlInput.trim() || settings.crestUrl;
+      let faviconUrl = settings.faviconUrl;
+      let coverUrl = settings.coverUrl;
+      let backgroundUrl = settings.backgroundUrl;
+      let ligaTrophyUrl = ligaTrophyUrlInput.trim();
+      let copaTrophyUrl = copaTrophyUrlInput.trim();
+      let recopaTrophyUrl = recopaTrophyUrlInput.trim();
+      if (siteCrestFile) crestUrl = await uploadMediaFile('site', siteCrestFile);
+      if (siteFaviconFile) faviconUrl = await uploadMediaFile('site', siteFaviconFile);
+      if (siteCoverFile) coverUrl = await uploadMediaFile('site', siteCoverFile);
+      if (siteBackgroundFile) backgroundUrl = await uploadMediaFile('site', siteBackgroundFile);
+      if (ligaTrophyFile) ligaTrophyUrl = await uploadMediaFile('site', ligaTrophyFile);
+      if (copaTrophyFile) copaTrophyUrl = await uploadMediaFile('site', copaTrophyFile);
+      if (recopaTrophyFile) recopaTrophyUrl = await uploadMediaFile('site', recopaTrophyFile);
 
-      await apiFetch('/api/admin/settings', { method: 'PUT', body: form });
+      const parsedMaxTeams = Math.max(
+        51,
+        Math.min(500, parseInt(maxTeamsInput, 10) || effectiveMaxTeams)
+      );
+
+      await saveSettingsFirestore({
+        title: siteTitle,
+        subtitle: siteSubtitle,
+        description: siteDescription,
+        bannerText: siteBanner,
+        adminTeamId,
+        radioName: radioName.trim(),
+        radioStreamUrl: radioStreamUrl.trim(),
+        maxTeams: parsedMaxTeams,
+        crestUrl,
+        faviconUrl,
+        coverUrl,
+        backgroundUrl,
+        ligaTrophyUrl,
+        copaTrophyUrl,
+        recopaTrophyUrl,
+        customTitles: sanitizeCustomTitles(customTitlesDraft),
+      });
+
+      const trimmedEdition = cupEditionNameDraft.trim();
+      if (trimmedEdition && trimmedEdition !== (cup.editionName || '').trim()) {
+        await updateCupEditionNameFirestore(trimmedEdition);
+      }
+
       setSiteCrestFile(null);
+      setSiteCrestUrlInput(crestUrl);
       setSiteFaviconFile(null);
       setSiteCoverFile(null);
       setSiteBackgroundFile(null);
+      setLigaTrophyFile(null);
+      setLigaTrophyUrlInput(ligaTrophyUrl);
+      setCopaTrophyFile(null);
+      setCopaTrophyUrlInput(copaTrophyUrl);
+      setRecopaTrophyFile(null);
+      setRecopaTrophyUrlInput(recopaTrophyUrl);
+      setMaxTeamsInput(String(parsedMaxTeams));
       await onRefresh();
-      setSiteMsg({ type: 'ok', text: 'Título, descripciones, fondo, iconos y configuración general actualizados.' });
-      window.setTimeout(() => setSiteMsg(null), 3500);
+      setSiteMsg({
+        type: 'ok',
+        text: 'Títulos, copas, trofeos, cupo y configuración general guardados en Cloud Firestore.',
+      });
+      window.setTimeout(() => setSiteMsg(null), 4000);
     } catch (err) {
       setSiteMsg({
         type: 'err',
@@ -1519,18 +1760,26 @@ export function ProfileView({
 
     setSavingAdminCredentials(true);
     try {
-      const res = await apiFetch<{ token: string; user: AuthUser }>('/api/admin/credentials', {
-        method: 'PUT',
-        body: JSON.stringify({
-          currentPassword: adminCurrentPassword.trim(),
-          nextAdminId: adminLoginId.trim().toUpperCase(),
-          nextPassword: adminNewPassword.trim(),
-          confirmPassword: adminConfirmPassword.trim(),
-          nextBackupGmail: backupGmail.trim(),
-        }),
+      await saveSettingsFirestore({
+        adminId: adminLoginId.trim().toUpperCase(),
+        backupGmail: backupGmail.trim(),
       });
-      if (res?.token) {
-        setStoredToken(res.token);
+      try {
+        const res = await apiFetch<{ token: string; user: AuthUser }>('/api/admin/credentials', {
+          method: 'PUT',
+          body: JSON.stringify({
+            currentPassword: adminCurrentPassword.trim(),
+            nextAdminId: adminLoginId.trim().toUpperCase(),
+            nextPassword: adminNewPassword.trim(),
+            confirmPassword: adminConfirmPassword.trim(),
+            nextBackupGmail: backupGmail.trim(),
+          }),
+        });
+        if (res?.token) {
+          setStoredToken(res.token);
+        }
+      } catch {
+        // Firestore settings/admin_config update already persisted above
       }
       setAdminCurrentPassword('');
       setAdminNewPassword('');
@@ -1538,7 +1787,7 @@ export function ProfileView({
       await onRefresh();
       setAdminCredMsg({
         type: 'ok',
-        text: 'Credenciales del Administrador actualizadas con verificación de seguridad. Tu sesión administrativa permanece activa.',
+        text: 'Credenciales y correo de recuperación guardados permanentemente.',
       });
     } catch (err) {
       setAdminCredMsg({
@@ -1598,24 +1847,35 @@ export function ProfileView({
     setSavingNews(true);
     setNewsMsg(null);
     try {
-      const form = new FormData();
-      form.append('title', newsTitle.trim());
-      form.append('content', newsContent.trim());
-      form.append('textColor', newsColor);
-      if (newsImageFile) form.append('image', newsImageFile);
-      if (newsVideoFile) form.append('video', newsVideoFile);
+      let uploadedImageUrl: string | null | undefined;
+      let uploadedVideoUrl: string | null | undefined;
+      if (newsImageFile) {
+        uploadedImageUrl = await uploadMediaFile('news', newsImageFile);
+      } else if (editingNewsId && removeNewsImage) {
+        uploadedImageUrl = null;
+      }
+      if (newsVideoFile) {
+        uploadedVideoUrl = await uploadMediaFile('news', newsVideoFile);
+      } else if (editingNewsId && removeNewsVideo) {
+        uploadedVideoUrl = null;
+      }
+
       if (editingNewsId) {
-        if (removeNewsImage) form.append('removeImage', 'true');
-        if (removeNewsVideo) form.append('removeVideo', 'true');
-        await apiFetch(`/api/admin/news/${encodeURIComponent(editingNewsId)}`, {
-          method: 'PUT',
-          body: form,
+        await updateNewsFirestore(editingNewsId, {
+          title: newsTitle.trim(),
+          content: newsContent.trim(),
+          textColor: newsColor,
+          ...(uploadedImageUrl !== undefined ? { imageUrl: uploadedImageUrl } : {}),
+          ...(uploadedVideoUrl !== undefined ? { videoUrl: uploadedVideoUrl } : {}),
         });
         setNewsMsg({ type: 'ok', text: 'Comunicado actualizado correctamente en el Inicio.' });
       } else {
-        await apiFetch('/api/admin/news', {
-          method: 'POST',
-          body: form,
+        await createNewsFirestore({
+          title: newsTitle.trim(),
+          content: newsContent.trim(),
+          textColor: newsColor,
+          imageUrl: uploadedImageUrl || undefined,
+          videoUrl: uploadedVideoUrl || undefined,
         });
         setNewsMsg({ type: 'ok', text: 'Comunicado publicado en Noticias! Últimas Novedades.' });
       }
@@ -1632,17 +1892,24 @@ export function ProfileView({
   };
 
   const handleDeleteNews = async (newsId: string) => {
+    if (deletingNewsId) return;
     setNewsMsg(null);
+    setDeletingNewsId(newsId);
     try {
-      await apiFetch(`/api/admin/news/${encodeURIComponent(newsId)}`, { method: 'DELETE' });
+      await deleteNewsFirestore(newsId);
       if (editingNewsId === newsId) handleResetNewsForm();
       await onRefresh();
-      setNewsMsg({ type: 'ok', text: 'Comunicado eliminado.' });
+      setNewsMsg({
+        type: 'ok',
+        text: 'Noticia eliminada permanentemente de la página y de la base de datos.',
+      });
     } catch (err) {
       setNewsMsg({
         type: 'err',
         text: err instanceof Error ? err.message : 'No se pudo eliminar el comunicado.',
       });
+    } finally {
+      setDeletingNewsId(null);
     }
   };
 
@@ -1651,10 +1918,7 @@ export function ProfileView({
     setCommentBusyId(commentId);
     setCommentModMsg(null);
     try {
-      await apiFetch(`/api/admin/comments/${encodeURIComponent(commentId)}`, {
-        method: 'PATCH',
-        body: JSON.stringify({ status: 'approved' }),
-      });
+      await approveCommentFirestore(commentId);
       await onRefresh();
       setCommentModMsg({ type: 'ok', text: 'Comentario aprobado y visible para todos en el Inicio.' });
     } catch (err) {
@@ -1671,9 +1935,7 @@ export function ProfileView({
     setCommentBusyId(commentId);
     setCommentModMsg(null);
     try {
-      await apiFetch(`/api/admin/comments/${encodeURIComponent(commentId)}`, {
-        method: 'DELETE',
-      });
+      await deleteCommentFirestore(commentId);
       await onRefresh();
       setCommentModMsg({ type: 'ok', text: 'Comentario eliminado.' });
     } catch (err) {
@@ -2309,11 +2571,11 @@ export function ProfileView({
                     key={trophy.id}
                     className="rounded-xl overflow-hidden bg-[#041224]/95 border border-amber-400/50 shadow-lg flex flex-col"
                   >
-                    <div className="relative h-48 bg-[#03070E] border-b border-amber-400/35 overflow-hidden">
+                    <div className="relative h-48 bg-[#03070E] border-b border-amber-400/35 overflow-hidden p-1">
                       <ResilientImage
                         src={trophy.imageUrl}
                         alt={trophy.title}
-                        className="w-full h-full object-cover object-center"
+                        className="w-full h-full object-contain object-center"
                         fallbackLabel={badgeLabel}
                       />
                       <span className="absolute top-2.5 left-2.5 px-2 py-0.5 rounded-md bg-black/75 border border-amber-400/60 text-[10px] font-bold text-amber-300 uppercase tracking-wider">
@@ -2349,15 +2611,16 @@ export function ProfileView({
                                 setSavingTrophyId(trophy.id);
                                 setTrophyFeedback(null);
                                 try {
-                                  await apiFetch(`/api/profile/trophies/${encodeURIComponent(trophy.id)}`, {
-                                    method: 'PATCH',
-                                    body: JSON.stringify({ message: trophyMsgDraft.trim() }),
-                                  });
+                                  await updateTrophyMessageFirestore(
+                                    myTeam.id,
+                                    trophy.id,
+                                    trophyMsgDraft.trim()
+                                  );
                                   setEditingTrophyId(null);
                                   await onRefresh();
                                   setTrophyFeedback({
                                     type: 'ok',
-                                    text: 'Mensaje del trofeo guardado en tu perfil.',
+                                    text: 'Mensaje del trofeo guardado en Cloud Firestore.',
                                   });
                                 } catch (err) {
                                   setTrophyFeedback({
@@ -2415,10 +2678,7 @@ export function ProfileView({
                                   setSavingTrophyId(trophy.id);
                                   setTrophyFeedback(null);
                                   try {
-                                    await apiFetch(
-                                      `/api/profile/trophies/${encodeURIComponent(trophy.id)}/message`,
-                                      { method: 'DELETE' }
-                                    );
+                                    await updateTrophyMessageFirestore(myTeam.id, trophy.id, '');
                                     await onRefresh();
                                     setTrophyFeedback({
                                       type: 'ok',
@@ -2452,7 +2712,7 @@ export function ProfileView({
       )}
 
       {/* Reproductor MP3 Personal Independiente de Cada Miembro */}
-      {myTeam && (
+      {(myTeam || user?.firebaseAuthenticated) && (
         <section className="p-6 bg-[#071D38]/95 border border-amber-400/50 rounded-2xl space-y-4 shadow-xl">
           <div className="flex flex-wrap items-center justify-between gap-3">
             <div>
@@ -2481,24 +2741,33 @@ export function ProfileView({
                   setUploadingPersonalMp3(true);
                   setPersonalMp3Msg(null);
                   try {
-                    try {
-                      const form = new FormData();
-                      for (const f of files) form.append('audio', f);
-                      await apiFetch('/api/profile/music', { method: 'POST', body: form });
+                    if (user?.firebaseAuthenticated) {
+                      for (const f of files) {
+                        const audioUrl = await uploadMediaFile('music', f);
+                        const baseName = f.name.replace(/\.[^.]+$/, '').replace(/[_-]+/g, ' ').trim();
+                        const trackPayload: MusicTrack = {
+                          id: `pm_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+                          title: baseName || 'Canción MP3',
+                          artist: myTeam?.memberName || user.displayName || 'Mi Lista MP3',
+                          audioUrl,
+                          createdAt: new Date().toISOString(),
+                        };
+                        if (myTeam) {
+                          await addPersonalMusicFirestore(myTeam.id, trackPayload);
+                        } else {
+                          await addUserPersonalMusicFirestore(trackPayload);
+                        }
+                      }
+                      await saveUserMusicModeFirestore('personal');
                       await onRefresh();
                       notifyPersonalMusicChanged({ switchToPersonal: true });
-                    } catch {
+                    } else if (myTeam) {
                       await savePersonalLocalTracks(personalOwnerKey, files, myTeam.memberName || 'Mi Lista MP3');
                       notifyPersonalMusicChanged({ switchToPersonal: true });
                     }
-                    try {
-                      localStorage.setItem('lma_music_mode', 'personal');
-                    } catch {
-                      // ignore
-                    }
                     setPersonalMp3Msg({
                       type: 'ok',
-                      text: `Se agregaron ${files.length} canción(es) y se copiaron automáticamente a "Mi Música" en el reproductor de abajo a la derecha.`,
+                      text: `Se agregaron ${files.length} canción(es) y se copiaron automáticamente a "Mi Música" en Cloud Firestore.`,
                     });
                   } catch (err) {
                     setPersonalMp3Msg({
@@ -2528,10 +2797,10 @@ export function ProfileView({
           )}
 
           {(() => {
-            const combinedPersonal: Array<MusicTrack & { isLocal?: boolean }> = [
-              ...(myTeam.personalMusic || []),
-              ...localPersonalSongs,
-            ];
+            const cloudPersonal = myTeam ? myTeam.personalMusic || [] : userPersonalMusic;
+            const combinedPersonal: Array<MusicTrack & { isLocal?: boolean }> = user?.firebaseAuthenticated
+              ? cloudPersonal
+              : [...cloudPersonal, ...localPersonalSongs];
             if (combinedPersonal.length === 0) {
               return (
                 <div className="p-4 rounded-xl bg-[#041224]/85 border border-sky-400/25 text-xs text-sky-200/80 text-center">
@@ -2567,15 +2836,25 @@ export function ProfileView({
                     <button
                       type="button"
                       onClick={async () => {
-                        if (tr.isLocal) {
-                          await deletePersonalLocalTrack(tr.id);
-                          notifyPersonalMusicChanged();
-                        } else {
-                          await apiFetch(`/api/profile/music/${encodeURIComponent(tr.id)}`, {
-                            method: 'DELETE',
+                        setPersonalMp3Msg(null);
+                        try {
+                          if (tr.isLocal) {
+                            await deletePersonalLocalTrack(tr.id);
+                            notifyPersonalMusicChanged();
+                          } else if (myTeam) {
+                            await deletePersonalMusicFirestore(myTeam.id, tr.id);
+                            await onRefresh();
+                            notifyPersonalMusicChanged();
+                          } else if (user?.firebaseAuthenticated) {
+                            await deleteUserPersonalMusicFirestore(tr.id);
+                            await onRefresh();
+                            notifyPersonalMusicChanged();
+                          }
+                        } catch (err) {
+                          setPersonalMp3Msg({
+                            type: 'err',
+                            text: err instanceof Error ? err.message : 'No se pudo eliminar la canción.',
                           });
-                          await onRefresh();
-                          notifyPersonalMusicChanged();
                         }
                       }}
                       aria-label={`Eliminar ${tr.title}`}
@@ -2600,14 +2879,14 @@ export function ProfileView({
                 Panel de Administrador
               </h2>
               <p className="text-xs text-sky-200/80">
-                Administrá las cuentas y credenciales de los {settings.maxTeams} participantes, seguridad de tu cuenta Admin, partidos, copas, noticias y configuración general.
+                Administrá las cuentas y credenciales de los {effectiveMaxTeams} participantes, seguridad de tu cuenta Admin, partidos, copas, noticias y configuración general.
               </p>
             </div>
 
             <div className="flex flex-wrap items-center gap-1 p-1 bg-[#071D38]/95 border border-amber-400/50 rounded-xl">
               {(
                 [
-                  { id: 'equipos', label: `Participantes (${adminTeams.length}/${settings.maxTeams})`, icon: Users },
+                  { id: 'equipos', label: `Participantes (${adminTeams.length}/${effectiveMaxTeams})`, icon: Users },
                   { id: 'noticias', label: `Noticias (${news.length})`, icon: Megaphone },
                   { id: 'comentarios', label: `Comentarios (${pendingComments.length})`, icon: MessageSquare },
                   { id: 'copa', label: 'Copa de la Liga', icon: Crown },
@@ -2941,11 +3220,12 @@ export function ProfileView({
                             </button>
                             <button
                               type="button"
+                              disabled={deletingNewsId === post.id}
                               onClick={() => handleDeleteNews(post.id)}
-                              className="inline-flex items-center gap-1 px-3 py-1.5 text-xs font-semibold text-rose-200 bg-rose-500/15 hover:bg-rose-500/25 border border-rose-400/40 rounded-lg"
+                              className="inline-flex items-center gap-1 px-3 py-1.5 text-xs font-semibold text-rose-200 bg-rose-500/15 hover:bg-rose-500/25 border border-rose-400/40 rounded-lg disabled:opacity-60"
                             >
                               <Trash2 className="w-3.5 h-3.5" />
-                              <span>Eliminar</span>
+                              <span>{deletingNewsId === post.id ? 'Eliminando...' : 'Eliminar'}</span>
                             </button>
                           </div>
                         </div>
@@ -3108,6 +3388,7 @@ export function ProfileView({
             <AdminCupPanel
               cup={cup}
               teams={teams}
+              matches={matches}
               onRefresh={onRefresh}
               onGoToChampions={() => onNavigate('galeria', 'campeones')}
               onGoToHome={() => onNavigate('inicio')}
@@ -3170,7 +3451,7 @@ export function ProfileView({
                 <div className="flex flex-wrap items-center justify-between gap-2">
                   <div>
                     <h3 className="font-display text-2xl font-bold text-albiceleste-shiny">
-                      ADMINISTRACIÓN DE PARTICIPANTES · Crear Cuenta ({adminTeams.length} / {settings.maxTeams})
+                      ADMINISTRACIÓN DE PARTICIPANTES · Crear Cuenta ({adminTeams.length} / {effectiveMaxTeams})
                     </h3>
                     <p className="text-xs text-sky-200/80">
                       Solo el Administrador puede crear participantes. Asigná un ID único y contraseña inicial (se guarda con hash seguro).
@@ -3289,23 +3570,37 @@ export function ProfileView({
                   </div>
                 </div>
 
-                <div>
-                  <label className="block text-xs font-semibold text-sky-100/90 mb-1">
-                    Lema / Descripción del Club (opcional)
-                  </label>
-                  <input
-                    type="text"
-                    value={newTeamBio}
-                    onChange={(e) => setNewTeamBio(e.target.value)}
-                    placeholder="Estilo de juego o presentación del DT..."
-                    className="w-full px-3 py-2 text-sm bg-[#041224] text-amber-50 border border-amber-400/50 rounded-lg"
-                  />
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                  <div>
+                    <label className="block text-xs font-semibold text-sky-100/90 mb-1">
+                      Correo Google autorizado (opcional · acceso con Google)
+                    </label>
+                    <input
+                      type="email"
+                      value={newMemberEmail}
+                      onChange={(e) => setNewMemberEmail(e.target.value)}
+                      placeholder="jugador@gmail.com"
+                      className="w-full px-3 py-2 text-sm bg-[#041224] text-amber-50 border border-amber-400/50 rounded-lg"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-xs font-semibold text-sky-100/90 mb-1">
+                      Lema / Descripción del Club (opcional)
+                    </label>
+                    <input
+                      type="text"
+                      value={newTeamBio}
+                      onChange={(e) => setNewTeamBio(e.target.value)}
+                      placeholder="Estilo de juego o presentación del DT..."
+                      className="w-full px-3 py-2 text-sm bg-[#041224] text-amber-50 border border-amber-400/50 rounded-lg"
+                    />
+                  </div>
                 </div>
 
                 <div className="flex justify-end">
                   <button
                     type="submit"
-                    disabled={savingTeam || adminTeams.length >= settings.maxTeams}
+                    disabled={savingTeam || adminTeams.length >= effectiveMaxTeams}
                     className="inline-flex items-center gap-2 px-5 py-2.5 text-sm font-semibold btn-gold-luxury disabled:opacity-50 rounded-xl transition-all"
                   >
                     <Plus className="w-4 h-4" />
@@ -3318,7 +3613,7 @@ export function ProfileView({
                 <div className="px-5 py-4 bg-[#05162B] border-b border-amber-400/45 flex flex-col lg:flex-row lg:items-center justify-between gap-3">
                   <div>
                     <h3 className="font-display text-xl font-bold text-albiceleste-shiny">
-                      Lista de Participantes ({adminTeams.length} / {settings.maxTeams})
+                      Lista de Participantes ({adminTeams.length} / {effectiveMaxTeams})
                     </h3>
                     <p className="text-xs text-sky-200/80">
                       Modificá ID, cambiá o restablecé contraseñas cifradas, activá/bloqueá cuentas o eliminá participantes.
@@ -3387,6 +3682,7 @@ export function ProfileView({
                           const isEditingRow = editingTeam?.id === t.id;
                           const isBlocked = t.accountStatus === 'blocked';
                           const standing = standingsMap.get(t.id);
+                          const linkedInvite = memberInvites.find((inv) => inv.teamId === t.id);
                           return (
                             <Fragment key={t.id}>
                               <tr className={isEditingRow ? 'bg-amber-400/[0.06]' : 'hover:bg-white/[0.02]'}>
@@ -3428,7 +3724,15 @@ export function ProfileView({
                                     </span>
                                   )}
                                 </td>
-                                <td className="py-2.5 px-3 text-sky-100/90">{t.memberName}</td>
+                                <td className="py-2.5 px-3 text-sky-100/90">
+                                  <div>{t.memberName}</div>
+                                  {linkedInvite?.email && (
+                                    <div className="inline-flex items-center gap-1 mt-0.5 px-1.5 py-0.5 rounded bg-emerald-500/15 border border-emerald-400/30 text-[10px] font-mono text-emerald-200">
+                                      <Mail className="w-2.5 h-2.5 shrink-0" />
+                                      <span>{linkedInvite.email}</span>
+                                    </div>
+                                  )}
+                                </td>
                                 <td className="py-2.5 px-3 whitespace-nowrap">
                                   {standing ? (
                                     <button
@@ -3618,17 +3922,31 @@ export function ProfileView({
                                         </div>
                                       </div>
 
-                                      <div>
-                                        <label className="block text-xs font-semibold text-sky-100/90 mb-1">
-                                          Lema / Bio del Equipo
-                                        </label>
-                                        <input
-                                          type="text"
-                                          value={editBio}
-                                          onChange={(e) => setEditBio(e.target.value)}
-                                          placeholder="Descripción o lema del DT..."
-                                          className="w-full px-3 py-2 text-sm bg-[#041224] text-amber-50 border border-amber-400/50 rounded-lg"
-                                        />
+                                      <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                                        <div>
+                                          <label className="block text-xs font-semibold text-sky-100/90 mb-1">
+                                            Correo Google autorizado (opcional)
+                                          </label>
+                                          <input
+                                            type="email"
+                                            value={editMemberEmail}
+                                            onChange={(e) => setEditMemberEmail(e.target.value)}
+                                            placeholder="jugador@gmail.com"
+                                            className="w-full px-3 py-2 text-sm bg-[#041224] text-amber-50 border border-amber-400/50 rounded-lg"
+                                          />
+                                        </div>
+                                        <div>
+                                          <label className="block text-xs font-semibold text-sky-100/90 mb-1">
+                                            Lema / Bio del Equipo
+                                          </label>
+                                          <input
+                                            type="text"
+                                            value={editBio}
+                                            onChange={(e) => setEditBio(e.target.value)}
+                                            placeholder="Descripción o lema del DT..."
+                                            className="w-full px-3 py-2 text-sm bg-[#041224] text-amber-50 border border-amber-400/50 rounded-lg"
+                                          />
+                                        </div>
                                       </div>
 
                                       <div className="flex justify-end gap-2">
@@ -4663,13 +4981,14 @@ export function ProfileView({
                     }
                     setSavingTopGoal(true);
                     try {
-                      const form = new FormData();
-                      form.append('rank', topGoalRank);
-                      form.append('title', topGoalTitle.trim() || `Mejor Gol #${topGoalRank}`);
-                      if (topGoalScorer.trim()) form.append('scorerName', topGoalScorer.trim());
-                      form.append('author', user?.displayName || 'Administrador');
-                      form.append('video', topGoalFile);
-                      await apiFetch('/api/admin/top-goals', { method: 'POST', body: form });
+                      const videoUrl = await uploadMediaFile('videos', topGoalFile);
+                      await upsertTopGoalFirestore({
+                        rank: Number(topGoalRank) || 1,
+                        title: topGoalTitle.trim() || `Mejor Gol #${topGoalRank}`,
+                        scorerName: topGoalScorer.trim() || undefined,
+                        author: user?.displayName || 'Administrador',
+                        videoUrl,
+                      });
                       setTopGoalTitle('');
                       setTopGoalScorer('');
                       setTopGoalFile(null);
@@ -4677,7 +4996,7 @@ export function ProfileView({
                       await onRefresh();
                       setTopGoalMsg({
                         type: 'ok',
-                        text: `Gol #${topGoalRank} guardado en el Top 5. Ya se reproduce automáticamente en el Inicio.`,
+                        text: `Gol #${topGoalRank} guardado en Cloud Firestore (Top 5). Ya se reproduce automáticamente en el Inicio.`,
                       });
                     } catch (err) {
                       setTopGoalMsg({
@@ -4771,9 +5090,7 @@ export function ProfileView({
                               <button
                                 type="button"
                                 onClick={async () => {
-                                  await apiFetch(`/api/admin/top-goals/${goal.id}`, {
-                                    method: 'DELETE',
-                                  });
+                                  await deleteTopGoalFirestore(goal.id);
                                   await onRefresh();
                                   setTopGoalMsg({
                                     type: 'ok',
@@ -4880,19 +5197,19 @@ export function ProfileView({
                                     type="button"
                                     onClick={async () => {
                                       try {
-                                        const form = new FormData();
-                                        form.append('title', cv.titulo);
-                                        form.append('author', cv.autor);
-                                        form.append('videoUrl', cv.videoUrl);
-                                        form.append('sourceVideoId', cv.id);
-                                        await apiFetch('/api/admin/top-goals', {
-                                          method: 'POST',
-                                          body: form,
+                                        const nextRank =
+                                          [1, 2, 3, 4, 5].find((r) => !topGoals.some((g) => g.rank === r)) || 5;
+                                        await upsertTopGoalFirestore({
+                                          rank: nextRank,
+                                          title: cv.titulo,
+                                          author: cv.autor,
+                                          videoUrl: cv.videoUrl,
+                                          sourceVideoId: cv.id,
                                         });
                                         await onRefresh();
                                         setTopGoalMsg({
                                           type: 'ok',
-                                          text: `"${cv.titulo}" agregado al Top 5 Mejores Goles del Inicio.`,
+                                          text: `"${cv.titulo}" agregado al Top 5 Mejores Goles (#${nextRank}) en Cloud Firestore.`,
                                         });
                                       } catch (err) {
                                         setTopGoalMsg({
@@ -5015,19 +5332,19 @@ export function ProfileView({
                                       type="button"
                                       onClick={async () => {
                                         try {
-                                          const form = new FormData();
-                                          form.append('title', v.title);
-                                          form.append('author', v.uploadedBy);
-                                          form.append('videoUrl', v.videoUrl);
-                                          form.append('sourceVideoId', v.id);
-                                          await apiFetch('/api/admin/top-goals', {
-                                            method: 'POST',
-                                            body: form,
+                                          const nextRank =
+                                            [1, 2, 3, 4, 5].find((r) => !topGoals.some((g) => g.rank === r)) || 5;
+                                          await upsertTopGoalFirestore({
+                                            rank: nextRank,
+                                            title: v.title,
+                                            author: v.uploadedBy,
+                                            videoUrl: v.videoUrl,
+                                            sourceVideoId: v.id,
                                           });
                                           await onRefresh();
                                           setTopGoalMsg({
                                             type: 'ok',
-                                            text: `"${v.title}" agregado al Top 5 Mejores Goles del Inicio.`,
+                                            text: `"${v.title}" agregado al Top 5 Mejores Goles (#${nextRank}) en Cloud Firestore.`,
                                           });
                                         } catch (err) {
                                           setTopGoalMsg({
@@ -5231,7 +5548,7 @@ export function ProfileView({
                         <ResilientImage
                           src={c.celebrationImageUrl}
                           alt={`Festejo ${c.teamName}`}
-                          className="w-24 h-20 rounded-xl object-cover bg-[#041224] border border-amber-400/45 shrink-0"
+                          className="w-24 h-20 rounded-xl object-contain bg-[#041224] border border-amber-400/45 p-0.5 shrink-0"
                         />
                         <div className="flex-1 min-w-0">
                           <div className="text-xs font-semibold text-amber-300">
@@ -5545,6 +5862,37 @@ export function ProfileView({
                     />
                   </div>
                   <div>
+                    <label className="block text-xs font-semibold text-amber-300 mb-1">
+                      Nombre de la Liga (Temporada Actual)
+                    </label>
+                    <input
+                      type="text"
+                      value={customTitlesDraft.compLigaName ?? ''}
+                      onChange={(e) =>
+                        setCustomTitlesDraft((prev) => ({
+                          ...prev,
+                          compLigaName: e.target.value,
+                        }))
+                      }
+                      placeholder={DEFAULT_CUSTOM_TITLES.compLigaName}
+                      maxLength={140}
+                      className="w-full px-3.5 py-2 text-sm bg-[#041224] text-amber-50 border border-amber-400/50 rounded-lg"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-xs font-semibold text-amber-300 mb-1">
+                      Cupo Máximo de Participantes (más de 50 miembros)
+                    </label>
+                    <input
+                      type="number"
+                      min={51}
+                      max={500}
+                      value={maxTeamsInput}
+                      onChange={(e) => setMaxTeamsInput(e.target.value)}
+                      className="w-full px-3.5 py-2 text-sm font-mono bg-[#041224] text-amber-50 border border-amber-400/50 rounded-lg"
+                    />
+                  </div>
+                  <div>
                     <label className="block text-xs font-semibold text-sky-100/90 mb-1">
                       Equipo del Administrador en la Liga
                     </label>
@@ -5632,19 +5980,21 @@ export function ProfileView({
                     />
                   </div>
 
-                  <div className="p-4 bg-[#05162B] border border-amber-400/45 rounded-xl space-y-2">
-                    <div className="flex items-center gap-3">
+                  <div className="p-4 bg-[#05162B] border border-amber-400/60 rounded-xl space-y-3">
+                    <div className="flex items-center gap-3.5">
                       <ResilientImage
-                        src={settings.crestUrl}
+                        src={siteCrestPreview || siteCrestUrlInput || settings.crestUrl}
                         fallbackSrc={DEFAULT_CREST}
-                        alt="Escudo oficial de la liga"
-                        className="w-10 h-10 rounded-full object-cover border border-amber-400/40"
+                        alt="Escudo oficial de inicio y de la liga"
+                        className="w-16 h-16 rounded-2xl object-cover border-2 border-amber-400/70 shadow-lg shrink-0"
                       />
-                      <div>
-                        <div className="text-xs font-semibold text-amber-300">
-                          Escudo / Logo de la Liga
+                      <div className="min-w-0">
+                        <div className="text-xs font-bold text-amber-300">
+                          Escudo de la Intro (Fuegos Artificiales) y Logo Principal
                         </div>
-                        <div className="text-[11px] text-sky-200/80">Intro y debajo de portada</div>
+                        <div className="text-[11px] text-sky-200/85">
+                          Esta imagen crece con los fuegos artificiales al abrir las cortinas de inicio.
+                        </div>
                       </div>
                     </div>
                     <input
@@ -5653,6 +6003,23 @@ export function ProfileView({
                       onChange={(e) => setSiteCrestFile(e.target.files?.[0] || null)}
                       className="w-full text-xs text-sky-100/90 file:mr-2 file:py-1.5 file:px-2.5 file:rounded-lg file:border-0 file:text-xs file:font-semibold file:bg-amber-400/20 file:text-amber-300"
                     />
+                    <div className="flex flex-col sm:flex-row gap-2">
+                      <input
+                        type="url"
+                        value={siteCrestUrlInput}
+                        onChange={(e) => setSiteCrestUrlInput(e.target.value)}
+                        placeholder="O pegá una URL directa de imagen (https://...)"
+                        className="flex-1 px-2.5 py-1.5 text-xs bg-[#041224] text-amber-50 border border-amber-400/40 rounded-lg"
+                      />
+                      <button
+                        type="button"
+                        disabled={applyingCrest}
+                        onClick={() => void handleQuickApplyCrest()}
+                        className="px-3 py-1.5 text-xs font-bold rounded-lg bg-amber-400/20 hover:bg-amber-400/30 border border-amber-400/60 text-amber-200 transition-colors shrink-0 disabled:opacity-60"
+                      >
+                        {applyingCrest ? 'Aplicando...' : 'Aplicar Escudo Ahora'}
+                      </button>
+                    </div>
                   </div>
 
                   <div className="p-4 bg-[#05162B] border border-amber-400/45 rounded-xl space-y-2">
@@ -5686,6 +6053,204 @@ export function ProfileView({
                   </div>
                 </div>
 
+                {/* Fotos Oficiales de Trofeos (Liga, Copa y Recopa) */}
+                <div className="p-5 bg-[#05162B]/95 border border-amber-400/50 rounded-2xl space-y-4">
+                  <div>
+                    <h4 className="font-display text-lg font-bold text-amber-300 flex items-center gap-2">
+                      <Trophy className="w-4 h-4 text-amber-400" />
+                      <span>Fotos de Trofeos Oficiales (Liga, Copa y Recopa)</span>
+                    </h4>
+                    <p className="text-xs text-sky-200/80 mt-0.5">
+                      Cambiá la foto del trofeo que se muestra en Posiciones, Copa, Recopa, Perfiles e Historial de Campeones. Se aplica al instante para todos los miembros.
+                    </p>
+                  </div>
+
+                  <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                    <div className="p-3.5 bg-[#041224] border border-amber-400/40 rounded-xl space-y-2.5">
+                      <div className="flex items-center gap-3">
+                        <ResilientImage
+                          src={resolveAssetUrl(ligaTrophyUrlInput || LIGA_TROPHY_IMG)}
+                          alt="Trofeo Liga"
+                          className="w-12 h-14 rounded-lg object-contain bg-[#060B14] border border-amber-400/40 p-1 shrink-0"
+                        />
+                        <div className="min-w-0 flex-1">
+                          <div className="text-xs font-bold text-amber-200">Trofeo de Liga</div>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setLigaTrophyUrlInput('');
+                              setLigaTrophyFile(null);
+                            }}
+                            className="text-[11px] text-sky-300 hover:text-amber-300 underline"
+                          >
+                            Restaurar original
+                          </button>
+                        </div>
+                      </div>
+                      <input
+                        type="file"
+                        accept="image/*"
+                        onChange={(e) => setLigaTrophyFile(e.target.files?.[0] || null)}
+                        className="w-full text-[11px] text-sky-100/90 file:mr-2 file:py-1 file:px-2 file:rounded file:border-0 file:text-[11px] file:font-semibold file:bg-amber-400/20 file:text-amber-300"
+                      />
+                      <input
+                        type="url"
+                        value={ligaTrophyUrlInput}
+                        onChange={(e) => setLigaTrophyUrlInput(e.target.value)}
+                        placeholder="O URL directa (https://...)"
+                        className="w-full px-2.5 py-1.5 text-[11px] bg-[#071D38] text-amber-50 border border-amber-400/35 rounded-lg"
+                      />
+                    </div>
+
+                    <div className="p-3.5 bg-[#041224] border border-amber-400/40 rounded-xl space-y-2.5">
+                      <div className="flex items-center gap-3">
+                        <ResilientImage
+                          src={resolveAssetUrl(copaTrophyUrlInput || COPA_TROPHY_IMG)}
+                          alt="Trofeo Copa"
+                          className="w-12 h-14 rounded-lg object-contain bg-[#060B14] border border-amber-400/40 p-1 shrink-0"
+                        />
+                        <div className="min-w-0 flex-1">
+                          <div className="text-xs font-bold text-amber-200">Trofeo de Copa</div>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setCopaTrophyUrlInput('');
+                              setCopaTrophyFile(null);
+                            }}
+                            className="text-[11px] text-sky-300 hover:text-amber-300 underline"
+                          >
+                            Restaurar original
+                          </button>
+                        </div>
+                      </div>
+                      <input
+                        type="file"
+                        accept="image/*"
+                        onChange={(e) => setCopaTrophyFile(e.target.files?.[0] || null)}
+                        className="w-full text-[11px] text-sky-100/90 file:mr-2 file:py-1 file:px-2 file:rounded file:border-0 file:text-[11px] file:font-semibold file:bg-amber-400/20 file:text-amber-300"
+                      />
+                      <input
+                        type="url"
+                        value={copaTrophyUrlInput}
+                        onChange={(e) => setCopaTrophyUrlInput(e.target.value)}
+                        placeholder="O URL directa (https://...)"
+                        className="w-full px-2.5 py-1.5 text-[11px] bg-[#071D38] text-amber-50 border border-amber-400/35 rounded-lg"
+                      />
+                    </div>
+
+                    <div className="p-3.5 bg-[#041224] border border-amber-400/40 rounded-xl space-y-2.5">
+                      <div className="flex items-center gap-3">
+                        <ResilientImage
+                          src={resolveAssetUrl(recopaTrophyUrlInput || RECOPA_TROPHY_IMG)}
+                          alt="Trofeo Recopa"
+                          className="w-12 h-14 rounded-lg object-contain bg-[#060B14] border border-amber-400/40 p-1 shrink-0"
+                        />
+                        <div className="min-w-0 flex-1">
+                          <div className="text-xs font-bold text-amber-200">Trofeo de Recopa</div>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setRecopaTrophyUrlInput('');
+                              setRecopaTrophyFile(null);
+                            }}
+                            className="text-[11px] text-sky-300 hover:text-amber-300 underline"
+                          >
+                            Restaurar original
+                          </button>
+                        </div>
+                      </div>
+                      <input
+                        type="file"
+                        accept="image/*"
+                        onChange={(e) => setRecopaTrophyFile(e.target.files?.[0] || null)}
+                        className="w-full text-[11px] text-sky-100/90 file:mr-2 file:py-1 file:px-2 file:rounded file:border-0 file:text-[11px] file:font-semibold file:bg-amber-400/20 file:text-amber-300"
+                      />
+                      <input
+                        type="url"
+                        value={recopaTrophyUrlInput}
+                        onChange={(e) => setRecopaTrophyUrlInput(e.target.value)}
+                        placeholder="O URL directa (https://...)"
+                        className="w-full px-2.5 py-1.5 text-[11px] bg-[#071D38] text-amber-50 border border-amber-400/35 rounded-lg"
+                      />
+                    </div>
+                  </div>
+                </div>
+
+                {/* Editor Total de Títulos, Copas, Liga, Menú y Secciones */}
+                <div className="p-5 bg-[#05162B]/95 border border-sky-400/40 rounded-2xl space-y-4">
+                  <div className="flex flex-wrap items-center justify-between gap-3 border-b border-sky-400/20 pb-3">
+                    <div>
+                      <h4 className="font-display text-lg font-bold text-amber-300 flex items-center gap-2">
+                        <Edit3 className="w-4 h-4 text-sky-300" />
+                        <span>Editor Total de Títulos, Copas, Liga, Menú y Secciones</span>
+                      </h4>
+                      <p className="text-xs text-sky-200/80 mt-0.5">
+                        Cambiá cualquier texto o nombre de competencia visible en la web. Todos los miembros lo verán actualizado en tiempo real.
+                      </p>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setCustomTitlesDraft({ ...DEFAULT_CUSTOM_TITLES });
+                        setCupEditionNameDraft('Edición Oficial 2026-2027');
+                      }}
+                      className="px-3 py-1.5 text-xs font-semibold rounded-lg border border-sky-400/40 bg-sky-950/50 text-sky-200 hover:bg-sky-900/60 transition-colors"
+                    >
+                      Restaurar Títulos Originales
+                    </button>
+                  </div>
+
+                  <div className="p-3.5 rounded-xl bg-[#041224] border border-amber-400/35">
+                    <label className="block text-xs font-semibold text-amber-300 mb-1">
+                      Nombre de Edición Actual de la Copa (ej: Copa de la Liga · Edición 2026-2027)
+                    </label>
+                    <input
+                      type="text"
+                      value={cupEditionNameDraft}
+                      onChange={(e) => setCupEditionNameDraft(e.target.value)}
+                      placeholder="Edición 2026-2027"
+                      maxLength={140}
+                      className="w-full px-3 py-2 text-sm bg-[#071D38] text-amber-50 border border-amber-400/40 rounded-lg"
+                    />
+                  </div>
+
+                  <div className="space-y-4">
+                    {CUSTOM_TITLE_GROUPS.map((group) => (
+                      <div
+                        key={group.id}
+                        className="p-4 rounded-xl bg-[#041224]/90 border border-sky-400/25 space-y-3"
+                      >
+                        <div>
+                          <div className="text-sm font-bold text-sky-200">{group.title}</div>
+                          <div className="text-[11px] text-sky-200/75">{group.description}</div>
+                        </div>
+                        <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                          {group.fields.map((field) => (
+                            <div key={field.key}>
+                              <label className="block text-[11px] font-semibold text-sky-100/90 mb-1">
+                                {field.label}
+                              </label>
+                              <input
+                                type="text"
+                                value={customTitlesDraft[field.key] ?? ''}
+                                onChange={(e) =>
+                                  setCustomTitlesDraft((prev) => ({
+                                    ...prev,
+                                    [field.key]: e.target.value,
+                                  }))
+                                }
+                                placeholder={DEFAULT_CUSTOM_TITLES[field.key]}
+                                maxLength={220}
+                                className="w-full px-3 py-1.5 text-xs bg-[#071D38] text-amber-50 border border-amber-400/35 rounded-lg"
+                              />
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+
                 <div className="flex justify-end">
                   <button
                     type="submit"
@@ -5695,6 +6260,248 @@ export function ProfileView({
                   </button>
                 </div>
               </form>
+
+              {/* Respaldos y Recuperación en Cloud Firestore */}
+              <div className="p-6 bg-[#071D38]/95 border-2 border-emerald-400/50 rounded-2xl space-y-5 shadow-xl">
+                <div className="flex flex-wrap items-start justify-between gap-3">
+                  <div>
+                    <h3 className="font-display text-2xl font-bold text-albiceleste-shiny flex items-center gap-2">
+                      <Database className="w-6 h-6 text-emerald-300" />
+                      <span>Respaldos y Recuperación en Cloud Firestore</span>
+                    </h3>
+                    <p className="text-xs text-sky-200/85 mt-1">
+                      La liga guarda un respaldo automático diario en la nube y además podés crear copias manuales, exportar todo a JSON o restaurar cualquier punto sin perder información (antes de restaurar se guarda automáticamente un respaldo <code className="text-amber-300">pre_restore</code>).
+                    </p>
+                  </div>
+                  <div className="flex flex-wrap items-center gap-2">
+                    <button
+                      type="button"
+                      onClick={async () => {
+                        setBackupMsg(null);
+                        try {
+                          const { snapshot } = await buildLiveLeagueSnapshot();
+                          const blob = new Blob([JSON.stringify(snapshot, null, 2)], {
+                            type: 'application/json',
+                          });
+                          const url = URL.createObjectURL(blob);
+                          const a = document.createElement('a');
+                          a.href = url;
+                          a.download = `lma-backup-${new Date().toISOString().slice(0, 10)}.json`;
+                          document.body.appendChild(a);
+                          a.click();
+                          a.remove();
+                          URL.revokeObjectURL(url);
+                          setBackupMsg({
+                            type: 'ok',
+                            text: 'Respaldo JSON completo descargado desde Cloud Firestore.',
+                          });
+                        } catch (err) {
+                          setBackupMsg({
+                            type: 'err',
+                            text: err instanceof Error ? err.message : 'No se pudo exportar el respaldo JSON.',
+                          });
+                        }
+                      }}
+                      className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-semibold text-emerald-200 bg-emerald-500/15 hover:bg-emerald-500/25 border border-emerald-400/45 rounded-xl"
+                    >
+                      <Download className="w-3.5 h-3.5" />
+                      <span>Exportar JSON</span>
+                    </button>
+
+                    <label className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-semibold text-amber-200 bg-amber-500/15 hover:bg-amber-500/25 border border-amber-400/45 rounded-xl cursor-pointer">
+                      <Upload className="w-3.5 h-3.5" />
+                      <span>Importar y Restaurar JSON</span>
+                      <input
+                        ref={backupImportInputRef}
+                        type="file"
+                        accept=".json,application/json"
+                        className="hidden"
+                        onChange={async (e) => {
+                          const file = e.target.files?.[0];
+                          if (!file) return;
+                          setBackupMsg(null);
+                          setRestoringBackupId('import-json');
+                          try {
+                            const text = await file.text();
+                            const parsed = JSON.parse(text) as Record<string, unknown>;
+                            const payload =
+                              parsed.snapshot && typeof parsed.snapshot === 'object'
+                                ? (parsed.snapshot as Record<string, unknown>)
+                                : parsed;
+                            await restoreSnapshotPayloadFirestore(
+                              payload,
+                              `Importación JSON (${file.name})`
+                            );
+                            await loadBackupsList();
+                            await onRefresh();
+                            setBackupMsg({
+                              type: 'ok',
+                              text: `Respaldo "${file.name}" restaurado en Cloud Firestore (se guardó copia previa de seguridad).`,
+                            });
+                          } catch (err) {
+                            setBackupMsg({
+                              type: 'err',
+                              text: err instanceof Error ? err.message : 'El archivo JSON no es un respaldo válido.',
+                            });
+                          } finally {
+                            setRestoringBackupId(null);
+                            if (backupImportInputRef.current) backupImportInputRef.current.value = '';
+                          }
+                        }}
+                      />
+                    </label>
+                  </div>
+                </div>
+
+                {backupMsg && (
+                  <div
+                    className={`p-3 text-sm rounded-xl border ${
+                      backupMsg.type === 'ok'
+                        ? 'bg-emerald-950/60 border-emerald-400/40 text-emerald-200'
+                        : 'bg-rose-950/60 border-rose-400/40 text-rose-200'
+                    }`}
+                  >
+                    {backupMsg.text}
+                  </div>
+                )}
+
+                <div className="flex flex-col sm:flex-row gap-3">
+                  <input
+                    type="text"
+                    value={backupLabelInput}
+                    onChange={(e) => setBackupLabelInput(e.target.value)}
+                    placeholder="Etiqueta opcional (Ej: Antes de iniciar Copa 2026)"
+                    className="flex-1 px-3.5 py-2 text-sm bg-[#041224] text-amber-50 border border-amber-400/50 rounded-xl"
+                  />
+                  <button
+                    type="button"
+                    disabled={creatingBackup}
+                    onClick={async () => {
+                      setCreatingBackup(true);
+                      setBackupMsg(null);
+                      try {
+                        await createFirestoreBackup(
+                          backupLabelInput.trim() || `Manual ${new Date().toLocaleDateString('es-AR')}`,
+                          'manual'
+                        );
+                        setBackupLabelInput('');
+                        await loadBackupsList();
+                        setBackupMsg({
+                          type: 'ok',
+                          text: 'Respaldo manual creado y guardado en Cloud Firestore.',
+                        });
+                      } catch (err) {
+                        setBackupMsg({
+                          type: 'err',
+                          text: err instanceof Error ? err.message : 'No se pudo crear el respaldo.',
+                        });
+                      } finally {
+                        setCreatingBackup(false);
+                      }
+                    }}
+                    className="inline-flex items-center justify-center gap-2 px-4 py-2 text-xs font-bold btn-gold-luxury disabled:opacity-50 rounded-xl whitespace-nowrap"
+                  >
+                    <Database className="w-4 h-4" />
+                    <span>{creatingBackup ? 'Creando respaldo...' : 'Crear Respaldo Ahora'}</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => void loadBackupsList()}
+                    disabled={loadingBackups}
+                    className="inline-flex items-center justify-center gap-1.5 px-3.5 py-2 text-xs font-semibold text-sky-200 bg-[#041224] hover:bg-[#0A294E] border border-sky-400/35 rounded-xl"
+                  >
+                    <RefreshCw className={`w-3.5 h-3.5 ${loadingBackups ? 'animate-spin' : ''}`} />
+                    <span>Actualizar Lista</span>
+                  </button>
+                </div>
+
+                <div className="space-y-2">
+                  <div className="text-xs font-semibold text-amber-200/90">
+                    Historial de Copias en Cloud Firestore ({backupsList.length})
+                  </div>
+                  {loadingBackups && backupsList.length === 0 ? (
+                    <div className="p-4 text-center text-xs text-sky-200/80 bg-[#041224] rounded-xl border border-amber-400/20">
+                      Cargando respaldos de Cloud Firestore...
+                    </div>
+                  ) : backupsList.length === 0 ? (
+                    <div className="p-4 text-center text-xs text-sky-200/80 bg-[#041224] rounded-xl border border-amber-400/20">
+                      Aún no hay copias registradas. Creá una copia manual arriba o esperá el respaldo diario automático.
+                    </div>
+                  ) : (
+                    <div className="max-h-72 overflow-y-auto divide-y divide-amber-400/15 bg-[#041224] rounded-xl border border-amber-400/30">
+                      {backupsList.map((b) => (
+                        <div
+                          key={b.id}
+                          className="p-3.5 flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-xs"
+                        >
+                          <div className="space-y-1 min-w-0">
+                            <div className="flex flex-wrap items-center gap-2">
+                              <span className="font-bold text-amber-100">{b.label || b.id}</span>
+                              <span className="px-2 py-0.5 rounded bg-[#0A294E] border border-amber-400/35 text-[10px] font-mono text-amber-300">
+                                {b.trigger}
+                              </span>
+                            </div>
+                            <div className="text-[11px] text-sky-200/75 font-mono">
+                              {new Date(b.createdAt).toLocaleString('es-AR')} · Equipos: {b.summary?.teamsCount ?? 0} · Partidos: {b.summary?.matchesCount ?? 0} · Noticias: {b.summary?.newsCount ?? 0} · Videos: {b.summary?.communityVideosCount ?? 0}
+                            </div>
+                          </div>
+
+                          <div className="shrink-0 flex items-center gap-2">
+                            {confirmRestoreId === b.id ? (
+                              <div className="inline-flex items-center gap-1.5 bg-amber-950/80 border border-amber-400/60 rounded-lg px-2 py-1">
+                                <button
+                                  type="button"
+                                  disabled={restoringBackupId === b.id}
+                                  onClick={async () => {
+                                    setRestoringBackupId(b.id);
+                                    setBackupMsg(null);
+                                    try {
+                                      await restoreFirestoreBackup(b.id);
+                                      setConfirmRestoreId(null);
+                                      await loadBackupsList();
+                                      await onRefresh();
+                                      setBackupMsg({
+                                        type: 'ok',
+                                        text: `Copia "${b.label || b.id}" restaurada con éxito (se creó respaldo previo de seguridad).`,
+                                      });
+                                    } catch (err) {
+                                      setBackupMsg({
+                                        type: 'err',
+                                        text: err instanceof Error ? err.message : 'No se pudo restaurar el respaldo.',
+                                      });
+                                    } finally {
+                                      setRestoringBackupId(null);
+                                    }
+                                  }}
+                                  className="px-2.5 py-1 text-[11px] font-bold text-zinc-950 bg-amber-400 hover:bg-amber-300 rounded disabled:opacity-50"
+                                >
+                                  {restoringBackupId === b.id ? 'Restaurando...' : 'Confirmar Restauración'}
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => setConfirmRestoreId(null)}
+                                  className="px-2 py-1 text-[11px] text-sky-200 hover:text-white"
+                                >
+                                  Cancelar
+                                </button>
+                              </div>
+                            ) : (
+                              <button
+                                type="button"
+                                onClick={() => setConfirmRestoreId(b.id)}
+                                className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-amber-200 bg-amber-500/15 hover:bg-amber-500/25 border border-amber-400/40 rounded-lg"
+                              >
+                                <History className="w-3.5 h-3.5" />
+                                <span>Restaurar</span>
+                              </button>
+                            )}
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              </div>
             </div>
           )}
         </section>

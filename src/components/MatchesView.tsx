@@ -20,11 +20,19 @@ import type {
   CupMatchNode,
   CupRound,
   CupTournament,
+  LeagueSettings,
   Match,
   PublicTeam,
   ScheduledFixture,
 } from '../types';
-import { apiFetch } from '../utils/api';
+import {
+  deleteMatchFirestore,
+  reviewMatchFirestore,
+  submitClaimFirestore,
+  submitMatchFirestore,
+} from '../services/firestoreLeague';
+import { uploadMediaFile } from '../utils/api';
+import { getTitleText } from '../utils/customTitles';
 import { ResilientImage } from './ResilientImage';
 
 export type MatchesSubTab = 'validated' | 'fixtures' | 'mine' | 'pending' | 'submit' | 'claims';
@@ -35,6 +43,7 @@ interface MatchesViewProps {
   claims?: Claim[];
   teams: PublicTeam[];
   cup?: CupTournament;
+  settings?: LeagueSettings;
   user: AuthUser | null;
   initialSubTab?: MatchesSubTab;
   onOpenAuth: () => void;
@@ -54,6 +63,7 @@ export function MatchesView({
   claims = [],
   teams,
   cup,
+  settings,
   user,
   initialSubTab = 'validated',
   onOpenAuth,
@@ -330,35 +340,50 @@ export function MatchesView({
     }
     setSubmitting(true);
     try {
-      const form = new FormData();
-      form.append('homeTeamId', homeTeamId);
-      form.append('awayTeamId', awayTeamId);
-      form.append('homeGoals', homeGoals);
-      form.append('awayGoals', awayGoals);
-      form.append('matchday', matchday);
-      form.append('leg', leg);
-      form.append('playedAt', playedAt);
-      form.append('notes', notes);
-      form.append('competitionType', competitionType);
-      if (competitionType === 'copa' && selectedCupMatchId) {
-        form.append('cupMatchId', selectedCupMatchId);
+      let proofImageUrl: string | undefined;
+      let scorerImageUrl: string | undefined;
+      if (proofFile) {
+        proofImageUrl = await uploadMediaFile('matches', proofFile);
       }
-      if (competitionType !== 'liga') {
-        form.append('extraTime', extraTime ? 'true' : 'false');
-        if (homePenalties.trim() !== '' && awayPenalties.trim() !== '') {
-          form.append('homePenalties', homePenalties.trim());
-          form.append('awayPenalties', awayPenalties.trim());
-        }
+      if (scorerFile) {
+        scorerImageUrl = await uploadMediaFile('matches', scorerFile);
       }
-      if (selectedFixtureId && competitionType === 'liga') form.append('fixtureId', selectedFixtureId);
-      if (scorerName.trim()) form.append('scorerName', scorerName.trim());
-      if (proofFile) form.append('proofImage', proofFile);
-      if (scorerFile) form.append('scorerImage', scorerFile);
 
-      const res = await apiFetch<{ match: Match; cupSynced?: boolean }>('/api/matches', {
-        method: 'POST',
-        body: form,
+      const res = await submitMatchFirestore({
+        homeTeamId,
+        awayTeamId,
+        homeGoals: Number(homeGoals),
+        awayGoals: Number(awayGoals),
+        matchday: Number(matchday) || 1,
+        leg,
+        playedAt,
+        notes,
+        competitionType,
+        cupMatchId: competitionType === 'copa' && selectedCupMatchId ? selectedCupMatchId : undefined,
+        extraTime: competitionType !== 'liga' ? extraTime : false,
+        homePenalties:
+          competitionType !== 'liga' && homePenalties.trim() !== ''
+            ? Number(homePenalties.trim())
+            : null,
+        awayPenalties:
+          competitionType !== 'liga' && awayPenalties.trim() !== ''
+            ? Number(awayPenalties.trim())
+            : null,
+        fixtureId: selectedFixtureId && competitionType === 'liga' ? selectedFixtureId : undefined,
+        scorerName: scorerName.trim() || undefined,
+        proofImageUrl,
+        scorerImageUrl,
+        submittedByTeamId: user?.teamId || user?.id || 'ADMI',
+        submittedByName:
+          user?.displayName ||
+          (user?.teamId ? teamMap.get(user.teamId)?.name : undefined) ||
+          'Participante',
+        isAdmin: user?.role === 'admin',
+        cup,
+        teams,
+        allMatches: matches,
       });
+
       const submittedComp = competitionType;
       setSelectedFixtureId('');
       setSelectedCupMatchId('');
@@ -417,16 +442,30 @@ export function MatchesView({
     }
     setSubmittingClaim(true);
     try {
-      const form = new FormData();
-      form.append('reasonType', claimReasonType);
-      form.append('description', claimDescription.trim());
-      if (claimAccusedTeamId) form.append('accusedTeamId', claimAccusedTeamId);
-      if (claimMatchId) form.append('matchId', claimMatchId);
-      if (claimCardFile) form.append('cardPhoto', claimCardFile);
-      if (claimVideoFile) form.append('videoFile', claimVideoFile);
-      if (claimVideoUrl.trim()) form.append('videoUrl', claimVideoUrl.trim());
+      let cardPhotoUrl: string | undefined;
+      let resolvedVideoUrl = claimVideoUrl.trim() || undefined;
+      if (claimCardFile) {
+        cardPhotoUrl = await uploadMediaFile('claims', claimCardFile);
+      }
+      if (claimVideoFile) {
+        resolvedVideoUrl = await uploadMediaFile('claims', claimVideoFile);
+      }
 
-      await apiFetch('/api/claims', { method: 'POST', body: form });
+      const accusedTeam = claimAccusedTeamId ? teamMap.get(claimAccusedTeamId) : undefined;
+      await submitClaimFirestore({
+        reasonType: claimReasonType,
+        description: claimDescription.trim(),
+        accusedTeamId: claimAccusedTeamId || undefined,
+        accusedTeamName: accusedTeam?.name,
+        matchId: claimMatchId || undefined,
+        cardPhotoUrl,
+        videoUrl: resolvedVideoUrl,
+        reporterTeamId: user?.teamId || user?.id || 'ADMI',
+        reporterName:
+          user?.displayName ||
+          (user?.teamId ? teamMap.get(user.teamId)?.name : undefined) ||
+          'Participante',
+      });
       setClaimDescription('');
       setClaimAccusedTeamId('');
       setClaimMatchId('');
@@ -451,28 +490,42 @@ export function MatchesView({
   };
 
   const handleAdminStatus = async (matchId: string, status: 'validated' | 'rejected') => {
-    await apiFetch(`/api/admin/matches/${matchId}`, {
-      method: 'PATCH',
-      body: JSON.stringify({ status }),
-    });
-    await onRefresh();
+    try {
+      await reviewMatchFirestore(matchId, {
+        status,
+        cup,
+        teams,
+        allMatches: matches,
+      });
+      await onRefresh();
+    } catch {
+      // Save error toast already surfaced by runConfirmedWrite
+    }
   };
 
   const handleAdminSaveScore = async (matchId: string) => {
-    await apiFetch(`/api/admin/matches/${matchId}`, {
-      method: 'PATCH',
-      body: JSON.stringify({
+    try {
+      await reviewMatchFirestore(matchId, {
         homeGoals: Number(editHomeGoals),
         awayGoals: Number(editAwayGoals),
-      }),
-    });
-    setEditingMatchId(null);
-    await onRefresh();
+        cup,
+        teams,
+        allMatches: matches,
+      });
+      setEditingMatchId(null);
+      await onRefresh();
+    } catch {
+      // Save error toast already surfaced by runConfirmedWrite
+    }
   };
 
   const handleAdminDelete = async (matchId: string) => {
-    await apiFetch(`/api/admin/matches/${matchId}`, { method: 'DELETE' });
-    await onRefresh();
+    try {
+      await deleteMatchFirestore(matchId);
+      await onRefresh();
+    } catch {
+      // Save error toast already surfaced by runConfirmedWrite
+    }
   };
 
   const renderMatchList = (list: Match[], emptyText: string) => {
@@ -501,12 +554,12 @@ export function MatchesView({
                   {m.competitionType === 'copa' ? (
                     <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-sky-500/20 border border-sky-300/45 text-sky-200 font-bold">
                       <Trophy className="w-3 h-3 text-sky-300" />
-                      Copa de la Liga
+                      {getTitleText(settings, 'compCopaName')}
                     </span>
                   ) : m.competitionType === 'recopa' ? (
                     <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-amber-400/20 border border-amber-300/50 text-amber-200 font-bold">
                       <Trophy className="w-3 h-3 text-amber-300" />
-                      Recopa Argentina
+                      {getTitleText(settings, 'compRecopaName')}
                     </span>
                   ) : (
                     <>
@@ -719,10 +772,10 @@ export function MatchesView({
       <div className="flex flex-col sm:flex-row sm:items-end justify-between gap-4">
         <div>
           <h1 className="font-display text-3xl sm:text-4xl font-extrabold text-albiceleste-shiny">
-            Partidos, Cruces, Resultados y Reclamos
+            {getTitleText(settings, 'matchesTitle')}
           </h1>
           <p className="mt-1 text-sm text-sky-200/80">
-            Consultá las fechas, subí tu resultado con foto del goleador o enviá un reclamo con pruebas y video .MP4.
+            {getTitleText(settings, 'matchesSubtitle')}
           </p>
         </div>
 
@@ -1090,9 +1143,21 @@ export function MatchesView({
                 <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
                   {(
                     [
-                      { id: 'liga', label: 'Liga Argentina', desc: 'Tabla de Posiciones' },
-                      { id: 'copa', label: 'Copa de la Liga', desc: 'Actualiza Llaves Automático' },
-                      { id: 'recopa', label: 'Recopa Argentina', desc: 'Actualiza Final Automático' },
+                      {
+                        id: 'liga',
+                        label: getTitleText(settings, 'compLigaName'),
+                        desc: 'Tabla de Posiciones',
+                      },
+                      {
+                        id: 'copa',
+                        label: getTitleText(settings, 'compCopaName'),
+                        desc: 'Actualiza Llaves Automático',
+                      },
+                      {
+                        id: 'recopa',
+                        label: getTitleText(settings, 'compRecopaName'),
+                        desc: 'Actualiza Final Automático',
+                      },
                     ] as const
                   ).map((opt) => (
                     <button

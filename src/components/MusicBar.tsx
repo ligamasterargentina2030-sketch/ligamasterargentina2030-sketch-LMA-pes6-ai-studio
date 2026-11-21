@@ -19,8 +19,16 @@ import {
   Volume2,
   VolumeX,
 } from 'lucide-react';
+import {
+  addLeagueMusicFirestore,
+  addPersonalMusicFirestore,
+  addUserPersonalMusicFirestore,
+  deleteLeagueMusicFirestore,
+  deletePersonalMusicFirestore,
+  deleteUserPersonalMusicFirestore,
+} from '../services/firestoreLeague';
 import type { AuthUser, LastListenedTrack, MusicTrack } from '../types';
-import { apiFetch } from '../utils/api';
+import { uploadMediaFile } from '../utils/api';
 import { resolveAssetUrl } from '../utils/assetUrl';
 import { resolveTrackCoverUrl } from '../utils/id3Cover';
 import {
@@ -145,11 +153,14 @@ const ARGENTINE_FM_STATIONS: RadioStation[] = [
 interface MusicBarProps {
   tracks: MusicTrack[];
   personalServerTracks?: MusicTrack[];
+  personalTeamId?: string;
   user?: AuthUser | null;
   radioName?: string;
   radioStreamUrl?: string;
   isAdmin?: boolean;
   introActive?: boolean;
+  musicMode?: 'league' | 'personal';
+  onChangeMusicMode?: (mode: 'league' | 'personal') => void | Promise<void>;
   onRefresh?: () => Promise<void>;
   onLastSongPlayed?: (track: LastListenedTrack) => void | Promise<void>;
 }
@@ -157,11 +168,14 @@ interface MusicBarProps {
 export function MusicBar({
   tracks,
   personalServerTracks = [],
+  personalTeamId,
   user = null,
   radioName,
   radioStreamUrl,
   isAdmin = false,
   introActive = false,
+  musicMode = 'league',
+  onChangeMusicMode,
   onRefresh,
   onLastSongPlayed,
 }: MusicBarProps) {
@@ -170,17 +184,24 @@ export function MusicBar({
   const userPausedRef = useRef(false);
   const lastReportedKeyRef = useRef<string | null>(null);
 
-  const ownerKey = user?.teamId || user?.id || 'guest';
+  const ownerKey = personalTeamId || user?.teamId || user?.id || 'guest';
   const [localPersonalTracks, setLocalPersonalTracks] = useState<LocalPersonalTrack[]>([]);
-  const [playlistMode, setPlaylistMode] = useState<'personal' | 'league'>(() => {
-    try {
-      return localStorage.getItem('lma_music_mode') === 'personal' ? 'personal' : 'league';
-    } catch {
-      return 'league';
-    }
-  });
+  const [playlistMode, setPlaylistMode] = useState<'personal' | 'league'>(musicMode);
+
+  useEffect(() => {
+    setPlaylistMode(musicMode);
+  }, [musicMode]);
 
   const reloadLocalPersonal = useCallback(async () => {
+    if (user?.firebaseAuthenticated) {
+      setLocalPersonalTracks((prev) => {
+        for (const old of prev) {
+          if (old.audioUrl.startsWith('blob:')) URL.revokeObjectURL(old.audioUrl);
+        }
+        return [];
+      });
+      return;
+    }
     const loaded = await loadPersonalLocalTracks(ownerKey);
     setLocalPersonalTracks((prev) => {
       for (const old of prev) {
@@ -188,7 +209,7 @@ export function MusicBar({
       }
       return loaded;
     });
-  }, [ownerKey]);
+  }, [ownerKey, user?.firebaseAuthenticated]);
 
   useEffect(() => {
     void reloadLocalPersonal();
@@ -198,18 +219,14 @@ export function MusicBar({
       if (customEv.detail?.switchToPersonal) {
         setPlaylistMode('personal');
         setCurrentIndex(0);
-        try {
-          localStorage.setItem('lma_music_mode', 'personal');
-        } catch {
-          // ignore
-        }
+        void onChangeMusicMode?.('personal');
       }
     };
     window.addEventListener('lma:personal-music-changed', onChanged);
     return () => {
       window.removeEventListener('lma:personal-music-changed', onChanged);
     };
-  }, [reloadLocalPersonal]);
+  }, [reloadLocalPersonal, onChangeMusicMode]);
 
   const personalTracks = useMemo<(MusicTrack & { isLocal?: boolean })[]>(() => {
     return [...personalServerTracks, ...localPersonalTracks];
@@ -556,11 +573,7 @@ export function MusicBar({
     setPlaylistMode(mode);
     setCurrentIndex(0);
     setErrorMsg(null);
-    try {
-      localStorage.setItem('lma_music_mode', mode);
-    } catch {
-      // ignore
-    }
+    void onChangeMusicMode?.(mode);
   };
 
   const toggleRadio = () => {
@@ -606,11 +619,15 @@ export function MusicBar({
     setTrackFormError(null);
     setAddingTrack(true);
     try {
-      const form = new FormData();
       for (const file of Array.from(fileList)) {
-        form.append('audio', file);
+        const audioUrl = await uploadMediaFile('music', file);
+        const rawTitle = file.name.replace(/\.[^/.]+$/, '').trim() || 'Canción Oficial';
+        await addLeagueMusicFirestore({
+          title: rawTitle,
+          artist: 'Liga Master Argentina',
+          audioUrl,
+        });
       }
-      await apiFetch('/api/admin/music', { method: 'POST', body: form });
       if (onRefresh) await onRefresh();
     } catch (err) {
       setTrackFormError(err instanceof Error ? err.message : 'Error subiendo MP3.');
@@ -625,22 +642,28 @@ export function MusicBar({
     setAddingTrack(true);
     const files = Array.from(fileList);
     try {
-      if (user) {
-        try {
-          const form = new FormData();
-          for (const file of files) {
-            form.append('audio', file);
+      if (user?.firebaseAuthenticated) {
+        const targetTeamId = personalTeamId || user.teamId;
+        for (const file of files) {
+          const audioUrl = await uploadMediaFile('music', file);
+          const rawTitle = file.name.replace(/\.[^/.]+$/, '').trim() || 'Mi Canción MP3';
+          const trackPayload: MusicTrack = {
+            id: `pm_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+            title: rawTitle,
+            artist: user.displayName || 'Mi Lista MP3',
+            audioUrl,
+            createdAt: new Date().toISOString(),
+          };
+          if (targetTeamId) {
+            await addPersonalMusicFirestore(targetTeamId, trackPayload);
+          } else {
+            await addUserPersonalMusicFirestore(trackPayload);
           }
-          await apiFetch('/api/profile/music', { method: 'POST', body: form });
-          if (onRefresh) await onRefresh();
-          notifyPersonalMusicChanged({ switchToPersonal: true });
-        } catch {
-          // Static / GitHub Pages fallback: save directly into this member's browser IndexedDB
-          await savePersonalLocalTracks(ownerKey, files, user.displayName || 'Mi Lista MP3');
-          notifyPersonalMusicChanged({ switchToPersonal: true });
         }
+        if (onRefresh) await onRefresh();
+        notifyPersonalMusicChanged({ switchToPersonal: true });
       } else {
-        await savePersonalLocalTracks(ownerKey, files, 'Mi Lista MP3');
+        await savePersonalLocalTracks(ownerKey, files, user?.displayName || 'Mi Lista MP3');
         notifyPersonalMusicChanged({ switchToPersonal: true });
       }
       switchPlaylistMode('personal');
@@ -652,23 +675,34 @@ export function MusicBar({
   };
 
   const handleDeletePersonalTrack = async (track: MusicTrack & { isLocal?: boolean }) => {
+    setTrackFormError(null);
     if (track.isLocal) {
       await deletePersonalLocalTrack(track.id);
       notifyPersonalMusicChanged();
       return;
     }
+    if (!user?.firebaseAuthenticated) return;
+    const targetTeamId = personalTeamId || user.teamId;
     try {
-      await apiFetch(`/api/profile/music/${encodeURIComponent(track.id)}`, { method: 'DELETE' });
+      if (targetTeamId) {
+        await deletePersonalMusicFirestore(targetTeamId, track.id);
+      } else {
+        await deleteUserPersonalMusicFirestore(track.id);
+      }
       if (onRefresh) await onRefresh();
       notifyPersonalMusicChanged();
-    } catch {
-      // ignore
+    } catch (err) {
+      setTrackFormError(err instanceof Error ? err.message : 'No se pudo eliminar la canción.');
     }
   };
 
   const handleAdminDeleteTrack = async (trackId: string) => {
-    await apiFetch(`/api/admin/music/${trackId}`, { method: 'DELETE' });
-    if (onRefresh) await onRefresh();
+    try {
+      await deleteLeagueMusicFirestore(trackId);
+      if (onRefresh) await onRefresh();
+    } catch (err) {
+      setTrackFormError(err instanceof Error ? err.message : 'No se pudo eliminar la canción.');
+    }
   };
 
   const showMp3Section = true;

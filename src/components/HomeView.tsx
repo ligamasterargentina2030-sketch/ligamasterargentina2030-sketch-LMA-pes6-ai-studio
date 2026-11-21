@@ -42,8 +42,14 @@ import type {
   StandingRow,
   TopGoalItem,
 } from '../types';
-import { apiFetch } from '../utils/api';
+import {
+  approveCommentFirestore,
+  deleteCommentFirestore,
+  saveFeaturedVideoFirestore,
+  submitCommentFirestore,
+} from '../services/firestoreLeague';
 import { resolveAssetUrl } from '../utils/assetUrl';
+import { getTitleText } from '../utils/customTitles';
 import { CupBracketCard } from './CupBracketCard';
 import { ResilientImage } from './ResilientImage';
 
@@ -216,7 +222,10 @@ export function HomeView({
     if (newsIdx >= news.length && news.length > 0) {
       setNewsIdx(0);
     }
-  }, [news.length, newsIdx]);
+    if (maximizedNewsId && !news.some((n) => n.id === maximizedNewsId)) {
+      setMaximizedNewsId(null);
+    }
+  }, [news, news.length, newsIdx, maximizedNewsId]);
 
   useEffect(() => {
     if (champions.length <= 1 || champPaused) return;
@@ -483,11 +492,10 @@ export function HomeView({
     if (!selected) return;
     setUpdatingFeatured(true);
     try {
-      await apiFetch('/api/admin/featured-video', {
-        method: 'PUT',
-        body: JSON.stringify(selected),
-      });
+      await saveFeaturedVideoFirestore(selected);
       await onRefresh();
+    } catch {
+      // Save error toast already surfaced by runConfirmedWrite
     } finally {
       setUpdatingFeatured(false);
     }
@@ -524,19 +532,20 @@ export function HomeView({
     setSubmittingComment(true);
     setCommentFeedback(null);
     try {
-      const res = await apiFetch<{ pendingApproval?: boolean }>('/api/comments', {
-        method: 'POST',
-        body: JSON.stringify({
-          authorName: commentAuthor.trim() || undefined,
-          message: commentMessage.trim(),
-        }),
+      const created = await submitCommentFirestore({
+        authorName: commentAuthor.trim() || user?.displayName || 'Hincha de la Liga',
+        authorTeamName: teams.find((t) => t.id === user?.teamId)?.name,
+        authorTeamId: user?.teamId,
+        message: commentMessage.trim(),
+        isAdmin: user?.role === 'admin',
       });
       setCommentMessage('');
       setCommentFeedback({
         type: 'ok',
-        text: res.pendingApproval
-          ? '¡Comentario enviado! Quedará publicado cuando el Administrador lo apruebe.'
-          : '¡Comentario publicado!',
+        text:
+          created.status === 'pending'
+            ? '¡Comentario enviado! Quedará publicado cuando el Administrador lo apruebe.'
+            : '¡Comentario publicado!',
       });
       await onRefresh();
     } catch (err) {
@@ -552,8 +561,13 @@ export function HomeView({
   const handleApproveComment = async (commentId: string) => {
     setModeratingCommentId(commentId);
     try {
-      await apiFetch(`/api/admin/comments/${commentId}`, { method: 'PATCH' });
+      await approveCommentFirestore(commentId);
       await onRefresh();
+    } catch (err) {
+      setCommentFeedback({
+        type: 'err',
+        text: err instanceof Error ? err.message : 'No se pudo aprobar el comentario.',
+      });
     } finally {
       setModeratingCommentId(null);
     }
@@ -562,8 +576,13 @@ export function HomeView({
   const handleDeleteComment = async (commentId: string) => {
     setModeratingCommentId(commentId);
     try {
-      await apiFetch(`/api/admin/comments/${commentId}`, { method: 'DELETE' });
+      await deleteCommentFirestore(commentId);
       await onRefresh();
+    } catch (err) {
+      setCommentFeedback({
+        type: 'err',
+        text: err instanceof Error ? err.message : 'No se pudo eliminar el comentario.',
+      });
     } finally {
       setModeratingCommentId(null);
     }
@@ -690,7 +709,7 @@ export function HomeView({
                 className="inline-flex items-center gap-1.5 px-4 py-2.5 text-sm btn-celeste-gold rounded-xl transition-all whitespace-nowrap"
               >
                 <Trophy className="w-4 h-4 text-amber-300" />
-                <span>Copas</span>
+                <span>{getTitleText(settings, 'navCopas')}</span>
               </button>
               <button
                 type="button"
@@ -698,14 +717,14 @@ export function HomeView({
                 className="inline-flex items-center gap-1.5 px-4 py-2.5 text-sm font-bold text-emerald-200 bg-emerald-950/55 hover:bg-emerald-900/65 border border-emerald-400/55 rounded-xl transition-colors whitespace-nowrap"
               >
                 <CalendarDays className="w-4 h-4 text-emerald-300" />
-                <span>Calendario ({totalCalendarCount})</span>
+                <span>{getTitleText(settings, 'navCalendario')} ({totalCalendarCount})</span>
               </button>
               <button
                 type="button"
                 onClick={() => onNavigate('posiciones')}
                 className="px-4 py-2.5 text-sm btn-celeste-gold rounded-xl transition-all whitespace-nowrap"
               >
-                Posiciones
+                {getTitleText(settings, 'navPosiciones')}
               </button>
               <button
                 type="button"
@@ -846,7 +865,7 @@ export function HomeView({
             <div className="flex items-center gap-2 min-w-0">
               <Megaphone className="w-5 h-5 text-emerald-400 shrink-0" />
               <h2 className="font-display text-2xl sm:text-3xl font-bold text-gold-shiny truncate">
-                Noticias! Últimas Novedades
+                {getTitleText(settings, 'homeNewsTitle')}
               </h2>
             </div>
             <div className="flex items-center gap-2 shrink-0">
@@ -954,12 +973,12 @@ export function HomeView({
                             {activeNews.championTeamName}
                           </span>
                         </div>
-                        <div className="col-span-8 relative aspect-[16/10] rounded-lg overflow-hidden border-2 border-zinc-950 bg-zinc-900">
+                        <div className="col-span-8 relative aspect-[16/10] rounded-lg overflow-hidden border-2 border-zinc-950 bg-zinc-950">
                           <ResilientImage
                             src={activeNews.celebrationImageUrl || activeNews.imageUrl}
                             fallbackSrc={defaultChampImg}
                             alt={`Celebración ${activeNews.championTeamName || 'Campeón'}`}
-                            className="w-full h-full object-cover"
+                            className="w-full h-full object-contain"
                             fallbackLabel="¡CAMPEÓN!"
                           />
                           <div className="absolute bottom-1.5 right-1.5 px-2 py-0.5 rounded bg-amber-400 text-zinc-950 font-display text-[11px] font-black uppercase tracking-wider shadow">
@@ -1016,11 +1035,11 @@ export function HomeView({
                       )}
 
                       {activeNews.imageUrl && (
-                        <div className="rounded-xl overflow-hidden border border-zinc-700/70 bg-black">
+                        <div className="rounded-xl overflow-hidden border border-zinc-700/70 bg-black flex items-center justify-center">
                           <ResilientImage
                             src={activeNews.imageUrl}
                             alt={activeNews.title}
-                            className="w-full max-h-72 sm:max-h-80 object-contain"
+                            className="w-full max-h-80 sm:max-h-96 object-contain mx-auto"
                             fallbackLabel={activeNews.title}
                           />
                         </div>
@@ -1143,7 +1162,7 @@ export function HomeView({
                 <div className="flex items-center gap-2 min-w-0">
                   <Trophy className="w-4 h-4 text-amber-300 shrink-0" />
                   <h2 className="font-display text-2xl font-bold text-gold-shiny truncate">
-                    Historial de Campeones
+                    {getTitleText(settings, 'homeChampionsTitle')}
                   </h2>
                 </div>
                 <div className="flex items-center gap-1.5 shrink-0">
@@ -1169,7 +1188,7 @@ export function HomeView({
                     src={activeChampion.celebrationImageUrl}
                     fallbackSrc={defaultChampImg}
                     alt={`Festejo campeón ${activeChampion.teamName}`}
-                    className="w-full h-full object-cover transition-opacity duration-500"
+                    className="w-full h-full object-contain transition-opacity duration-500"
                     fallbackLabel={activeChampion.teamName}
                   />
                   {champions.length > 1 && (
@@ -1200,10 +1219,10 @@ export function HomeView({
                   <div className="min-w-0">
                     <div className="text-xs font-medium text-amber-300">
                       {activeChampion.tournamentType === 'copa'
-                        ? 'Copa de la Liga · '
+                        ? `${getTitleText(settings, 'compCopaName')} · `
                         : activeChampion.tournamentType === 'recopa'
-                        ? 'Recopa (Gran Campeón) · '
-                        : 'Liga Argentina · '}
+                        ? `${getTitleText(settings, 'compRecopaName')} · `
+                        : `${getTitleText(settings, 'compLigaName')} · `}
                       {activeChampion.season}
                     </div>
                     <div className="font-display text-xl font-bold text-silver-shiny truncate">
@@ -1256,7 +1275,7 @@ export function HomeView({
             <div className="bg-[#0B0D12]/95 border border-amber-400/45 rounded-2xl p-6 flex-1 flex flex-col justify-center items-center text-center gap-3 shadow-xl shadow-black/70">
               <Trophy className="w-8 h-8 text-amber-300" />
               <h2 className="font-display text-2xl font-bold text-gold-shiny">
-                Historial de Campeones
+                {getTitleText(settings, 'homeChampionsTitle')}
               </h2>
               <p className="text-xs text-zinc-300">
                 Subí la celebración oficial de los campeones de Liga y Copa de la Liga.
@@ -1281,7 +1300,7 @@ export function HomeView({
             <div className="flex items-center gap-2">
               <Star className="w-4 h-4 text-amber-300" />
               <h2 className="font-display text-2xl font-bold text-silver-shiny">
-                Video Más Destacado
+                {getTitleText(settings, 'homeFeaturedVideoTitle')}
               </h2>
             </div>
 
@@ -1386,7 +1405,7 @@ export function HomeView({
               <Flame className="w-4 h-4 text-amber-400 shrink-0" />
               <div className="min-w-0">
                 <h2 className="font-display text-2xl font-bold text-gold-shiny leading-none">
-                  Top 5 Mejores Goles
+                  {getTitleText(settings, 'homeTopGoalsTitle')}
                 </h2>
                 <p className="text-[11px] text-zinc-400 mt-0.5 truncate">
                   {sortedAdminTopGoals.length > 0
@@ -1608,10 +1627,10 @@ export function HomeView({
           <div className="px-6 py-4 border-b border-amber-400/30 flex items-center justify-between bg-gradient-to-r from-[#08090D] via-[#121620] to-[#08090D]">
             <div>
               <h2 className="font-display text-2xl font-bold text-gold-shiny">
-                Punteros del Torneo
+                {getTitleText(settings, 'homeLeadersTitle')}
               </h2>
               <p className="text-xs text-zinc-400">
-                Clasificación oficial actualizada tras cada validación
+                {getTitleText(settings, 'homeLeadersSubtitle')}
               </p>
             </div>
             <button
@@ -1684,7 +1703,7 @@ export function HomeView({
             <div className="flex items-center gap-2">
               <CalendarDays className="w-4 h-4 text-amber-300" />
               <h2 className="font-display text-2xl font-bold text-silver-shiny">
-                Últimos Resultados
+                {getTitleText(settings, 'homeRecentMatchesTitle')}
               </h2>
             </div>
             <button
@@ -1744,6 +1763,9 @@ export function HomeView({
       <section className="w-full">
         <CupBracketCard
           cup={cup}
+          teams={teams}
+          matches={matches}
+          settings={settings}
           isAdmin={user?.role === 'admin'}
           onEditCup={() => onNavigate('perfil', 'copa')}
           onGoToChampionsUpload={() => onNavigate('galeria', 'campeones')}
@@ -1759,10 +1781,10 @@ export function HomeView({
             <MessageSquare className="w-5 h-5 text-sky-400 shrink-0" />
             <div>
               <h2 className="font-display text-2xl font-bold text-albiceleste-shiny">
-                Comentarios de la Liga
+                {getTitleText(settings, 'homeCommentsTitle')}
               </h2>
               <p className="text-xs text-zinc-300">
-                Dejá tu mensaje para la comunidad. Solo el Administrador puede aprobar o eliminar comentarios.
+                {getTitleText(settings, 'homeCommentsSubtitle')}
               </p>
             </div>
           </div>
@@ -1950,7 +1972,7 @@ export function HomeView({
       <section className="p-6 bg-gradient-to-r from-[#08090D] via-[#121620] to-[#08090D] border border-amber-400/45 rounded-2xl flex flex-col md:flex-row items-center justify-between gap-5 shadow-xl shadow-black/70">
         <div className="text-center md:text-left">
           <h3 className="font-display text-2xl font-extrabold text-gold-shiny">
-            Siguenos en nuestras redes sociales. Gracias Te queremos.
+            {getTitleText(settings, 'homeSocialTitle')}
           </h3>
           <p className="text-xs text-zinc-300 mt-1">
             Sumate al grupo oficial, mirá los mejores resúmenes y enterate de todas las fechas.
@@ -2114,12 +2136,12 @@ export function HomeView({
                         {maximizedNews.championTeamName}
                       </span>
                     </div>
-                    <div className="md:col-span-8 relative aspect-[16/10] rounded-xl overflow-hidden border-2 border-zinc-950 bg-zinc-900">
+                    <div className="md:col-span-8 relative rounded-xl overflow-hidden border-2 border-zinc-950 bg-zinc-950 flex items-center justify-center">
                       <ResilientImage
                         src={maximizedNews.celebrationImageUrl || maximizedNews.imageUrl}
                         fallbackSrc={defaultChampImg}
                         alt={`Celebración ${maximizedNews.championTeamName || 'Campeón'}`}
-                        className="w-full h-full object-cover"
+                        className="w-full max-h-[55vh] object-contain mx-auto"
                         fallbackLabel="¡CAMPEÓN!"
                       />
                     </div>

@@ -10,23 +10,26 @@ import {
   Trophy,
   Upload,
 } from 'lucide-react';
-import {
-  addDoc,
-  collection,
-  deleteDoc,
-  doc,
-  serverTimestamp,
-} from 'firebase/firestore/lite';
 import defaultChampImg from '../assets/images/champion_celebration_default_1794642902876.jpg';
 import { resolveAssetUrl } from '../utils/assetUrl';
 import {
-  db,
-  formatFirestoreError,
-  notifyCommunityVideosChanged,
-  OperationType,
-} from '../firebase';
-import type { AuthUser, ChampionEntry, CommunityVideo, GalleryVideo } from '../types';
-import { apiFetch } from '../utils/api';
+  createChampionFirestore,
+  deleteChampionFirestore,
+  deleteCommunityVideoFirestore,
+  deleteOfficialVideoFirestore,
+  publishCommunityVideoFirestore,
+  saveFeaturedVideoFirestore,
+  toggleFeaturedOfficialVideoFirestore,
+} from '../services/firestoreLeague';
+import type {
+  AuthUser,
+  ChampionEntry,
+  CommunityVideo,
+  GalleryVideo,
+  LeagueSettings,
+} from '../types';
+import { uploadMediaFile } from '../utils/api';
+import { getTitleText } from '../utils/customTitles';
 import { ResilientImage } from './ResilientImage';
 
 const UPLOADCARE_PUBLIC_KEY = '2263e409db23d5990fee';
@@ -77,6 +80,7 @@ interface GalleryViewProps {
   firestoreError: string | null;
   featuredVideoId?: string;
   champions: ChampionEntry[];
+  settings?: LeagueSettings;
   user: AuthUser | null;
   initialSubTab?: 'videos' | 'campeones';
   onOpenAuth: () => void;
@@ -139,6 +143,7 @@ export function GalleryView({
   firestoreError,
   featuredVideoId,
   champions,
+  settings,
   user,
   initialSubTab = 'videos',
   onOpenAuth,
@@ -249,20 +254,18 @@ export function GalleryView({
     setPublishingVideo(true);
 
     try {
-      await addDoc(collection(db, 'videos_comunidad'), {
+      await publishCommunityVideoFirestore({
         titulo: cleanTitulo,
         autor: cleanAutor,
         videoUrl: uploadedVideoUrl,
-        fecha: serverTimestamp(),
       });
-      notifyCommunityVideosChanged();
       setTitulo('');
       setUploadedVideoUrl('');
       setUploadedFileName('');
       setVideoSuccess('¡Video publicado! Ya está disponible para toda la comunidad.');
       window.setTimeout(() => setVideoSuccess(null), 5000);
     } catch (err) {
-      setVideoError(formatFirestoreError(err, OperationType.CREATE, 'videos_comunidad'));
+      setVideoError(err instanceof Error ? err.message : 'No se pudo publicar el video.');
     } finally {
       setPublishingVideo(false);
     }
@@ -272,17 +275,14 @@ export function GalleryView({
     setVideoError(null);
     setFeaturingId(video.id);
     try {
-      await apiFetch('/api/admin/featured-video', {
-        method: 'PUT',
-        body: JSON.stringify({
-          id: video.id,
-          source: 'community',
-          title: video.titulo,
-          author: video.autor,
-          videoUrl: video.videoUrl,
-          downloadUrl: video.videoUrl,
-          fechaLabel: video.fechaLabel,
-        }),
+      await saveFeaturedVideoFirestore({
+        id: video.id,
+        source: 'community',
+        title: video.titulo,
+        author: video.autor,
+        videoUrl: video.videoUrl,
+        downloadUrl: video.videoUrl,
+        fechaLabel: video.fechaLabel,
       });
       await onRefresh();
       setVideoSuccess(`"${video.titulo}" ahora es el Video Destacado en la página de Inicio.`);
@@ -296,14 +296,10 @@ export function GalleryView({
 
   const handleDeleteCommunityVideo = async (id: string) => {
     try {
-      await deleteDoc(doc(db, 'videos_comunidad', id));
-      notifyCommunityVideosChanged();
-      if (featuredVideoId === id) {
-        await apiFetch('/api/admin/featured-video', { method: 'DELETE' }).catch(() => undefined);
-        await onRefresh();
-      }
+      await deleteCommunityVideoFirestore(id, featuredVideoId);
+      await onRefresh();
     } catch (err) {
-      setVideoError(formatFirestoreError(err, OperationType.DELETE, `videos_comunidad/${id}`));
+      setVideoError(err instanceof Error ? err.message : 'No se pudo eliminar el video.');
     }
   };
 
@@ -316,14 +312,15 @@ export function GalleryView({
     setChampError(null);
     setUploadingChamp(true);
     try {
-      const form = new FormData();
-      form.append('season', season);
-      form.append('teamName', teamName);
-      form.append('memberName', memberName);
-      form.append('tournamentType', tournamentType);
-      form.append('notes', champNotes);
-      form.append('celebrationImage', champFile);
-      await apiFetch('/api/champions', { method: 'POST', body: form });
+      const celebrationImageUrl = await uploadMediaFile('champions', champFile);
+      await createChampionFirestore({
+        season,
+        teamName,
+        memberName,
+        tournamentType,
+        notes: champNotes,
+        celebrationImageUrl,
+      });
       setSeason('');
       setTeamName('');
       setMemberName('');
@@ -340,18 +337,32 @@ export function GalleryView({
   };
 
   const handleDeleteVideo = async (id: string) => {
-    await apiFetch(`/api/admin/videos/${id}`, { method: 'DELETE' });
-    await onRefresh();
+    try {
+      await deleteOfficialVideoFirestore(id);
+      await onRefresh();
+    } catch (err) {
+      setVideoError(err instanceof Error ? err.message : 'No se pudo eliminar el video.');
+    }
   };
 
   const handleFeatureVideo = async (id: string) => {
-    await apiFetch(`/api/admin/videos/${id}/featured`, { method: 'PATCH' });
-    await onRefresh();
+    const vid = videos.find((v) => v.id === id);
+    if (!vid) return;
+    try {
+      await toggleFeaturedOfficialVideoFirestore(vid, videos);
+      await onRefresh();
+    } catch (err) {
+      setVideoError(err instanceof Error ? err.message : 'No se pudo destacar el video.');
+    }
   };
 
   const handleDeleteChampion = async (id: string) => {
-    await apiFetch(`/api/admin/champions/${id}`, { method: 'DELETE' });
-    await onRefresh();
+    try {
+      await deleteChampionFirestore(id);
+      await onRefresh();
+    } catch (err) {
+      setChampError(err instanceof Error ? err.message : 'No se pudo eliminar el campeón.');
+    }
   };
 
   return (
@@ -359,10 +370,10 @@ export function GalleryView({
       <div className="flex flex-col sm:flex-row sm:items-end justify-between gap-4">
         <div>
           <h1 className="font-display text-3xl sm:text-4xl font-extrabold text-albiceleste-shiny">
-            Galería y Historial de Campeones
+            {getTitleText(settings, 'galleryTitle')}
           </h1>
           <p className="mt-1 text-sm text-sky-200/85">
-            Subí tus jugadas exclusivamente en formato .MP4 con Uploadcare y mirá todos los videos en tiempo real. Solo el Administrador puede eliminar videos.
+            {getTitleText(settings, 'gallerySubtitle')}
           </p>
         </div>
 
@@ -389,7 +400,7 @@ export function GalleryView({
             }`}
           >
             <Trophy className="w-4 h-4" />
-            <span>Historial de Campeones</span>
+            <span>{getTitleText(settings, 'homeChampionsTitle')}</span>
           </button>
         </div>
       </div>
@@ -862,7 +873,7 @@ export function GalleryView({
                     src={champ.celebrationImageUrl}
                     fallbackSrc={defaultChampImg}
                     alt={`Festejo campeón ${champ.teamName}`}
-                    className="w-full h-full object-cover"
+                    className="w-full h-full object-contain"
                     fallbackLabel={champ.teamName}
                   />
                 </div>

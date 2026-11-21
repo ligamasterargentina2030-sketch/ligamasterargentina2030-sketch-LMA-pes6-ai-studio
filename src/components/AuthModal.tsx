@@ -1,5 +1,8 @@
 import { useEffect, useState, type FormEvent } from 'react';
 import { KeyRound, Mail, ShieldCheck, X } from 'lucide-react';
+import { signInWithPopup } from 'firebase/auth';
+import { auth, googleProvider } from '../firebase';
+import { resolveOrLinkFirebaseMember } from '../services/firestoreLeague';
 import type { AuthUser } from '../types';
 import { apiFetch, setStoredToken } from '../utils/api';
 import {
@@ -25,6 +28,7 @@ export function AuthModal({
   const [id, setId] = useState(prefillId || '');
   const [clave, setClave] = useState('');
   const [loading, setLoading] = useState(false);
+  const [googleLoading, setGoogleLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   // Admin-only recovery state
@@ -47,6 +51,48 @@ export function AuthModal({
   }, [prefillId]);
 
   if (!open) return null;
+
+  const handleGoogleSignIn = async () => {
+    setError(null);
+    setGoogleLoading(true);
+    try {
+      const cred = await signInWithPopup(auth, googleProvider);
+      const u = cred.user;
+      if (!u || !u.email) {
+        throw new Error('No se pudo obtener el correo de la cuenta de Google.');
+      }
+      const linked = await resolveOrLinkFirebaseMember(
+        u.uid,
+        u.email,
+        u.displayName || u.email
+      );
+      const authUser: AuthUser = {
+        id: linked?.id || u.uid,
+        role: linked?.role || 'member',
+        displayName: linked?.displayName || u.displayName || u.email,
+        teamId: linked?.teamId,
+        uid: u.uid,
+        email: u.email,
+        firebaseAuthenticated: true,
+      };
+      onSuccess(authUser);
+      setRecoveryOpen(false);
+      setResetSentMessage(null);
+      setRecoveryError(null);
+      onClose();
+    } catch (err) {
+      const code = (err as { code?: string })?.code || '';
+      if (code === 'auth/popup-closed-by-user') {
+        setError('Se cerró la ventana de acceso con Google antes de completar el ingreso.');
+      } else if (code === 'auth/popup-blocked') {
+        setError('El navegador bloqueó la ventana emergente de Google. Permití ventanas emergentes para este sitio.');
+      } else {
+        setError(err instanceof Error ? err.message : 'No se pudo iniciar sesión con Google.');
+      }
+    } finally {
+      setGoogleLoading(false);
+    }
+  };
 
   const handleSubmit = async (e: FormEvent) => {
     e.preventDefault();
@@ -117,20 +163,64 @@ export function AuthModal({
         </div>
 
         <div className="p-6 space-y-4">
+          {error && (
+            <div className="p-3 text-sm font-medium text-rose-200 bg-rose-950/60 border border-rose-500/40 rounded-lg leading-relaxed">
+              {error}
+            </div>
+          )}
+
+          {/* Acceso Principal Cloud Firestore via Google Firebase Auth */}
+          <div className="p-4 rounded-xl bg-[#05162B] border border-emerald-400/45 space-y-2.5">
+            <div className="text-xs font-semibold text-emerald-300 flex items-center gap-1.5">
+              <ShieldCheck className="w-4 h-4 shrink-0" />
+              <span>Acceso Oficial en la Nube (Cloud Firestore)</span>
+            </div>
+            <p className="text-[11px] text-sky-200/85 leading-relaxed">
+              Recomendado para Administrador y Miembros: permite guardar resultados, cambios, comentarios y sincronización en tiempo real en toda la liga.
+            </p>
+            <button
+              type="button"
+              onClick={handleGoogleSignIn}
+              disabled={googleLoading || loading}
+              className="w-full py-2.5 px-4 rounded-lg bg-white hover:bg-zinc-100 text-zinc-900 font-bold text-sm flex items-center justify-center gap-2.5 shadow-md transition-all disabled:opacity-60"
+            >
+              <svg viewBox="0 0 24 24" className="w-4 h-4 shrink-0" aria-hidden="true">
+                <path
+                  fill="#4285F4"
+                  d="M23.745 12.27c0-.7-.06-1.4-.19-2.07H12v4.51h6.6c-.29 1.52-1.14 2.82-2.4 3.68v3.05h3.88c2.27-2.09 3.665-5.17 3.665-9.17Z"
+                />
+                <path
+                  fill="#34A853"
+                  d="M12 24c3.24 0 5.95-1.08 7.93-2.91l-3.88-3.05c-1.08.72-2.45 1.16-4.05 1.16-3.12 0-5.77-2.11-6.72-4.96H1.29v3.14C3.26 21.3 7.37 24 12 24Z"
+                />
+                <path
+                  fill="#FBBC05"
+                  d="M5.28 14.24c-.24-.72-.38-1.49-.38-2.24s.14-1.52.38-2.24V6.62H1.29C.47 8.24 0 10.06 0 12s.47 3.76 1.29 5.38l3.99-3.14Z"
+                />
+                <path
+                  fill="#EA4335"
+                  d="M12 4.75c1.77 0 3.35.61 4.6 1.8l3.42-3.42C17.95 1.19 15.24 0 12 0 7.37 0 3.26 2.7 1.29 6.62l3.99 3.14c.95-2.85 3.6-4.96 6.72-4.96Z"
+                />
+              </svg>
+              <span>{googleLoading ? 'Conectando con Google...' : 'Ingresar con Google (Firebase Auth)'}</span>
+            </button>
+          </div>
+
+          <div className="relative flex items-center py-1">
+            <div className="flex-grow border-t border-amber-400/20" />
+            <span className="px-3 text-[11px] font-semibold text-sky-200/70 uppercase tracking-wider">
+              o acceso con ID y Clave
+            </span>
+            <div className="flex-grow border-t border-amber-400/20" />
+          </div>
+
           {staticHostingMode && (
             <div className="p-3 text-xs text-amber-100 bg-amber-950/60 border border-amber-400/50 rounded-lg leading-relaxed">
-              <strong>Aviso de conexión:</strong> La página cargó en modo estático sin conexión al servidor backend. Para iniciar sesión necesitás usar la URL pública con servidor activo o configurar{' '}
-              <code className="font-mono text-amber-200">VITE_API_BASE_URL</code>.
+              <strong>Modo estático detectado:</strong> Usá el botón <strong>Ingresar con Google</strong> de arriba para sincronizar tus datos directo en Cloud Firestore sin depender del servidor local.
             </div>
           )}
 
           <form onSubmit={handleSubmit} className="space-y-4">
-            {error && (
-              <div className="p-3 text-sm font-medium text-rose-200 bg-rose-950/60 border border-rose-500/40 rounded-lg leading-relaxed">
-                {error}
-              </div>
-            )}
-
             <div>
               <label
                 className="block text-xs font-semibold text-sky-200 mb-1.5"
@@ -179,8 +269,8 @@ export function AuthModal({
               </button>
               <button
                 type="submit"
-                disabled={loading}
-                className="px-6 py-2.5 text-sm font-bold tracking-wide btn-gold-luxury disabled:opacity-60 rounded-lg"
+                disabled={loading || googleLoading}
+                className="px-6 py-2.5 text-sm font-bold btn-gold-luxury disabled:opacity-60 rounded-lg"
               >
                 {loading ? 'VERIFICANDO...' : 'INGRESAR'}
               </button>

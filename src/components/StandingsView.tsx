@@ -1,8 +1,16 @@
 import { useEffect, useMemo, useRef, useState, type FormEvent } from 'react';
-import { Crown, Edit3, Plus, Search, Shield, Trash2, Trophy, Upload, X } from 'lucide-react';
-import type { AuthUser, PublicTeam, StandingRow } from '../types';
-import { apiFetch } from '../utils/api';
+import { Check, Crown, Edit3, Plus, Search, Shield, Trash2, Trophy, Upload, X } from 'lucide-react';
+import {
+  awardLeagueChampionFirestore,
+  createTeamFirestore,
+  deleteTeamFirestore,
+  saveSettingsFirestore,
+  updateTeamFirestore,
+} from '../services/firestoreLeague';
+import type { AuthUser, LeagueSettings, PublicTeam, StandingRow } from '../types';
+import { uploadMediaFile } from '../utils/api';
 import { resolveAssetUrl } from '../utils/assetUrl';
+import { getTitleText, sanitizeCustomTitles } from '../utils/customTitles';
 import { ResilientImage } from './ResilientImage';
 
 const LIGA_TROPHY_IMG = resolveAssetUrl('/assets/aistudio/Trofeo_Liga_Argentina_LMA.jpg');
@@ -10,6 +18,7 @@ const LIGA_TROPHY_IMG = resolveAssetUrl('/assets/aistudio/Trofeo_Liga_Argentina_
 interface StandingsViewProps {
   standings: StandingRow[];
   maxTeams: number;
+  settings?: LeagueSettings;
   user: AuthUser | null;
   onOpenAuth: () => void;
   onRefresh: () => Promise<void>;
@@ -28,6 +37,7 @@ function getNextSuggestedId(standings: StandingRow[]): string {
 export function StandingsView({
   standings,
   maxTeams,
+  settings,
   user,
   onOpenAuth,
   onRefresh,
@@ -38,7 +48,7 @@ export function StandingsView({
 
   const suggestedId = useMemo(() => getNextSuggestedId(standings), [standings]);
   const [newId, setNewId] = useState(suggestedId);
-  const [newClave, setNewClave] = useState(suggestedId.toLowerCase());
+  const [newMemberEmail, setNewMemberEmail] = useState('');
   const [newTeamName, setNewTeamName] = useState('');
   const [newMemberName, setNewMemberName] = useState('');
   const [newCrestFile, setNewCrestFile] = useState<File | null>(null);
@@ -56,10 +66,26 @@ export function StandingsView({
   const [savingEdit, setSavingEdit] = useState(false);
   const [crowningLeader, setCrowningLeader] = useState(false);
 
+  // Quick inline editor for Season League Name & Standings Title (Admin)
+  const [editingLeagueName, setEditingLeagueName] = useState(false);
+  const [leagueNameDraft, setLeagueNameDraft] = useState(getTitleText(settings, 'compLigaName'));
+  const [standingsTitleDraft, setStandingsTitleDraft] = useState(
+    getTitleText(settings, 'standingsTitle')
+  );
+  const [savingLeagueName, setSavingLeagueName] = useState(false);
+  const [uploadingTrophy, setUploadingTrophy] = useState(false);
+  const ligaTrophyInputRef = useRef<HTMLInputElement | null>(null);
+
+  useEffect(() => {
+    if (!editingLeagueName) {
+      setLeagueNameDraft(getTitleText(settings, 'compLigaName'));
+      setStandingsTitleDraft(getTitleText(settings, 'standingsTitle'));
+    }
+  }, [settings, editingLeagueName]);
+
   useEffect(() => {
     if (!showAddForm) {
       setNewId(suggestedId);
-      setNewClave(suggestedId.toLowerCase());
     }
   }, [suggestedId, showAddForm]);
 
@@ -101,30 +127,23 @@ export function StandingsView({
     setFormMsg(null);
     setSaving(true);
     try {
-      const form = new FormData();
-      form.append('id', newId.trim());
-      form.append('clave', newClave.trim());
-      form.append('name', newTeamName.trim());
-      form.append('memberName', newMemberName.trim());
-      if (newCrestFile) {
-        form.append('crest', newCrestFile);
-      }
-      const data = await apiFetch<{ team: PublicTeam; generatedClave?: string }>('/api/admin/teams', {
-        method: 'POST',
-        body: form,
+      const crestUrl = newCrestFile ? await uploadMediaFile('crests', newCrestFile) : undefined;
+      const created = await createTeamFirestore({
+        id: newId.trim() || suggestedId,
+        name: newTeamName.trim() || newMemberName.trim(),
+        memberName: newMemberName.trim(),
+        crestUrl,
+        linkedEmail: newMemberEmail.trim() || undefined,
       });
-      const assignedPass = data?.generatedClave || newClave.trim();
       setNewTeamName('');
       setNewMemberName('');
+      setNewMemberEmail('');
       setNewCrestFile(null);
       if (fileInputRef.current) fileInputRef.current.value = '';
       await onRefresh();
-      const created = data?.team;
       setFormMsg({
         type: 'ok',
-        text: created
-          ? `Participante "${created.memberName}" (${created.name} · ID: ${created.id}${assignedPass ? ` · Contraseña inicial: ${assignedPass}` : ''}) creado y publicado en la Tabla de Posiciones.`
-          : 'Equipo y participante agregados y publicados en la Tabla de Posiciones.',
+        text: `Participante "${created.memberName}" (${created.name} · ID: ${created.id}) creado y publicado en la Tabla de Posiciones.`,
       });
     } catch (err) {
       setFormMsg({
@@ -150,13 +169,12 @@ export function StandingsView({
     setSavingEdit(true);
     setFormMsg(null);
     try {
-      const form = new FormData();
-      form.append('name', editTeamName.trim());
-      form.append('memberName', editMemberName.trim());
-      if (editCrestFile) {
-        form.append('crest', editCrestFile);
-      }
-      await apiFetch(`/api/admin/teams/${editingTeam.id}`, { method: 'PUT', body: form });
+      const crestUrl = editCrestFile ? await uploadMediaFile('crests', editCrestFile) : undefined;
+      await updateTeamFirestore(editingTeam.id, {
+        name: editTeamName.trim(),
+        memberName: editMemberName.trim(),
+        ...(crestUrl ? { crestUrl } : {}),
+      });
       setEditingTeam(null);
       setEditCrestFile(null);
       await onRefresh();
@@ -175,10 +193,20 @@ export function StandingsView({
   };
 
   const handleDeleteTeam = async (team: PublicTeam) => {
-    await apiFetch(`/api/admin/teams/${team.id}`, { method: 'DELETE' });
-    await onRefresh();
+    try {
+      await deleteTeamFirestore(team.id);
+      await onRefresh();
+    } catch (err) {
+      setFormMsg({
+        type: 'err',
+        text: err instanceof Error ? err.message : 'No se pudo eliminar el equipo.',
+      });
+    }
   };
 
+  const effectiveMaxTeams = maxTeams > 50 ? maxTeams : 100;
+  const activeLigaName = getTitleText(settings, 'compLigaName');
+  const activeLigaTrophyImg = resolveAssetUrl(settings?.ligaTrophyUrl || LIGA_TROPHY_IMG);
   const leaderRow = standings[0];
 
   const handleCrownLeagueChampion = async () => {
@@ -186,14 +214,15 @@ export function StandingsView({
     setCrowningLeader(true);
     setFormMsg(null);
     try {
-      await apiFetch('/api/admin/award-league-champion', {
-        method: 'POST',
-        body: JSON.stringify({ teamId: leaderRow.team.id }),
+      await awardLeagueChampionFirestore({
+        team: leaderRow.team,
+        season: activeLigaName,
+        trophyImageUrl: settings?.ligaTrophyUrl || undefined,
       });
       await onRefresh();
       setFormMsg({
         type: 'ok',
-        text: `¡${leaderRow.team.name} (${leaderRow.team.memberName}) fue coronado Campeón de la Liga Argentina! El trofeo oficial se cargó automáticamente en su perfil.`,
+        text: `¡${leaderRow.team.name} (${leaderRow.team.memberName}) fue coronado Campeón de ${activeLigaName}! El trofeo oficial se cargó automáticamente en su perfil.`,
       });
     } catch (err) {
       setFormMsg({
@@ -205,36 +234,178 @@ export function StandingsView({
     }
   };
 
+  const handleSaveLeagueName = async (e: FormEvent) => {
+    e.preventDefault();
+    const cleanLiga = leagueNameDraft.trim();
+    const cleanTitle = standingsTitleDraft.trim();
+    if (!cleanLiga || !cleanTitle) return;
+    setSavingLeagueName(true);
+    setFormMsg(null);
+    try {
+      await saveSettingsFirestore({
+        customTitles: sanitizeCustomTitles({
+          ...(settings?.customTitles || {}),
+          compLigaName: cleanLiga,
+          standingsTitle: cleanTitle,
+        }),
+      });
+      setEditingLeagueName(false);
+      await onRefresh();
+      setFormMsg({
+        type: 'ok',
+        text: `Nombre de la liga actualizado a "${cleanLiga}" en tiempo real para todos los miembros.`,
+      });
+    } catch (err) {
+      setFormMsg({
+        type: 'err',
+        text: err instanceof Error ? err.message : 'No se pudo guardar el nombre de la liga.',
+      });
+    } finally {
+      setSavingLeagueName(false);
+    }
+  };
+
+  const handleUploadLigaTrophy = async (file: File | null) => {
+    if (!file) return;
+    setUploadingTrophy(true);
+    setFormMsg(null);
+    try {
+      const url = await uploadMediaFile('site', file);
+      await saveSettingsFirestore({ ligaTrophyUrl: url });
+      await onRefresh();
+      setFormMsg({
+        type: 'ok',
+        text: 'Foto oficial del Trofeo de Liga actualizada en Cloud Firestore para todos.',
+      });
+    } catch (err) {
+      setFormMsg({
+        type: 'err',
+        text: err instanceof Error ? err.message : 'No se pudo cambiar la foto del trofeo.',
+      });
+    } finally {
+      setUploadingTrophy(false);
+      if (ligaTrophyInputRef.current) ligaTrophyInputRef.current.value = '';
+    }
+  };
+
   return (
     <div className="space-y-6">
-      {/* Trofeo Oficial de la Liga Argentina arriba de la Tabla de Posiciones */}
+      {/* Trofeo Oficial de la Liga arriba de la Tabla de Posiciones */}
       <section className="relative overflow-hidden rounded-2xl border-2 border-amber-400/65 bg-gradient-to-r from-[#070B12]/96 via-[#0C1D36]/96 to-[#070B12]/96 shadow-[0_18px_45px_rgba(0,0,0,0.85)]">
         <div className="h-1.5 w-full albiceleste-ribbon" aria-hidden="true" />
         <div className="p-5 sm:p-6 flex flex-col md:flex-row items-center gap-6">
-          <div className="relative shrink-0">
-            <div className="w-32 h-40 sm:w-36 sm:h-44 rounded-2xl overflow-hidden border-2 border-amber-400/80 shadow-[0_0_28px_rgba(250,204,21,0.38)] bg-[#04080F]">
-              <ResilientImage
-                src={LIGA_TROPHY_IMG}
-                alt="Trofeo Oficial Liga Master Argentina"
-                className="w-full h-full object-cover object-center"
-                fallbackLabel="LMA"
-              />
+          <div className="relative shrink-0 flex flex-col items-center gap-2">
+            <div className="relative">
+              <div className="w-32 h-40 sm:w-36 sm:h-44 rounded-2xl overflow-hidden border-2 border-amber-400/80 shadow-[0_0_28px_rgba(250,204,21,0.38)] bg-[#04080F] p-1">
+                <ResilientImage
+                  src={activeLigaTrophyImg}
+                  alt={`Trofeo Oficial ${activeLigaName}`}
+                  className="w-full h-full object-contain object-center"
+                  fallbackLabel="LMA"
+                />
+              </div>
+              <div className="absolute -bottom-2.5 left-1/2 -translate-x-1/2 px-2.5 py-0.5 rounded-md bg-amber-400 text-[#07090D] font-mono text-[10px] font-extrabold uppercase tracking-wider shadow-lg whitespace-nowrap">
+                Trofeo Oficial
+              </div>
             </div>
-            <div className="absolute -bottom-2.5 left-1/2 -translate-x-1/2 px-2.5 py-0.5 rounded-md bg-amber-400 text-[#07090D] font-mono text-[10px] font-extrabold uppercase tracking-wider shadow-lg whitespace-nowrap">
-              Trofeo Oficial
-            </div>
+            {isAdmin && (
+              <label className="mt-2 inline-flex items-center gap-1 px-2.5 py-1 text-[11px] font-semibold text-amber-200 bg-amber-500/15 hover:bg-amber-500/25 border border-amber-400/45 rounded-lg cursor-pointer transition-colors">
+                <Upload className="w-3 h-3" />
+                <span>{uploadingTrophy ? 'Subiendo...' : 'Cambiar foto'}</span>
+                <input
+                  ref={ligaTrophyInputRef}
+                  type="file"
+                  accept="image/*"
+                  disabled={uploadingTrophy}
+                  onChange={(e) => void handleUploadLigaTrophy(e.target.files?.[0] || null)}
+                  className="hidden"
+                />
+              </label>
+            )}
           </div>
 
           <div className="flex-1 text-center md:text-left space-y-2 min-w-0">
             <div className="inline-flex items-center gap-1.5 text-xs font-bold text-amber-300 uppercase tracking-wider">
               <Trophy className="w-4 h-4 text-amber-400" />
-              <span>Campeonato Oficial · Primera División</span>
+              <span>{getTitleText(settings, 'standingsBadge')}</span>
             </div>
-            <h1 className="font-display text-3xl sm:text-4xl font-extrabold text-lma-brand">
-              Tabla de Posiciones · Liga Argentina
-            </h1>
+
+            {editingLeagueName && isAdmin ? (
+              <form
+                onSubmit={handleSaveLeagueName}
+                className="p-3.5 rounded-xl bg-[#041224]/95 border border-amber-400/60 space-y-2.5 text-left max-w-xl"
+              >
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+                  <div>
+                    <label className="block text-[11px] font-semibold text-amber-200 mb-1">
+                      Nombre de la Liga (Temporada Actual)
+                    </label>
+                    <input
+                      type="text"
+                      required
+                      value={leagueNameDraft}
+                      onChange={(e) => {
+                        const val = e.target.value;
+                        setLeagueNameDraft(val);
+                        setStandingsTitleDraft(`Tabla de Posiciones · ${val}`);
+                      }}
+                      placeholder="Ej: Liga Inglesa / Liga Argentina"
+                      className="w-full px-3 py-1.5 text-xs bg-[#071D38] text-white border border-amber-400/50 rounded-lg"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-[11px] font-semibold text-sky-200 mb-1">
+                      Título de Encabezado en Posiciones
+                    </label>
+                    <input
+                      type="text"
+                      required
+                      value={standingsTitleDraft}
+                      onChange={(e) => setStandingsTitleDraft(e.target.value)}
+                      placeholder="Tabla de Posiciones · ..."
+                      className="w-full px-3 py-1.5 text-xs bg-[#071D38] text-white border border-amber-400/50 rounded-lg"
+                    />
+                  </div>
+                </div>
+                <div className="flex items-center justify-end gap-2">
+                  <button
+                    type="button"
+                    onClick={() => setEditingLeagueName(false)}
+                    className="px-3 py-1 text-xs font-semibold text-sky-200 bg-[#0A294E] hover:bg-[#0D3464] rounded-lg"
+                  >
+                    Cancelar
+                  </button>
+                  <button
+                    type="submit"
+                    disabled={savingLeagueName}
+                    className="inline-flex items-center gap-1 px-3 py-1 text-xs font-bold btn-gold-luxury rounded-lg disabled:opacity-60"
+                  >
+                    <Check className="w-3.5 h-3.5" />
+                    <span>{savingLeagueName ? 'Guardando...' : 'Guardar Nombre'}</span>
+                  </button>
+                </div>
+              </form>
+            ) : (
+              <div className="flex flex-wrap items-center justify-center md:justify-start gap-2.5">
+                <h1 className="font-display text-3xl sm:text-4xl font-extrabold text-lma-brand">
+                  {getTitleText(settings, 'standingsTitle')}
+                </h1>
+                {isAdmin && (
+                  <button
+                    type="button"
+                    onClick={() => setEditingLeagueName(true)}
+                    className="inline-flex items-center gap-1 px-2.5 py-1 text-[11px] font-semibold text-amber-200 bg-amber-400/15 hover:bg-amber-400/25 border border-amber-400/50 rounded-lg transition-colors"
+                    title="Editar nombre de la liga esta temporada"
+                  >
+                    <Edit3 className="w-3 h-3" />
+                    <span>Editar liga</span>
+                  </button>
+                )}
+              </div>
+            )}
+
             <p className="text-xs sm:text-sm text-sky-100/85 max-w-2xl">
-              {standings.length} de {maxTeams} clubes en competencia · Del 1° al 16° clasifican a la Copa de la Liga · Quien salga Campeón recibe automáticamente el Trofeo de la Liga en su perfil.
+              {standings.length} de {effectiveMaxTeams} clubes en competencia · Del 1° al 16° clasifican a la {getTitleText(settings, 'compCopaName')} · Quien salga Campeón recibe automáticamente el Trofeo de {activeLigaName} en su perfil.
             </p>
 
             {leaderRow && (
@@ -268,7 +439,7 @@ export function StandingsView({
                     disabled={crowningLeader}
                     onClick={handleCrownLeagueChampion}
                     className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-bold btn-gold-luxury rounded-xl disabled:opacity-60"
-                    title="Otorgar automáticamente el Trofeo Oficial de Liga Argentina al #1 de la tabla"
+                    title={`Otorgar automáticamente el Trofeo Oficial de ${activeLigaName} al #1 de la tabla`}
                   >
                     <Trophy className="w-3.5 h-3.5" />
                     <span>
@@ -349,7 +520,7 @@ export function StandingsView({
           <div className="flex items-center justify-between gap-2">
             <div>
               <h2 className="font-display text-2xl font-bold text-albiceleste-shiny">
-                Agregar Miembro y Publicar Equipo en la Tabla ({standings.length}/{maxTeams})
+                Agregar Miembro y Publicar Equipo en la Tabla ({standings.length}/{effectiveMaxTeams})
               </h2>
               <p className="text-xs text-sky-200/80">
                 Subí el escudo PNG (se ajusta automáticamente a 128x128), completá equipo y miembro, y publicalo al instante.
@@ -407,13 +578,13 @@ export function StandingsView({
 
             <div className="lg:col-span-2">
               <label className="block text-xs font-semibold text-amber-200/90 mb-1">
-                Clave de acceso (auto)
+                Correo Google (invitación)
               </label>
               <input
-                type="text"
-                value={newClave}
-                onChange={(e) => setNewClave(e.target.value)}
-                placeholder="Auto (Ej: pes611)"
+                type="email"
+                value={newMemberEmail}
+                onChange={(e) => setNewMemberEmail(e.target.value)}
+                placeholder="opcional@gmail.com"
                 className="w-full px-3 py-2 text-sm bg-[#041224] text-white border border-amber-400/40 rounded-lg focus:outline-none focus:ring-2 focus:ring-sky-300"
               />
             </div>
@@ -444,7 +615,7 @@ export function StandingsView({
           <div className="flex justify-end pt-1">
             <button
               type="submit"
-              disabled={saving || standings.length >= maxTeams}
+              disabled={saving || standings.length >= effectiveMaxTeams}
               className="inline-flex items-center gap-2 px-5 py-2.5 text-sm btn-gold-luxury disabled:opacity-50 rounded-xl"
             >
               <Upload className="w-4 h-4" />

@@ -10,13 +10,28 @@ import {
   Trophy,
   X,
 } from 'lucide-react';
-import type { CupMatchNode, CupRound, CupTournament } from '../types';
-import { apiFetch } from '../utils/api';
+import type {
+  CupMatchNode,
+  CupRound,
+  CupTournament,
+  LeagueSettings,
+  Match,
+  PublicTeam,
+} from '../types';
+import {
+  saveCupFirestore,
+  updateCupMatchNodeFirestore,
+  updateCupRecopaFirestore,
+} from '../services/firestoreLeague';
 import { resolveAssetUrl } from '../utils/assetUrl';
+import { getTitleText } from '../utils/customTitles';
 import { ResilientImage } from './ResilientImage';
 
 interface CupBracketCardProps {
   cup: CupTournament;
+  teams?: PublicTeam[];
+  matches?: Match[];
+  settings?: LeagueSettings;
   isAdmin: boolean;
   embeddedPreview?: boolean;
   onEditCup: () => void;
@@ -381,6 +396,9 @@ function MatchSlotBox({
 
 export function CupBracketCard({
   cup,
+  teams = [],
+  matches = [],
+  settings,
   isAdmin,
   embeddedPreview = false,
   onEditCup,
@@ -411,13 +429,13 @@ export function CupBracketCard({
   const handleSelectWinner = async (matchId: string, slot: number | null) => {
     setBusyMatchId(matchId);
     try {
-      await apiFetch(`/api/admin/cup/matches/${encodeURIComponent(matchId)}`, {
-        method: 'PUT',
-        body: JSON.stringify({
-          winnerSlot: slot,
-          played: slot !== null,
-        }),
-      });
+      await updateCupMatchNodeFirestore(
+        cup,
+        matchId,
+        { winnerSlot: slot, played: slot !== null },
+        teams,
+        matches
+      );
       await onRefresh();
     } finally {
       setBusyMatchId(null);
@@ -431,13 +449,13 @@ export function CupBracketCard({
   ) => {
     setBusyMatchId(matchId);
     try {
-      await apiFetch(`/api/admin/cup/matches/${encodeURIComponent(matchId)}`, {
-        method: 'PUT',
-        body: JSON.stringify({
-          homeGoals,
-          awayGoals,
-        }),
-      });
+      await updateCupMatchNodeFirestore(
+        cup,
+        matchId,
+        { homeGoals, awayGoals, played: homeGoals !== null && awayGoals !== null },
+        teams,
+        matches
+      );
       await onRefresh();
     } finally {
       setBusyMatchId(null);
@@ -447,10 +465,7 @@ export function CupBracketCard({
   const handleSelectRecopaWinner = async (side: 'league' | 'cup' | null) => {
     setBusyRecopa(true);
     try {
-      await apiFetch('/api/admin/cup/recopa', {
-        method: 'PUT',
-        body: JSON.stringify({ grandChampionSide: side }),
-      });
+      await updateCupRecopaFirestore(cup, { grandChampionSide: side }, teams, matches);
       await onRefresh();
     } finally {
       setBusyRecopa(false);
@@ -462,11 +477,15 @@ export function CupBracketCard({
     if (!winnerNameInput.trim()) return;
     setSavingWinner(true);
     try {
-      const form = new FormData();
-      form.append('status', 'finished');
-      form.append('championTeamName', winnerNameInput.trim());
-      form.append('championMemberName', winnerMemberInput.trim() || 'Campeón de Copa');
-      await apiFetch('/api/admin/cup/settings', { method: 'PUT', body: form });
+      const draft: CupTournament = JSON.parse(JSON.stringify(cup)) as CupTournament;
+      draft.status = 'finished';
+      draft.championTeamName = winnerNameInput.trim();
+      draft.championMemberName = winnerMemberInput.trim() || 'Campeón de Copa';
+      if (draft.recopa) {
+        draft.recopa.cupChampionName = draft.championTeamName;
+        draft.recopa.cupChampionMember = draft.championMemberName;
+      }
+      await saveCupFirestore(draft, teams, matches, 'Guardar campeón de Copa');
       setEditingWinnerInline(false);
       await onRefresh();
     } finally {
@@ -560,17 +579,17 @@ export function CupBracketCard({
                   : 'bg-[#05162B] border-amber-400/55'
               }`}
             >
-              <div className="w-24 h-24 sm:w-28 sm:h-28 mx-auto rounded-xl overflow-hidden border-2 border-amber-300/65 bg-[#041224] shadow-[0_8px_24px_rgba(251,191,36,0.28)]">
+              <div className="w-24 h-24 sm:w-28 sm:h-28 mx-auto rounded-xl overflow-hidden border-2 border-amber-300/65 bg-[#041224] p-1 shadow-[0_8px_24px_rgba(251,191,36,0.28)]">
                 <ResilientImage
-                  src={CUP_TROPHY_IMG}
-                  alt="Trofeo 3D Copa de la Liga"
-                  className="w-full h-full object-cover"
+                  src={resolveAssetUrl(settings?.copaTrophyUrl || CUP_TROPHY_IMG)}
+                  alt={`Trofeo ${getTitleText(settings, 'compCopaName')}`}
+                  className="w-full h-full object-contain"
                   fallbackLabel="COPA 3D"
                 />
               </div>
 
               <div className="font-display text-lg font-extrabold tracking-wide uppercase text-albiceleste-shiny">
-                Copa de la Liga
+                {getTitleText(settings, 'compCopaName')}
               </div>
 
               {cupFinished ? (
@@ -757,20 +776,22 @@ export function CupBracketCard({
         <div className="grid grid-cols-1 md:grid-cols-12 gap-4 items-center">
           {/* 3D Recopa Trophy */}
           <div className="md:col-span-3 flex items-center gap-3">
-            <div className="w-20 h-20 rounded-xl overflow-hidden border-2 border-amber-300/65 bg-[#041224] shrink-0 shadow-[0_8px_22px_rgba(251,191,36,0.3)]">
+            <div className="w-20 h-20 rounded-xl overflow-hidden border-2 border-amber-300/65 bg-[#041224] p-1 shrink-0 shadow-[0_8px_22px_rgba(251,191,36,0.3)]">
               <ResilientImage
-                src={RECOPA_TROPHY_IMG}
-                alt="Trofeo 3D Recopa Argentina"
-                className="w-full h-full object-cover"
+                src={resolveAssetUrl(settings?.recopaTrophyUrl || RECOPA_TROPHY_IMG)}
+                alt={`Trofeo ${getTitleText(settings, 'compRecopaName')}`}
+                className="w-full h-full object-contain"
                 fallbackLabel="RECOPA 3D"
               />
             </div>
             <div>
               <div className="inline-flex items-center gap-1 text-xs font-bold text-amber-300 uppercase tracking-wider">
                 <Crown className="w-3.5 h-3.5" />
-                <span>Recopa</span>
+                <span>{getTitleText(settings, 'compRecopaName')}</span>
               </div>
-              <div className="text-sm font-bold text-albiceleste-shiny">Campeón de Liga vs Copa</div>
+              <div className="text-sm font-bold text-albiceleste-shiny">
+                {getTitleText(settings, 'compRecopaSubtitle')}
+              </div>
               <div className="text-[11px] text-sky-200/80">Gran Final Única</div>
             </div>
           </div>

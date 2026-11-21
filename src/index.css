@@ -306,6 +306,24 @@
   will-change: transform;
 }
 
+/* Escudo intro crece suavemente hasta abrir la cortina (solo GPU transform) */
+@keyframes lma-intro-shield-grow {
+  0% {
+    transform: scale(0.32);
+  }
+  55% {
+    transform: scale(0.84);
+  }
+  100% {
+    transform: scale(1.18);
+  }
+}
+
+.lma-intro-shield-grow {
+  animation: lma-intro-shield-grow 7.35s cubic-bezier(0.22, 1, 0.36, 1) forwards;
+  will-change: transform;
+}
+
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after {
     animation-duration: 0.01ms !important;

@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
-import { Menu, X } from 'lucide-react';
+import { onAuthStateChanged, signOut } from 'firebase/auth';
+import { CheckCircle2, Loader2, Menu, ShieldAlert, X } from 'lucide-react';
 import { AuthModal } from './components/AuthModal';
 import { CalendarView } from './components/CalendarView';
 import { CupBracketCard } from './components/CupBracketCard';
@@ -16,10 +17,28 @@ import { PWAInstallButton } from './components/PWAInstallButton';
 import { ResetPasswordView } from './components/ResetPasswordView';
 import { RulesView } from './components/RulesView';
 import { StandingsView } from './components/StandingsView';
-import type { AuthUser, LastListenedTrack, LeagueBootstrap } from './types';
+import { auth } from './firebase';
+import {
+  ensureDailyBackupIfNeeded,
+  ensureInitialFirestoreSeed,
+  resolveOrLinkFirebaseMember,
+  saveUserMusicModeFirestore,
+  subscribeLeagueRealtime,
+  subscribeSaveStatus,
+  toggleAtomicLikeFirestore,
+  updateTeamLastSongFirestore,
+  type RealtimeLeagueSlice,
+} from './services/firestoreLeague';
+import type {
+  AuthUser,
+  LastListenedTrack,
+  LeagueBootstrap,
+  SaveConfirmationStatus,
+} from './types';
 import { useCommunityVideos } from './hooks/useCommunityVideos';
-import { apiFetch, resolveApiUrl, setStoredToken } from './utils/api';
+import { apiFetch, setStoredToken } from './utils/api';
 import { buildInlineTeamCrestSvg, resolveAssetUrl } from './utils/assetUrl';
+import { getTitleText } from './utils/customTitles';
 import { computeStandings } from './utils/standings';
 
 const DEFAULT_ICON = resolveAssetUrl(
@@ -99,9 +118,18 @@ function hydrateStaticCrests(payload: LeagueBootstrap): LeagueBootstrap {
 }
 
 export default function App() {
-  const [data, setData] = useState<LeagueBootstrap | null>(null);
+  const [fallbackBootstrap, setFallbackBootstrap] = useState<LeagueBootstrap | null>(null);
+  const [realtimeSlice, setRealtimeSlice] = useState<RealtimeLeagueSlice>({
+    checked: false,
+    seeded: false,
+  });
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState<string | null>(null);
+  const [saveStatus, setSaveStatus] = useState<SaveConfirmationStatus>({ state: 'idle', message: '' });
+
+  const [firebaseUser, setFirebaseUser] = useState<AuthUser | null>(null);
+  const [legacyUser, setLegacyUser] = useState<AuthUser | null>(null);
+  const [authReady, setAuthReady] = useState(false);
 
   const [showIntro, setShowIntro] = useState(true);
   const [introContentReady, setIntroContentReady] = useState(false);
@@ -127,29 +155,10 @@ export default function App() {
   );
   const [staticHostingMode, setStaticHostingMode] = useState(false);
   const [viewingTeamId, setViewingTeamId] = useState<string | null>(null);
-  const [pageLiked, setPageLiked] = useState<boolean>(() => {
-    try {
-      return localStorage.getItem('lma_page_liked') === '1';
-    } catch {
-      return false;
-    }
-  });
-  const [likedTeams, setLikedTeams] = useState<Record<string, boolean>>(() => {
-    try {
-      const raw = localStorage.getItem('lma_liked_teams');
-      return raw ? (JSON.parse(raw) as Record<string, boolean>) : {};
-    } catch {
-      return {};
-    }
-  });
-  const [likedNews, setLikedNews] = useState<Record<string, boolean>>(() => {
-    try {
-      const raw = localStorage.getItem('lma_liked_news');
-      return raw ? (JSON.parse(raw) as Record<string, boolean>) : {};
-    } catch {
-      return {};
-    }
-  });
+
+  useEffect(() => {
+    return subscribeSaveStatus((st) => setSaveStatus(st));
+  }, []);
 
   useEffect(() => {
     if (resetPageState.active) {
@@ -191,7 +200,53 @@ export default function App() {
 
   const { communityVideos, loadingCommunity, firestoreError } = useCommunityVideos();
 
-  const fetchBootstrap = useCallback(async () => {
+  // Firebase Auth listener
+  useEffect(() => {
+    const unsub = onAuthStateChanged(auth, async (u) => {
+      if (!u || !u.email) {
+        setFirebaseUser(null);
+        setAuthReady(true);
+        return;
+      }
+      try {
+        const linked = await resolveOrLinkFirebaseMember(
+          u.uid,
+          u.email,
+          u.displayName || u.email
+        );
+        const resolved: AuthUser = {
+          id: linked?.id || u.uid,
+          role: linked?.role || 'member',
+          displayName: linked?.displayName || u.displayName || u.email,
+          teamId: linked?.teamId,
+          uid: u.uid,
+          email: u.email,
+          firebaseAuthenticated: true,
+        };
+        setFirebaseUser(resolved);
+        if (resolved.role === 'admin' && u.emailVerified) {
+          void ensureInitialFirestoreSeed()
+            .then(() => ensureDailyBackupIfNeeded())
+            .catch(() => undefined);
+        }
+      } catch (err) {
+        setLoadError(err instanceof Error ? err.message : 'No se pudo validar tu cuenta.');
+        setFirebaseUser(null);
+      } finally {
+        setAuthReady(true);
+      }
+    });
+    return () => unsub();
+  }, []);
+
+  const effectiveUser = useMemo<AuthUser | null>(() => {
+    if (firebaseUser) return firebaseUser;
+    if (legacyUser) return legacyUser;
+    return fallbackBootstrap?.user || null;
+  }, [firebaseUser, legacyUser, fallbackBootstrap?.user]);
+
+  // Read-only fallback bootstrap ONLY if Firestore is not seeded yet
+  const fetchBootstrapFallback = useCallback(async () => {
     try {
       const payload = await apiFetch<LeagueBootstrap>('/api/bootstrap');
       if (
@@ -203,80 +258,132 @@ export default function App() {
       ) {
         throw new Error('Datos de la liga incompletos.');
       }
-      setData(payload);
+      if (payload.user) {
+        setLegacyUser(payload.user);
+      }
+      setFallbackBootstrap(payload);
       setStaticHostingMode(false);
       setLoadError(null);
     } catch (err) {
-      // Static GitHub Pages fallback when Express API server is not running
-      try {
-        const staticRes = await fetch(resolveAssetUrl('/static-bootstrap.json'), {
-          cache: 'no-store',
-        });
-        if (staticRes.ok) {
-          const staticPayload = (await staticRes.json()) as LeagueBootstrap;
-          if (
-            staticPayload &&
-            Array.isArray(staticPayload.teams) &&
-            Array.isArray(staticPayload.matches) &&
-            staticPayload.settings &&
-            staticPayload.cup
-          ) {
-            setData(hydrateStaticCrests(staticPayload));
-            setStaticHostingMode(true);
-            setLoadError(null);
-            return;
+      const errorMsg = err instanceof Error ? err.message : '';
+      const isStaticFallbackEligible =
+        typeof window !== 'undefined' &&
+        (window.location.hostname.endsWith('github.io') || errorMsg.includes('versión estática'));
+
+      if (isStaticFallbackEligible) {
+        try {
+          const staticRes = await fetch(resolveAssetUrl('/static-bootstrap.json'), {
+            cache: 'no-store',
+          });
+          if (staticRes.ok) {
+            const staticPayload = (await staticRes.json()) as LeagueBootstrap;
+            if (
+              staticPayload &&
+              Array.isArray(staticPayload.teams) &&
+              Array.isArray(staticPayload.matches) &&
+              staticPayload.settings &&
+              staticPayload.cup
+            ) {
+              setFallbackBootstrap(hydrateStaticCrests(staticPayload));
+              setStaticHostingMode(true);
+              setLoadError(null);
+              return;
+            }
           }
+        } catch {
+          // fall through
         }
-      } catch {
-        // fall through to standard error message
       }
-      setLoadError(err instanceof Error ? err.message : 'Error cargando la liga.');
+      if (!realtimeSlice.seeded) {
+        setLoadError(err instanceof Error ? err.message : 'Error cargando la liga.');
+      }
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [realtimeSlice.seeded]);
 
   useEffect(() => {
-    fetchBootstrap();
-    if (staticHostingMode) return;
+    void fetchBootstrapFallback();
+  }, [fetchBootstrapFallback]);
 
-    const handleFocus = () => {
-      void fetchBootstrap();
-    };
-    window.addEventListener('focus', handleFocus);
+  // Primary Real-Time Cloud Firestore Subscription (all collections)
+  useEffect(() => {
+    if (!authReady) return;
+    const isVerifiedAdmin =
+      effectiveUser?.role === 'admin' && Boolean(auth.currentUser?.emailVerified);
+    const uid = auth.currentUser?.uid || null;
 
-    let es: EventSource | null = null;
-    if (typeof EventSource !== 'undefined') {
-      es = new EventSource(resolveApiUrl('/api/events'));
-      es.addEventListener('db_updated', () => {
-        void fetchBootstrap();
-      });
-      es.onerror = () => {
-        es?.close();
-      };
-    }
-
-    let bc: BroadcastChannel | null = null;
-    if (typeof BroadcastChannel !== 'undefined') {
-      bc = new BroadcastChannel('lma-sync');
-      bc.onmessage = () => {
-        void fetchBootstrap();
-      };
-    }
-
-    const pollInterval = window.setInterval(() => {
-      if (document.visibilityState === 'visible') {
-        void fetchBootstrap();
+    const unsub = subscribeLeagueRealtime(
+      { uid, isAdmin: isVerifiedAdmin },
+      (patch) => {
+        setRealtimeSlice((prev) => ({
+          ...prev,
+          ...patch,
+          checked: Boolean(prev.checked || patch.checked),
+          seeded: Boolean(prev.seeded || patch.seeded),
+        }));
+        if (patch.seeded || (patch.checked && !patch.seeded)) {
+          setLoading(false);
+          if (patch.seeded) setLoadError(null);
+        }
+      },
+      (msg) => {
+        setLoadError(msg);
       }
-    }, 60000);
+    );
 
-    return () => {
-      window.removeEventListener('focus', handleFocus);
-      if (es) es.close();
-      if (bc) bc.close();
-      window.clearInterval(pollInterval);
-    };
-  }, [fetchBootstrap, staticHostingMode]);
+    return () => unsub();
+  }, [authReady, effectiveUser?.role, effectiveUser?.uid]);
+
+  // Unified live LeagueBootstrap built strictly from Cloud Firestore (fallback ONLY if DB unseeded after initial check)
+  const data = useMemo<LeagueBootstrap | null>(() => {
+    if (realtimeSlice.seeded) {
+      const settings = realtimeSlice.settings;
+      const teams = realtimeSlice.teams;
+      const cup = realtimeSlice.cup;
+      const rules = realtimeSlice.rules;
+      if (!settings || !teams || !cup || !rules) return null;
+
+      return hydrateStaticCrests({
+        settings: {
+          ...settings,
+          maxTeams: Number(settings.maxTeams) > 50 ? Math.min(500, Number(settings.maxTeams)) : 100,
+          backupGmail: realtimeSlice.backupGmail ?? settings.backupGmail,
+        },
+        user: effectiveUser,
+        teams,
+        adminTeams: realtimeSlice.adminTeams || (effectiveUser?.role === 'admin' ? teams : undefined),
+        matches: realtimeSlice.matches ?? [],
+        fixtures: realtimeSlice.fixtures ?? [],
+        calendarEvents: realtimeSlice.calendarEvents ?? [],
+        claims: realtimeSlice.claims ?? [],
+        news: realtimeSlice.news ?? [],
+        topGoals: realtimeSlice.topGoals ?? [],
+        comments: realtimeSlice.comments ?? [],
+        champions: realtimeSlice.champions ?? [],
+        rules,
+        cup,
+        music: realtimeSlice.music ?? [],
+        videos: realtimeSlice.videos ?? [],
+        pageLikes: realtimeSlice.pageLikes ?? 0,
+        credentialAuditLog: realtimeSlice.auditLog ?? [],
+      });
+    }
+
+    if (realtimeSlice.checked && !realtimeSlice.seeded && fallbackBootstrap) {
+      return {
+        ...fallbackBootstrap,
+        user: effectiveUser,
+      };
+    }
+
+    return null;
+  }, [realtimeSlice, fallbackBootstrap, effectiveUser]);
+
+  const pageLiked = Boolean(realtimeSlice.likedPage);
+  const likedTeams = realtimeSlice.likedTeams || {};
+  const likedNews = realtimeSlice.likedNews || {};
+  const musicMode = realtimeSlice.musicMode || 'league';
 
   useEffect(() => {
     if (!data?.settings) return;
@@ -357,191 +464,121 @@ export default function App() {
     window.scrollTo({ top: 0, behavior: 'auto' });
   };
 
-  const handleLikePage = useCallback(async () => {
-    try {
-      const res = await apiFetch<{ pageLikes: number }>('/api/likes/page', { method: 'POST' });
-      setData((prev) => (prev ? { ...prev, pageLikes: res.pageLikes } : prev));
-    } catch {
-      // Static mode fallback: increment locally
-      setData((prev) => (prev ? { ...prev, pageLikes: (prev.pageLikes || 0) + 1 } : prev));
-    }
-    setPageLiked(true);
-    try {
-      localStorage.setItem('lma_page_liked', '1');
-    } catch {
-      // ignore
-    }
-  }, []);
-
-  const handleLikeTeam = useCallback(async (teamId: string) => {
-    try {
-      const res = await apiFetch<{ teamId: string; likes: number }>(
-        `/api/teams/${encodeURIComponent(teamId)}/like`,
-        { method: 'POST' }
-      );
-      setData((prev) =>
-        prev
-          ? {
-              ...prev,
-              teams: prev.teams.map((t) => (t.id === res.teamId ? { ...t, likes: res.likes } : t)),
-            }
-          : prev
-      );
-    } catch {
-      setData((prev) =>
-        prev
-          ? {
-              ...prev,
-              teams: prev.teams.map((t) =>
-                t.id === teamId ? { ...t, likes: (t.likes || 0) + 1 } : t
-              ),
-            }
-          : prev
-      );
-    }
-    setLikedTeams((prev) => {
-      const next = { ...prev, [teamId]: true };
-      try {
-        localStorage.setItem('lma_liked_teams', JSON.stringify(next));
-      } catch {
-        // ignore
-      }
-      return next;
-    });
-  }, []);
-
-  const handleLikeNews = useCallback(async (newsId: string) => {
-    try {
-      const res = await apiFetch<{ newsId: string; likes: number }>(
-        `/api/news/${encodeURIComponent(newsId)}/like`,
-        { method: 'POST' }
-      );
-      setData((prev) =>
-        prev
-          ? {
-              ...prev,
-              news: (prev.news || []).map((n) =>
-                n.id === res.newsId ? { ...n, likes: res.likes } : n
-              ),
-            }
-          : prev
-      );
-    } catch {
-      setData((prev) =>
-        prev
-          ? {
-              ...prev,
-              news: (prev.news || []).map((n) =>
-                n.id === newsId ? { ...n, likes: (n.likes || 0) + 1 } : n
-              ),
-            }
-          : prev
-      );
-    }
-    setLikedNews((prev) => {
-      const next = { ...prev, [newsId]: true };
-      try {
-        localStorage.setItem('lma_liked_news', JSON.stringify(next));
-      } catch {
-        // ignore
-      }
-      return next;
-    });
-  }, []);
-
-  const handleLastSongPlayed = useCallback(
-    async (track: LastListenedTrack) => {
-      if (!data?.user) return;
-      const targetTeamId =
-        data.user.teamId || (data.user.role === 'admin' ? data.settings.adminTeamId : undefined);
-      if (!targetTeamId) return;
-
-      try {
-        localStorage.setItem(`lma_last_song_${targetTeamId}`, JSON.stringify(track));
-      } catch {
-        // ignore
-      }
-
-      setData((prev) =>
-        prev
-          ? {
-              ...prev,
-              teams: prev.teams.map((t) =>
-                t.id === targetTeamId ? { ...t, lastListenedTrack: track } : t
-              ),
-            }
-          : prev
-      );
-
-      try {
-        const res = await apiFetch<{ teamId: string; lastListenedTrack: LastListenedTrack }>(
-          '/api/profile/last-song',
-          {
-            method: 'POST',
-            body: JSON.stringify(track),
-          }
-        );
-        if (res?.lastListenedTrack) {
-          try {
-            localStorage.setItem(
-              `lma_last_song_${res.teamId}`,
-              JSON.stringify(res.lastListenedTrack)
-            );
-          } catch {
-            // ignore
-          }
-          setData((prev) =>
-            prev
-              ? {
-                  ...prev,
-                  teams: prev.teams.map((t) =>
-                    t.id === res.teamId
-                      ? { ...t, lastListenedTrack: res.lastListenedTrack }
-                      : t
-                  ),
-                }
-              : prev
-          );
-        }
-      } catch {
-        // Static / offline mode keeps localStorage fallback
-      }
-    },
-    [data?.user, data?.settings.adminTeamId]
-  );
-
   const openAuthModal = useCallback(() => {
     setAuthModalOpen(true);
   }, []);
 
-  const handleAuthSuccess = async (_user: AuthUser) => {
-    await fetchBootstrap();
+  const handleLikePage = useCallback(async () => {
+    if (!auth.currentUser || !auth.currentUser.emailVerified) {
+      openAuthModal();
+      return;
+    }
+    try {
+      await toggleAtomicLikeFirestore('page', 'global');
+    } catch {
+      // Save error toast already surfaced by runConfirmedWrite
+    }
+  }, [openAuthModal]);
+
+  const handleLikeTeam = useCallback(
+    async (teamId: string) => {
+      if (likedTeams[teamId]) return;
+      if (!auth.currentUser || !auth.currentUser.emailVerified) {
+        openAuthModal();
+        return;
+      }
+      try {
+        await toggleAtomicLikeFirestore('team', teamId);
+      } catch {
+        // Save error toast already surfaced by runConfirmedWrite
+      }
+    },
+    [likedTeams, openAuthModal]
+  );
+
+  const handleLikeNews = useCallback(
+    async (newsId: string) => {
+      if (!auth.currentUser || !auth.currentUser.emailVerified) {
+        openAuthModal();
+        return;
+      }
+      try {
+        await toggleAtomicLikeFirestore('news', newsId);
+      } catch {
+        // Save error toast already surfaced by runConfirmedWrite
+      }
+    },
+    [openAuthModal]
+  );
+
+  const handleLastSongPlayed = useCallback(
+    async (track: LastListenedTrack) => {
+      if (!effectiveUser) return;
+      const targetTeamId =
+        effectiveUser.teamId ||
+        (effectiveUser.role === 'admin' ? data?.settings.adminTeamId : undefined);
+      if (!targetTeamId) return;
+      await updateTeamLastSongFirestore(targetTeamId, track);
+    },
+    [effectiveUser, data?.settings.adminTeamId]
+  );
+
+  const handleChangeMusicMode = useCallback(async (mode: 'league' | 'personal') => {
+    setRealtimeSlice((prev) => ({ ...prev, musicMode: mode }));
+    try {
+      await saveUserMusicModeFirestore(mode);
+    } catch {
+      // Ignored if guest or handled by Firestore listener
+    }
+  }, []);
+
+  const handleAuthSuccess = async (user: AuthUser) => {
+    if (user.firebaseAuthenticated) {
+      setFirebaseUser(user);
+    } else {
+      setLegacyUser(user);
+    }
+    if (!realtimeSlice.seeded) {
+      await fetchBootstrapFallback();
+    }
   };
 
   const handleLogout = async () => {
     try {
+      await signOut(auth);
+    } catch {
+      // Ignore Firebase signOut error
+    }
+    try {
       await apiFetch('/api/auth/logout', { method: 'POST' });
     } catch {
-      // Ignore network errors while clearing client session
+      // Ignore network errors while clearing legacy token
     }
     setStoredToken(null);
+    setFirebaseUser(null);
+    setLegacyUser(null);
     setProfileSubTab(undefined);
-    await fetchBootstrap();
   };
 
+  const handleNoopRefresh = useCallback(async () => {
+    if (!realtimeSlice.seeded) {
+      await fetchBootstrapFallback();
+    }
+  }, [realtimeSlice.seeded, fetchBootstrapFallback]);
+
   const navItems: { id: NavTab; label: string }[] = [
-    { id: 'inicio', label: 'Inicio' },
-    { id: 'posiciones', label: 'Posiciones' },
-    { id: 'partidos', label: 'Partidos' },
-    { id: 'copas', label: 'Copas' },
-    { id: 'calendario', label: 'Calendario' },
-    { id: 'galeria', label: 'Galería' },
-    { id: 'reglamento', label: 'Reglamento' },
-    { id: 'perfil', label: 'Mi Perfil' },
+    { id: 'inicio', label: getTitleText(data?.settings, 'navInicio') },
+    { id: 'posiciones', label: getTitleText(data?.settings, 'navPosiciones') },
+    { id: 'partidos', label: getTitleText(data?.settings, 'navPartidos') },
+    { id: 'copas', label: getTitleText(data?.settings, 'navCopas') },
+    { id: 'calendario', label: getTitleText(data?.settings, 'navCalendario') },
+    { id: 'galeria', label: getTitleText(data?.settings, 'navGaleria') },
+    { id: 'reglamento', label: getTitleText(data?.settings, 'navReglamento') },
+    { id: 'perfil', label: getTitleText(data?.settings, 'navPerfil') },
   ];
 
   const introIcon = resolveAssetUrl(
-    data?.settings.faviconUrl || data?.settings.crestUrl || DEFAULT_ICON
+    data?.settings.crestUrl || data?.settings.faviconUrl || DEFAULT_ICON
   );
 
   const viewedTeam = useMemo(
@@ -555,7 +592,7 @@ export default function App() {
 
   return (
     <div className="relative min-h-screen flex flex-col bg-[#050608] text-white pb-8">
-      {/* Fondo de pantalla completo optimizado para scroll fluido */}
+      {/* Fondo de pantalla completo */}
       {(!showIntro || introContentReady) && (
         <div
           className="fixed inset-0 z-0 bg-cover bg-center bg-no-repeat pointer-events-none"
@@ -607,7 +644,6 @@ export default function App() {
           </nav>
 
           <div className="flex items-center gap-2 shrink-0 ml-auto">
-            {/* Fecha actual y hora en tiempo real al lado de Ingresar a Cuenta */}
             <LiveClock onClick={() => handleNavigate('calendario')} />
             <PWAInstallButton />
 
@@ -663,13 +699,34 @@ export default function App() {
         )}
       </header>
 
+      {/* Server-confirmed Save Feedback Toast */}
+      {saveStatus.state !== 'idle' && (
+        <div className="fixed bottom-4 left-4 z-40 max-w-md pointer-events-none">
+          <div
+            className={`px-4 py-2.5 rounded-xl border shadow-2xl text-xs font-semibold flex items-center gap-2 backdrop-blur-md ${
+              saveStatus.state === 'saving'
+                ? 'bg-[#071D38]/95 border-amber-400/60 text-amber-100'
+                : saveStatus.state === 'saved'
+                ? 'bg-emerald-950/95 border-emerald-400/60 text-emerald-100'
+                : 'bg-rose-950/95 border-rose-400/60 text-rose-100'
+            }`}
+          >
+            {saveStatus.state === 'saving' ? (
+              <Loader2 className="w-4 h-4 animate-spin text-amber-300 shrink-0" />
+            ) : saveStatus.state === 'saved' ? (
+              <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
+            ) : (
+              <ShieldAlert className="w-4 h-4 text-rose-400 shrink-0" />
+            )}
+            <span>{saveStatus.message}</span>
+          </div>
+        </div>
+      )}
+
       {/* Main Content */}
       <main className="relative z-10 flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 py-8">
         {resetPageState.active ? (
-          <ResetPasswordView
-            oobCode={resetPageState.oobCode}
-            onComplete={handleExitResetPage}
-          />
+          <ResetPasswordView oobCode={resetPageState.oobCode} onComplete={handleExitResetPage} />
         ) : loading && !data ? (
           <div className="space-y-6 animate-pulse">
             <div className="h-80 rounded-2xl bg-[#0B0D12]/90 border border-zinc-400/30" />
@@ -688,7 +745,7 @@ export default function App() {
             <p className="text-sm text-rose-300">{loadError}</p>
             <button
               type="button"
-              onClick={fetchBootstrap}
+              onClick={fetchBootstrapFallback}
               className="px-4 py-2 text-xs font-bold btn-gold-luxury rounded-lg"
             >
               Reintentar
@@ -719,7 +776,7 @@ export default function App() {
                   likedNews={likedNews}
                   user={data.user}
                   onNavigate={handleNavigate}
-                  onRefresh={fetchBootstrap}
+                  onRefresh={handleNoopRefresh}
                   onReplayIntro={() => setShowIntro(true)}
                   onLikePage={handleLikePage}
                   onLikeNews={handleLikeNews}
@@ -731,9 +788,10 @@ export default function App() {
                 <StandingsView
                   standings={standings}
                   maxTeams={data.settings.maxTeams}
+                  settings={data.settings}
                   user={data.user}
                   onOpenAuth={openAuthModal}
-                  onRefresh={fetchBootstrap}
+                  onRefresh={handleNoopRefresh}
                   onViewParticipant={(teamId) => setViewingTeamId(teamId)}
                 />
               )}
@@ -745,11 +803,12 @@ export default function App() {
                   claims={data.claims || []}
                   teams={data.teams}
                   cup={data.cup}
+                  settings={data.settings}
                   user={data.user}
                   initialSubTab={matchesSubTab}
                   onOpenAuth={openAuthModal}
                   onOpenCups={() => handleNavigate('copas')}
-                  onRefresh={fetchBootstrap}
+                  onRefresh={handleNoopRefresh}
                 />
               )}
 
@@ -758,21 +817,24 @@ export default function App() {
                   <div className="flex flex-wrap items-center justify-between gap-3">
                     <div>
                       <h1 className="font-display text-3xl sm:text-4xl font-extrabold text-albiceleste-shiny">
-                        Copas Oficiales · Llaves de Copa de la Liga y Recopa
+                        {getTitleText(data.settings, 'copasPageTitle')}
                       </h1>
                       <p className="text-xs sm:text-sm text-zinc-300">
-                        Seguí el cuadro completo de eliminación directa desde Octavos hasta la Gran Final y la Recopa Argentina.
+                        {getTitleText(data.settings, 'copasPageSubtitle')}
                       </p>
                     </div>
                   </div>
 
                   <CupBracketCard
                     cup={data.cup}
+                    teams={data.teams}
+                    matches={data.matches}
+                    settings={data.settings}
                     isAdmin={data.user?.role === 'admin'}
                     onEditCup={() => handleNavigate('perfil', 'copa')}
                     onGoToChampionsUpload={() => handleNavigate('galeria', 'campeones')}
                     onGoToRules={() => handleNavigate('reglamento')}
-                    onRefresh={fetchBootstrap}
+                    onRefresh={handleNoopRefresh}
                   />
                 </div>
               )}
@@ -781,11 +843,12 @@ export default function App() {
                 <CalendarView
                   calendarEvents={data.calendarEvents || []}
                   calendarMessage={data.settings.calendarMessage}
+                  settings={data.settings}
                   cup={data.cup}
                   fixtures={data.fixtures || []}
                   teams={data.teams}
                   user={data.user}
-                  onRefresh={fetchBootstrap}
+                  onRefresh={handleNoopRefresh}
                   onOpenCup={() => handleNavigate('perfil', 'copa')}
                 />
               )}
@@ -799,14 +862,17 @@ export default function App() {
                   firestoreError={firestoreError}
                   featuredVideoId={data.settings.featuredVideo?.id}
                   champions={data.champions}
+                  settings={data.settings}
                   user={data.user}
                   initialSubTab={gallerySubTab}
                   onOpenAuth={openAuthModal}
-                  onRefresh={fetchBootstrap}
+                  onRefresh={handleNoopRefresh}
                 />
               )}
 
-              {activeTab === 'reglamento' && <RulesView rules={data.rules} />}
+              {activeTab === 'reglamento' && (
+                <RulesView rules={data.rules} settings={data.settings} />
+              )}
 
               {activeTab === 'perfil' && (
                 <ProfileView
@@ -829,10 +895,13 @@ export default function App() {
                   comments={data.comments || []}
                   likedTeams={likedTeams}
                   credentialAuditLog={data.credentialAuditLog || []}
+                  memberInvites={realtimeSlice.memberInvites || []}
+                  userPersonalMusic={realtimeSlice.userPersonalMusic || []}
+                  backupGmail={realtimeSlice.backupGmail}
                   initialAdminTab={profileSubTab}
                   onOpenAuth={openAuthModal}
                   onLogout={handleLogout}
-                  onRefresh={fetchBootstrap}
+                  onRefresh={handleNoopRefresh}
                   onNavigate={handleNavigate}
                   onViewParticipant={(teamId) => setViewingTeamId(teamId)}
                   onLikeTeam={handleLikeTeam}
@@ -843,7 +912,7 @@ export default function App() {
         )}
       </main>
 
-      {/* Footer Negro, Dorado y Plateado con toques Liga */}
+      {/* Footer */}
       <footer className="relative z-10 border-t border-amber-400/50 bg-gradient-to-r from-[#06070A]/96 via-[#0E1118]/96 to-[#06070A]/96 mt-12">
         <div className="max-w-7xl mx-auto px-4 sm:px-6 py-6 flex flex-col lg:flex-row items-center justify-between gap-4 text-xs text-zinc-200">
           <div className="text-center lg:text-left">
@@ -858,7 +927,7 @@ export default function App() {
 
           <div className="flex flex-wrap items-center justify-center gap-4">
             <span className="text-zinc-200 font-medium">
-              Siguenos en nuestras redes sociales. Gracias Te queremos.
+              {getTitleText(data?.settings, 'homeSocialTitle')}
             </span>
             <div className="flex items-center gap-2.5">
               <a
@@ -906,23 +975,33 @@ export default function App() {
         </div>
       </footer>
 
-      {data && (
-        <MusicBar
-          tracks={data.music}
-          personalServerTracks={
-            data.teams.find(
-              (t) => t.id === (data.user?.teamId || (data.user?.role === 'admin' ? data.settings.adminTeamId : undefined))
-            )?.personalMusic || []
-          }
-          user={data.user}
-          radioName={data.settings.radioName}
-          radioStreamUrl={data.settings.radioStreamUrl}
-          isAdmin={data.user?.role === 'admin'}
-          introActive={showIntro}
-          onRefresh={fetchBootstrap}
-          onLastSongPlayed={handleLastSongPlayed}
-        />
-      )}
+      {data && (() => {
+        const effectiveMusicTeamId =
+          data.user?.teamId ||
+          (data.user?.role === 'admin' ? data.settings.adminTeamId : undefined);
+        const effectiveMusicTeam = effectiveMusicTeamId
+          ? data.teams.find((t) => t.id === effectiveMusicTeamId)
+          : undefined;
+        const personalServerTracks = effectiveMusicTeam
+          ? effectiveMusicTeam.personalMusic || []
+          : realtimeSlice.userPersonalMusic || [];
+        return (
+          <MusicBar
+            tracks={data.music}
+            personalServerTracks={personalServerTracks}
+            personalTeamId={effectiveMusicTeam?.id}
+            user={data.user}
+            radioName={data.settings.radioName}
+            radioStreamUrl={data.settings.radioStreamUrl}
+            isAdmin={data.user?.role === 'admin'}
+            introActive={showIntro}
+            musicMode={musicMode}
+            onChangeMusicMode={handleChangeMusicMode}
+            onRefresh={handleNoopRefresh}
+            onLastSongPlayed={handleLastSongPlayed}
+          />
+        );
+      })()}
 
       <AuthModal
         open={authModalOpen}
@@ -938,6 +1017,7 @@ export default function App() {
         standing={viewedStanding}
         matches={data?.matches || []}
         champions={data?.champions || []}
+        settings={data?.settings}
         liked={Boolean(viewedTeam && likedTeams[viewedTeam.id])}
         onLike={handleLikeTeam}
         onClose={() => setViewingTeamId(null)}

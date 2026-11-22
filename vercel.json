@@ -4,17 +4,19 @@
   "outputDirectory": "dist",
   "functions": {
     "api/index.ts": {
-      "includeFiles": "{data/**,firebase-applet-config.json}",
+      "includeFiles": "{server.ts,src/server/**,src/assets/images/**,data/league.json,data/uploads/**,firebase-applet-config.json}",
       "maxDuration": 30
     }
   },
   "rewrites": [
-    { "source": "/api/(.*)", "destination": "/api/index" },
-    { "source": "/uploads/(.*)", "destination": "/api/index" },
-    { "source": "/default-assets/(.*)", "destination": "/api/index" },
-    { "source": "/LMA-pes6-ai-studio/api/(.*)", "destination": "/api/index" },
-    { "source": "/LMA-pes6-ai-studio/uploads/(.*)", "destination": "/api/index" },
-    { "source": "/LMA-pes6-ai-studio/default-assets/(.*)", "destination": "/api/index" },
+    { "source": "/api", "destination": "/api/index?__path=/api" },
+    { "source": "/api/(.*)", "destination": "/api/index?__path=/api/$1" },
+    { "source": "/uploads/(.*)", "destination": "/api/index?__path=/uploads/$1" },
+    { "source": "/default-assets/(.*)", "destination": "/api/index?__path=/default-assets/$1" },
+    { "source": "/LMA-pes6-ai-studio/api", "destination": "/api/index?__path=/api" },
+    { "source": "/LMA-pes6-ai-studio/api/(.*)", "destination": "/api/index?__path=/api/$1" },
+    { "source": "/LMA-pes6-ai-studio/uploads/(.*)", "destination": "/api/index?__path=/uploads/$1" },
+    { "source": "/LMA-pes6-ai-studio/default-assets/(.*)", "destination": "/api/index?__path=/default-assets/$1" },
     {
       "source": "/((?!assets/|api/|uploads/|default-assets/|manifest\\.json|sw\\.js|workbox-.*|pwa-.*|apple-touch-icon\\.png|favicon\\.ico|static-bootstrap\\.json).*)",
       "destination": "/index.html"

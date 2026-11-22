@@ -1,15 +1,38 @@
 import { getApp, getApps, initializeApp } from 'firebase/app';
 import { browserLocalPersistence, getAuth, GoogleAuthProvider, setPersistence } from 'firebase/auth';
-import { doc, getDocFromServer, getFirestore } from 'firebase/firestore';
+import {
+  doc,
+  enableNetwork,
+  getDocFromServer,
+  getFirestore,
+  initializeFirestore,
+  type Firestore,
+} from 'firebase/firestore';
 import firebaseConfig from '../firebase-applet-config.json';
 
 const app = getApps().some((a) => a.name === '[DEFAULT]')
   ? getApp()
   : initializeApp(firebaseConfig);
 
-export const db = firebaseConfig.firestoreDatabaseId
-  ? getFirestore(app, firebaseConfig.firestoreDatabaseId)
-  : getFirestore(app);
+function createFirestoreInstance(): Firestore {
+  const databaseId = firebaseConfig.firestoreDatabaseId || undefined;
+  if (typeof window !== 'undefined') {
+    try {
+      return initializeFirestore(
+        app,
+        {
+          experimentalForceLongPolling: true,
+        },
+        databaseId
+      );
+    } catch {
+      // Fall back to getFirestore if this instance was already initialized
+    }
+  }
+  return databaseId ? getFirestore(app, databaseId) : getFirestore(app);
+}
+
+export const db = createFirestoreInstance();
 
 export const auth = getAuth(app);
 auth.languageCode = 'es';
@@ -139,10 +162,24 @@ export async function testConnection(): Promise<boolean> {
   if (connectionTested) return true;
   connectionTested = true;
   try {
+    await enableNetwork(db).catch(() => undefined);
     await getDocFromServer(doc(db, 'test', 'connection'));
     return true;
-  } catch (error) {
-    if (error instanceof Error && error.message.includes('the client is offline')) {
+  } catch (firstError) {
+    if (typeof window !== 'undefined' && navigator.onLine !== false) {
+      await new Promise((resolve) => setTimeout(resolve, 1200));
+      try {
+        await enableNetwork(db).catch(() => undefined);
+        await getDocFromServer(doc(db, 'test', 'connection'));
+        return true;
+      } catch (retryError) {
+        if (retryError instanceof Error && retryError.message.includes('the client is offline')) {
+          console.error('Please check your Firebase configuration. Firestore client is offline.');
+        }
+        return false;
+      }
+    }
+    if (firstError instanceof Error && firstError.message.includes('the client is offline')) {
       console.error('Please check your Firebase configuration. Firestore client is offline.');
     }
     return false;

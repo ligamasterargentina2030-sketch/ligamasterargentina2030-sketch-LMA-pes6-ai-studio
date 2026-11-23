@@ -572,10 +572,19 @@ service cloud.firestore {
           isOwner(uid) &&
           request.auth.token.email is string &&
           incoming().status == 'active' &&
-          exists(/databases/$(database)/documents/teams/$(incoming().teamId)) &&
-          exists(/databases/$(database)/documents/member_invites/$(request.auth.token.email.lower())) &&
-          get(/databases/$(database)/documents/member_invites/$(request.auth.token.email.lower())).data.status == 'active' &&
-          get(/databases/$(database)/documents/member_invites/$(request.auth.token.email.lower())).data.teamId == incoming().teamId
+          (
+            (
+              exists(/databases/$(database)/documents/teams/$(incoming().teamId)) &&
+              exists(/databases/$(database)/documents/member_invites/$(request.auth.token.email.lower())) &&
+              get(/databases/$(database)/documents/member_invites/$(request.auth.token.email.lower())).data.status == 'active' &&
+              get(/databases/$(database)/documents/member_invites/$(request.auth.token.email.lower())).data.teamId == incoming().teamId
+            ) ||
+            (
+              !exists(/databases/$(database)/documents/teams/$(incoming().teamId)) &&
+              existsAfter(/databases/$(database)/documents/teams/$(incoming().teamId)) &&
+              getAfter(/databases/$(database)/documents/teams/$(incoming().teamId)).data.ownerUid == request.auth.uid
+            )
+          )
         )
       );
       allow update: if isValidId(uid) && isValidMemberLink(incoming(), uid) && (
@@ -594,7 +603,20 @@ service cloud.firestore {
 
     match /teams/{teamId} {
       allow get, list: if true;
-      allow create: if isValidId(teamId) && isAdmin() && isValidTeam(incoming()) && incoming().id == teamId;
+      allow create: if isValidId(teamId) && isValidTeam(incoming()) && incoming().id == teamId && (
+        isAdmin() ||
+        (
+          isSignedIn() &&
+          'ownerUid' in incoming() &&
+          incoming().ownerUid == request.auth.uid &&
+          incoming().accountStatus == 'active' &&
+          (!('likes' in incoming()) || incoming().likes == 0) &&
+          (!('trophies' in incoming()) || incoming().trophies.size() == 0) &&
+          (!('personalMusic' in incoming()) || incoming().personalMusic.size() == 0) &&
+          !exists(/databases/$(database)/documents/members/$(request.auth.uid)) &&
+          existsAfter(/databases/$(database)/documents/members/$(request.auth.uid))
+        )
+      );
       allow update: if isValidId(teamId) && isValidTeam(incoming()) && (
         isAdmin() ||
         (

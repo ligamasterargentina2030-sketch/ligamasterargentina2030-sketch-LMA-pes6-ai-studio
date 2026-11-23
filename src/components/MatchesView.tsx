@@ -25,13 +25,14 @@ import type {
   PublicTeam,
   ScheduledFixture,
 } from '../types';
+import { auth } from '../firebase';
 import {
   deleteMatchFirestore,
   reviewMatchFirestore,
   submitClaimFirestore,
   submitMatchFirestore,
 } from '../services/firestoreLeague';
-import { uploadMediaFile } from '../utils/api';
+import { apiFetch, uploadMediaFile } from '../utils/api';
 import { getTitleText } from '../utils/customTitles';
 import { ResilientImage } from './ResilientImage';
 
@@ -340,51 +341,86 @@ export function MatchesView({
     }
     setSubmitting(true);
     try {
-      let proofImageUrl: string | undefined;
-      let scorerImageUrl: string | undefined;
-      if (proofFile) {
-        proofImageUrl = await uploadMediaFile('matches', proofFile);
-      }
-      if (scorerFile) {
-        scorerImageUrl = await uploadMediaFile('matches', scorerFile);
-      }
-
-      const res = await submitMatchFirestore({
-        homeTeamId,
-        awayTeamId,
-        homeGoals: Number(homeGoals),
-        awayGoals: Number(awayGoals),
-        matchday: Number(matchday) || 1,
-        leg,
-        playedAt,
-        notes,
-        competitionType,
-        cupMatchId: competitionType === 'copa' && selectedCupMatchId ? selectedCupMatchId : undefined,
-        extraTime: competitionType !== 'liga' ? extraTime : false,
-        homePenalties:
-          competitionType !== 'liga' && homePenalties.trim() !== ''
-            ? Number(homePenalties.trim())
-            : null,
-        awayPenalties:
-          competitionType !== 'liga' && awayPenalties.trim() !== ''
-            ? Number(awayPenalties.trim())
-            : null,
-        fixtureId: selectedFixtureId && competitionType === 'liga' ? selectedFixtureId : undefined,
-        scorerName: scorerName.trim() || undefined,
-        proofImageUrl,
-        scorerImageUrl,
-        submittedByTeamId: user?.teamId || user?.id || 'ADMI',
-        submittedByName:
-          user?.displayName ||
-          (user?.teamId ? teamMap.get(user.teamId)?.name : undefined) ||
-          'Participante',
-        isAdmin: user?.role === 'admin',
-        cup,
-        teams,
-        allMatches: matches,
-      });
-
       const submittedComp = competitionType;
+      let cupSyncedResult = false;
+
+      if (auth.currentUser && auth.currentUser.emailVerified) {
+        let proofImageUrl: string | undefined;
+        let scorerImageUrl: string | undefined;
+        if (proofFile) {
+          proofImageUrl = await uploadMediaFile('matches', proofFile);
+        }
+        if (scorerFile) {
+          scorerImageUrl = await uploadMediaFile('matches', scorerFile);
+        }
+
+        const res = await submitMatchFirestore({
+          homeTeamId,
+          awayTeamId,
+          homeGoals: Number(homeGoals),
+          awayGoals: Number(awayGoals),
+          matchday: Number(matchday) || 1,
+          leg,
+          playedAt,
+          notes,
+          competitionType,
+          cupMatchId: competitionType === 'copa' && selectedCupMatchId ? selectedCupMatchId : undefined,
+          extraTime: competitionType !== 'liga' ? extraTime : false,
+          homePenalties:
+            competitionType !== 'liga' && homePenalties.trim() !== ''
+              ? Number(homePenalties.trim())
+              : null,
+          awayPenalties:
+            competitionType !== 'liga' && awayPenalties.trim() !== ''
+              ? Number(awayPenalties.trim())
+              : null,
+          fixtureId: selectedFixtureId && competitionType === 'liga' ? selectedFixtureId : undefined,
+          scorerName: scorerName.trim() || undefined,
+          proofImageUrl,
+          scorerImageUrl,
+          submittedByTeamId: user?.teamId || user?.id || 'ADMI',
+          submittedByName:
+            user?.displayName ||
+            (user?.teamId ? teamMap.get(user.teamId)?.name : undefined) ||
+            'Participante',
+          isAdmin: user?.role === 'admin',
+          cup,
+          teams,
+          allMatches: matches,
+        });
+        cupSyncedResult = Boolean(res?.cupSynced);
+      } else {
+        const form = new FormData();
+        form.append('homeTeamId', homeTeamId);
+        form.append('awayTeamId', awayTeamId);
+        form.append('homeGoals', String(Number(homeGoals)));
+        form.append('awayGoals', String(Number(awayGoals)));
+        form.append('matchday', String(Number(matchday) || 1));
+        form.append('leg', leg);
+        form.append('playedAt', playedAt);
+        form.append('notes', notes);
+        form.append('competitionType', competitionType);
+        if (competitionType === 'copa' && selectedCupMatchId) {
+          form.append('cupMatchId', selectedCupMatchId);
+        }
+        if (competitionType !== 'liga') {
+          form.append('extraTime', String(extraTime));
+          if (homePenalties.trim() !== '') form.append('homePenalties', homePenalties.trim());
+          if (awayPenalties.trim() !== '') form.append('awayPenalties', awayPenalties.trim());
+        }
+        if (selectedFixtureId && competitionType === 'liga') {
+          form.append('fixtureId', selectedFixtureId);
+        }
+        if (scorerName.trim()) form.append('scorerName', scorerName.trim());
+        if (proofFile) form.append('proofImage', proofFile);
+        if (scorerFile) form.append('scorerImage', scorerFile);
+
+        const res = await apiFetch<{ cupSynced?: boolean }>('/api/matches', {
+          method: 'POST',
+          body: form,
+        });
+        cupSyncedResult = Boolean(res?.cupSynced);
+      }
       setSelectedFixtureId('');
       setSelectedCupMatchId('');
       setNotes('');
@@ -401,7 +437,7 @@ export function MatchesView({
       await onRefresh();
       if (submittedComp === 'copa' || submittedComp === 'recopa') {
         const compLabel = submittedComp === 'copa' ? 'Copa de la Liga' : 'Recopa Argentina';
-        const syncText = res?.cupSynced
+        const syncText = cupSyncedResult
           ? `¡Resultado de ${compLabel} cargado y actualizado AUTOMÁTICAMENTE en el Cuadro de la Copa!`
           : `Resultado de ${compLabel} registrado oficialmente. Verificá que los equipos coincidan con una llave activa del cuadro.`;
         setCupSyncBanner(syncText);
@@ -442,30 +478,46 @@ export function MatchesView({
     }
     setSubmittingClaim(true);
     try {
-      let cardPhotoUrl: string | undefined;
-      let resolvedVideoUrl = claimVideoUrl.trim() || undefined;
-      if (claimCardFile) {
-        cardPhotoUrl = await uploadMediaFile('claims', claimCardFile);
-      }
-      if (claimVideoFile) {
-        resolvedVideoUrl = await uploadMediaFile('claims', claimVideoFile);
-      }
+      if (auth.currentUser && auth.currentUser.emailVerified) {
+        let cardPhotoUrl: string | undefined;
+        let resolvedVideoUrl = claimVideoUrl.trim() || undefined;
+        if (claimCardFile) {
+          cardPhotoUrl = await uploadMediaFile('claims', claimCardFile);
+        }
+        if (claimVideoFile) {
+          resolvedVideoUrl = await uploadMediaFile('claims', claimVideoFile);
+        }
 
-      const accusedTeam = claimAccusedTeamId ? teamMap.get(claimAccusedTeamId) : undefined;
-      await submitClaimFirestore({
-        reasonType: claimReasonType,
-        description: claimDescription.trim(),
-        accusedTeamId: claimAccusedTeamId || undefined,
-        accusedTeamName: accusedTeam?.name,
-        matchId: claimMatchId || undefined,
-        cardPhotoUrl,
-        videoUrl: resolvedVideoUrl,
-        reporterTeamId: user?.teamId || user?.id || 'ADMI',
-        reporterName:
-          user?.displayName ||
-          (user?.teamId ? teamMap.get(user.teamId)?.name : undefined) ||
-          'Participante',
-      });
+        const accusedTeam = claimAccusedTeamId ? teamMap.get(claimAccusedTeamId) : undefined;
+        await submitClaimFirestore({
+          reasonType: claimReasonType,
+          description: claimDescription.trim(),
+          accusedTeamId: claimAccusedTeamId || undefined,
+          accusedTeamName: accusedTeam?.name,
+          matchId: claimMatchId || undefined,
+          cardPhotoUrl,
+          videoUrl: resolvedVideoUrl,
+          reporterTeamId: user?.teamId || user?.id || 'ADMI',
+          reporterName:
+            user?.displayName ||
+            (user?.teamId ? teamMap.get(user.teamId)?.name : undefined) ||
+            'Participante',
+        });
+      } else {
+        const form = new FormData();
+        form.append('reasonType', claimReasonType);
+        form.append('description', claimDescription.trim());
+        if (claimAccusedTeamId) form.append('accusedTeamId', claimAccusedTeamId);
+        if (claimMatchId) form.append('matchId', claimMatchId);
+        if (claimVideoUrl.trim()) form.append('videoUrl', claimVideoUrl.trim());
+        if (claimCardFile) form.append('cardPhoto', claimCardFile);
+        if (claimVideoFile) form.append('videoFile', claimVideoFile);
+
+        await apiFetch('/api/claims', {
+          method: 'POST',
+          body: form,
+        });
+      }
       setClaimDescription('');
       setClaimAccusedTeamId('');
       setClaimMatchId('');

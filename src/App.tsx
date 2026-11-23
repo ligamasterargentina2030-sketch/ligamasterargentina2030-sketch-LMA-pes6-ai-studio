@@ -33,6 +33,7 @@ import type {
   AuthUser,
   LastListenedTrack,
   LeagueBootstrap,
+  PublicTeam,
   SaveConfirmationStatus,
 } from './types';
 import { useCommunityVideos } from './hooks/useCommunityVideos';
@@ -156,6 +157,23 @@ export default function App() {
   const [staticHostingMode, setStaticHostingMode] = useState(false);
   const [viewingTeamId, setViewingTeamId] = useState<string | null>(null);
   const [litFooterSocial, setLitFooterSocial] = useState<'facebook' | 'youtube' | 'whatsapp' | null>(null);
+  const [sessionMountIso] = useState(() => new Date().toISOString());
+  const [apiTeamsOverlay, setApiTeamsOverlay] = useState<PublicTeam[]>([]);
+  const [apiLikeState, setApiLikeState] = useState<{
+    likedPage: boolean;
+    pageDelta: number;
+    likedTeams: Record<string, boolean>;
+    teamDeltas: Record<string, number>;
+    likedNews: Record<string, boolean>;
+    newsDeltas: Record<string, number>;
+  }>({
+    likedPage: false,
+    pageDelta: 0,
+    likedTeams: {},
+    teamDeltas: {},
+    likedNews: {},
+    newsDeltas: {},
+  });
 
   const flashFooterSocial = (network: 'facebook' | 'youtube' | 'whatsapp') => {
     setLitFooterSocial(network);
@@ -345,14 +363,76 @@ export default function App() {
     return () => unsub();
   }, [authReady, effectiveUser?.role, effectiveUser?.uid]);
 
-  // Unified live LeagueBootstrap built strictly from Cloud Firestore (fallback ONLY if DB unseeded after initial check)
+  // Unified live LeagueBootstrap built from Cloud Firestore + active API session overlay (never drops ID+Clave actions)
   const data = useMemo<LeagueBootstrap | null>(() => {
     if (realtimeSlice.seeded) {
       const settings = realtimeSlice.settings;
-      const teams = realtimeSlice.teams;
+      const baseTeams = realtimeSlice.teams;
       const cup = realtimeSlice.cup;
       const rules = realtimeSlice.rules;
-      if (!settings || !teams || !cup || !rules) return null;
+      if (!settings || !baseTeams || !cup || !rules) return null;
+
+      // Merge any newly self-registered / API-updated member teams
+      const teamMap = new Map<string, PublicTeam>();
+      for (const t of baseTeams) teamMap.set(t.id, t);
+      if (fallbackBootstrap?.teams) {
+        for (const t of fallbackBootstrap.teams) {
+          const isApiOwned =
+            (effectiveUser && !effectiveUser.firebaseAuthenticated && t.id === effectiveUser.teamId) ||
+            (t.createdAt && t.createdAt >= sessionMountIso);
+          if (isApiOwned || !teamMap.has(t.id)) {
+            if (isApiOwned) {
+              teamMap.set(t.id, t);
+            }
+          }
+        }
+      }
+      for (const t of apiTeamsOverlay) {
+        teamMap.set(t.id, t);
+      }
+
+      const mergedTeams = Array.from(teamMap.values()).map((t) => {
+        const delta = apiLikeState.teamDeltas[t.id] || 0;
+        return delta > 0 ? { ...t, likes: (t.likes || 0) + delta } : t;
+      });
+
+      const mergedMatches = [...(realtimeSlice.matches ?? [])];
+      if (fallbackBootstrap?.matches) {
+        const knownMatchIds = new Set(mergedMatches.map((m) => m.id));
+        for (const m of fallbackBootstrap.matches) {
+          if (!knownMatchIds.has(m.id) && m.createdAt && m.createdAt >= sessionMountIso) {
+            mergedMatches.unshift(m);
+            knownMatchIds.add(m.id);
+          }
+        }
+      }
+
+      const mergedClaims = [...(realtimeSlice.claims ?? [])];
+      if (fallbackBootstrap?.claims) {
+        const knownClaimIds = new Set(mergedClaims.map((c) => c.id));
+        for (const c of fallbackBootstrap.claims) {
+          if (!knownClaimIds.has(c.id) && c.createdAt && c.createdAt >= sessionMountIso) {
+            mergedClaims.unshift(c);
+            knownClaimIds.add(c.id);
+          }
+        }
+      }
+
+      const mergedComments = [...(realtimeSlice.comments ?? [])];
+      if (fallbackBootstrap?.comments) {
+        const knownCommentIds = new Set(mergedComments.map((c) => c.id));
+        for (const c of fallbackBootstrap.comments) {
+          if (!knownCommentIds.has(c.id) && c.createdAt && c.createdAt >= sessionMountIso) {
+            mergedComments.unshift(c);
+            knownCommentIds.add(c.id);
+          }
+        }
+      }
+
+      const mergedNews = (realtimeSlice.news ?? []).map((n) => {
+        const delta = apiLikeState.newsDeltas[n.id] || 0;
+        return delta > 0 ? { ...n, likes: (n.likes || 0) + delta } : n;
+      });
 
       return hydrateStaticCrests({
         settings: {
@@ -361,21 +441,21 @@ export default function App() {
           backupGmail: realtimeSlice.backupGmail ?? settings.backupGmail,
         },
         user: effectiveUser,
-        teams,
-        adminTeams: realtimeSlice.adminTeams || (effectiveUser?.role === 'admin' ? teams : undefined),
-        matches: realtimeSlice.matches ?? [],
+        teams: mergedTeams,
+        adminTeams: realtimeSlice.adminTeams || (effectiveUser?.role === 'admin' ? mergedTeams : undefined),
+        matches: mergedMatches,
         fixtures: realtimeSlice.fixtures ?? [],
         calendarEvents: realtimeSlice.calendarEvents ?? [],
-        claims: realtimeSlice.claims ?? [],
-        news: realtimeSlice.news ?? [],
+        claims: mergedClaims,
+        news: mergedNews,
         topGoals: realtimeSlice.topGoals ?? [],
-        comments: realtimeSlice.comments ?? [],
+        comments: mergedComments,
         champions: realtimeSlice.champions ?? [],
         rules,
         cup,
         music: realtimeSlice.music ?? [],
         videos: realtimeSlice.videos ?? [],
-        pageLikes: realtimeSlice.pageLikes ?? 0,
+        pageLikes: (realtimeSlice.pageLikes ?? 0) + apiLikeState.pageDelta,
         credentialAuditLog: realtimeSlice.auditLog ?? [],
       });
     }
@@ -388,11 +468,17 @@ export default function App() {
     }
 
     return null;
-  }, [realtimeSlice, fallbackBootstrap, effectiveUser]);
+  }, [realtimeSlice, fallbackBootstrap, effectiveUser, apiTeamsOverlay, apiLikeState, sessionMountIso]);
 
-  const pageLiked = Boolean(realtimeSlice.likedPage);
-  const likedTeams = realtimeSlice.likedTeams || {};
-  const likedNews = realtimeSlice.likedNews || {};
+  const pageLiked = Boolean(realtimeSlice.likedPage || apiLikeState.likedPage);
+  const likedTeams = useMemo(
+    () => ({ ...(realtimeSlice.likedTeams || {}), ...apiLikeState.likedTeams }),
+    [realtimeSlice.likedTeams, apiLikeState.likedTeams]
+  );
+  const likedNews = useMemo(
+    () => ({ ...(realtimeSlice.likedNews || {}), ...apiLikeState.likedNews }),
+    [realtimeSlice.likedNews, apiLikeState.likedNews]
+  );
   const musicMode = realtimeSlice.musicMode || 'league';
 
   useEffect(() => {
@@ -479,46 +565,81 @@ export default function App() {
   }, []);
 
   const handleLikePage = useCallback(async () => {
-    if (!auth.currentUser || !auth.currentUser.emailVerified) {
-      openAuthModal();
+    if (pageLiked) return;
+    if (auth.currentUser && auth.currentUser.emailVerified) {
+      try {
+        await toggleAtomicLikeFirestore('page', 'global');
+      } catch {
+        // Save error toast already surfaced by runConfirmedWrite
+      }
       return;
     }
     try {
-      await toggleAtomicLikeFirestore('page', 'global');
+      await apiFetch<{ pageLikes: number }>('/api/likes/page', { method: 'POST' });
+      setApiLikeState((prev) => ({
+        ...prev,
+        likedPage: true,
+        pageDelta: prev.pageDelta + 1,
+      }));
     } catch {
-      // Save error toast already surfaced by runConfirmedWrite
+      if (!effectiveUser) openAuthModal();
     }
-  }, [openAuthModal]);
+  }, [pageLiked, effectiveUser, openAuthModal]);
 
   const handleLikeTeam = useCallback(
     async (teamId: string) => {
       if (likedTeams[teamId]) return;
-      if (!auth.currentUser || !auth.currentUser.emailVerified) {
-        openAuthModal();
+      if (auth.currentUser && auth.currentUser.emailVerified) {
+        try {
+          await toggleAtomicLikeFirestore('team', teamId);
+        } catch {
+          // Save error toast already surfaced by runConfirmedWrite
+        }
         return;
       }
       try {
-        await toggleAtomicLikeFirestore('team', teamId);
+        await apiFetch<{ teamId: string; likes: number }>(
+          `/api/teams/${encodeURIComponent(teamId)}/like`,
+          { method: 'POST' }
+        );
+        setApiLikeState((prev) => ({
+          ...prev,
+          likedTeams: { ...prev.likedTeams, [teamId]: true },
+          teamDeltas: { ...prev.teamDeltas, [teamId]: (prev.teamDeltas[teamId] || 0) + 1 },
+        }));
       } catch {
-        // Save error toast already surfaced by runConfirmedWrite
+        if (!effectiveUser) openAuthModal();
       }
     },
-    [likedTeams, openAuthModal]
+    [likedTeams, effectiveUser, openAuthModal]
   );
 
   const handleLikeNews = useCallback(
     async (newsId: string) => {
-      if (!auth.currentUser || !auth.currentUser.emailVerified) {
-        openAuthModal();
+      if (likedNews[newsId]) return;
+      if (auth.currentUser && auth.currentUser.emailVerified) {
+        try {
+          await toggleAtomicLikeFirestore('news', newsId);
+        } catch {
+          // Save error toast already surfaced by runConfirmedWrite
+        }
         return;
       }
       try {
-        await toggleAtomicLikeFirestore('news', newsId);
+        await apiFetch<{ newsId: string; likes: number }>(
+          `/api/news/${encodeURIComponent(newsId)}/like`,
+          { method: 'POST' }
+        );
+        setApiLikeState((prev) => ({
+          ...prev,
+          likedNews: { ...prev.likedNews, [newsId]: true },
+          newsDeltas: { ...prev.newsDeltas, [newsId]: (prev.newsDeltas[newsId] || 0) + 1 },
+        }));
       } catch {
-        // Save error toast already surfaced by runConfirmedWrite
+        if (!effectiveUser) openAuthModal();
       }
     },
-    [openAuthModal]
+    [likedNews, effectiveUser, openAuthModal]
   );
 
   const handleLastSongPlayed = useCallback(
@@ -528,7 +649,18 @@ export default function App() {
         effectiveUser.teamId ||
         (effectiveUser.role === 'admin' ? data?.settings.adminTeamId : undefined);
       if (!targetTeamId) return;
-      await updateTeamLastSongFirestore(targetTeamId, track);
+      if (auth.currentUser && auth.currentUser.emailVerified) {
+        await updateTeamLastSongFirestore(targetTeamId, track);
+      } else {
+        try {
+          await apiFetch('/api/profile/last-song', {
+            method: 'POST',
+            body: JSON.stringify(track),
+          });
+        } catch {
+          // Ignore backend tracking errors silently
+        }
+      }
     },
     [effectiveUser, data?.settings.adminTeamId]
   );
@@ -542,15 +674,19 @@ export default function App() {
     }
   }, []);
 
-  const handleAuthSuccess = async (user: AuthUser) => {
+  const handleAuthSuccess = async (user: AuthUser, createdTeam?: PublicTeam) => {
     if (user.firebaseAuthenticated) {
       setFirebaseUser(user);
     } else {
       setLegacyUser(user);
     }
-    if (!realtimeSlice.seeded) {
-      await fetchBootstrapFallback();
+    if (createdTeam) {
+      setApiTeamsOverlay((prev) => [
+        createdTeam,
+        ...prev.filter((t) => t.id !== createdTeam.id),
+      ]);
     }
+    await fetchBootstrapFallback();
   };
 
   const handleLogout = async () => {
@@ -571,10 +707,8 @@ export default function App() {
   };
 
   const handleNoopRefresh = useCallback(async () => {
-    if (!realtimeSlice.seeded) {
-      await fetchBootstrapFallback();
-    }
-  }, [realtimeSlice.seeded, fetchBootstrapFallback]);
+    await fetchBootstrapFallback();
+  }, [fetchBootstrapFallback]);
 
   const navItems: { id: NavTab; label: string }[] = [
     { id: 'inicio', label: getTitleText(data?.settings, 'navInicio') },
@@ -615,7 +749,7 @@ export default function App() {
         />
       )}
       <div
-        className="fixed inset-0 z-0 bg-gradient-to-b from-[#03060C]/62 via-[#061830]/48 to-[#03060C]/68 pointer-events-none"
+        className="fixed inset-0 z-0 bg-gradient-to-b from-[#03060C]/44 via-[#061830]/32 to-[#03060C]/50 pointer-events-none"
         aria-hidden="true"
       />
 
@@ -918,6 +1052,13 @@ export default function App() {
                   onNavigate={handleNavigate}
                   onViewParticipant={(teamId) => setViewingTeamId(teamId)}
                   onLikeTeam={handleLikeTeam}
+                  onAuthUpdate={(updatedUser) => {
+                    if (updatedUser.firebaseAuthenticated) {
+                      setFirebaseUser(updatedUser);
+                    } else {
+                      setLegacyUser(updatedUser);
+                    }
+                  }}
                 />
               )}
             </>

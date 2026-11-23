@@ -46,6 +46,7 @@ import type {
   StandingRow,
   TopGoalItem,
 } from '../types';
+import { auth } from '../firebase';
 import {
   approveCommentFirestore,
   deleteCommentFirestore,
@@ -53,7 +54,7 @@ import {
   saveSettingsFirestore,
   submitCommentFirestore,
 } from '../services/firestoreLeague';
-import { uploadMediaFile } from '../utils/api';
+import { apiFetch, uploadMediaFile } from '../utils/api';
 import { resolveAssetUrl } from '../utils/assetUrl';
 import { getTitleText } from '../utils/customTitles';
 import { CupBracketCard } from './CupBracketCard';
@@ -683,20 +684,35 @@ export function HomeView({
     setSubmittingComment(true);
     setCommentFeedback(null);
     try {
-      const created = await submitCommentFirestore({
-        authorName: commentAuthor.trim() || user?.displayName || 'Hincha de la Liga',
-        authorTeamName: teams.find((t) => t.id === user?.teamId)?.name,
-        authorTeamId: user?.teamId,
-        message: commentMessage.trim(),
-        isAdmin: user?.role === 'admin',
-      });
+      let pendingApproval = user?.role !== 'admin';
+      if (auth.currentUser && auth.currentUser.emailVerified) {
+        const created = await submitCommentFirestore({
+          authorName: commentAuthor.trim() || user?.displayName || 'Hincha de la Liga',
+          authorTeamName: teams.find((t) => t.id === user?.teamId)?.name,
+          authorTeamId: user?.teamId,
+          message: commentMessage.trim(),
+          isAdmin: user?.role === 'admin',
+        });
+        pendingApproval = created.status === 'pending';
+      } else {
+        const res = await apiFetch<{ comment: LeagueComment; pendingApproval?: boolean }>(
+          '/api/comments',
+          {
+            method: 'POST',
+            body: JSON.stringify({
+              authorName: commentAuthor.trim() || user?.displayName || 'Hincha de la Liga',
+              message: commentMessage.trim(),
+            }),
+          }
+        );
+        pendingApproval = res.pendingApproval ?? res.comment?.status === 'pending';
+      }
       setCommentMessage('');
       setCommentFeedback({
         type: 'ok',
-        text:
-          created.status === 'pending'
-            ? '¡Comentario enviado! Quedará publicado cuando el Administrador lo apruebe.'
-            : '¡Comentario publicado!',
+        text: pendingApproval
+          ? '¡Comentario enviado! Quedará publicado cuando el Administrador lo apruebe.'
+          : '¡Comentario publicado!',
       });
       await onRefresh();
     } catch (err) {
@@ -712,7 +728,13 @@ export function HomeView({
   const handleApproveComment = async (commentId: string) => {
     setModeratingCommentId(commentId);
     try {
-      await approveCommentFirestore(commentId);
+      if (auth.currentUser && auth.currentUser.emailVerified) {
+        await approveCommentFirestore(commentId);
+      } else {
+        await apiFetch(`/api/admin/comments/${encodeURIComponent(commentId)}`, {
+          method: 'PATCH',
+        });
+      }
       await onRefresh();
     } catch (err) {
       setCommentFeedback({
@@ -727,7 +749,13 @@ export function HomeView({
   const handleDeleteComment = async (commentId: string) => {
     setModeratingCommentId(commentId);
     try {
-      await deleteCommentFirestore(commentId);
+      if (auth.currentUser && auth.currentUser.emailVerified) {
+        await deleteCommentFirestore(commentId);
+      } else {
+        await apiFetch(`/api/admin/comments/${encodeURIComponent(commentId)}`, {
+          method: 'DELETE',
+        });
+      }
       await onRefresh();
     } catch (err) {
       setCommentFeedback({
@@ -765,78 +793,59 @@ export function HomeView({
           </div>
         </div>
 
-        {/* Tarjeta con Foto de Portada Ancho Completo + Mismo Alto + Efecto 3D y Barra Transparente */}
-        <div className="hero-cover-3d-stage w-screen relative left-1/2 -translate-x-1/2">
+        {/* Tarjeta con Foto de Portada en Proporción Original (sin aplanar) + Ajuste Perfecto en Pantalla + Efecto 3D HD */}
+        <div
+          className="hero-cover-3d-stage w-full mx-auto"
+          style={{
+            maxWidth: 'min(100%, calc((100dvh - 170px) * 1.7908))',
+          }}
+        >
           <div
             onPointerMove={handleHeroPointerMove}
             onPointerLeave={handleHeroPointerLeave}
             style={{
               transform: heroTilt.active
-                ? `rotateX(${heroTilt.rotateX.toFixed(2)}deg) rotateY(${heroTilt.rotateY.toFixed(2)}deg) translateZ(10px)`
+                ? `rotateX(${heroTilt.rotateX.toFixed(2)}deg) rotateY(${heroTilt.rotateY.toFixed(2)}deg) translateZ(8px)`
                 : undefined,
               transformStyle: 'preserve-3d',
             }}
-            className="w-full overflow-hidden glass-lma-card !rounded-none !border-x-0 border-y border-amber-400/70 shadow-[0_28px_64px_rgba(0,0,0,0.82)] transition-transform duration-300 ease-out"
+            className="w-full overflow-hidden glass-lma-card rounded-2xl border-2 border-amber-400/75 shadow-[0_26px_60px_rgba(0,0,0,0.84)] transition-transform duration-300 ease-out"
           >
             <div className="h-1.5 w-full albiceleste-ribbon" aria-hidden="true" />
 
-            {/* Foto de Portada Completa a Ancho Total + Mismo Alto + Efecto 3D HD */}
+            {/* Foto de Portada HD en proporción exacta original (cero estiramiento, cero recorte de bandera o cabra) */}
             {resolvedCoverSrc ? (
-              <div className="relative w-full h-[230px] sm:h-[380px] md:h-[500px] lg:h-[620px] bg-black overflow-hidden border-b border-amber-400/50">
-                {/* Fondo Panorámico 3D que completa el ancho de pantalla con el mismo estadio */}
-                <div
-                  aria-hidden="true"
-                  style={{
-                    transform: heroTilt.active
-                      ? `translate3d(${(heroTilt.rotateY * 1.1).toFixed(1)}px, ${(-heroTilt.rotateX * 1.1).toFixed(1)}px, -20px) scale(1.12)`
-                      : 'scale(1.1)',
-                  }}
-                  className="absolute inset-0 transition-transform duration-300 ease-out pointer-events-none"
-                >
-                  <ResilientImage
-                    src={resolvedCoverSrc}
-                    alt=""
-                    className="w-full h-full object-cover object-center blur-md brightness-[0.64] saturate-[1.2]"
-                    fallbackLabel=""
-                  />
-                </div>
-
-                {/* Plano Frontal Nítido HD: Foto Completa (bandera de atrás + cabra entera en 3D) */}
+              <div className="relative w-full aspect-[1678/937] bg-[#040914] overflow-hidden border-b border-amber-400/50">
                 <div
                   style={{
                     transform: heroTilt.active
-                      ? `translate3d(${(-heroTilt.rotateY * 1.7).toFixed(1)}px, ${(heroTilt.rotateX * 1.7).toFixed(1)}px, 28px)`
+                      ? `translate3d(${(-heroTilt.rotateY * 1.1).toFixed(1)}px, ${(heroTilt.rotateX * 1.1).toFixed(1)}px, 16px)`
                       : undefined,
-                    maskImage:
-                      'linear-gradient(90deg, transparent 0%, black 4%, black 96%, transparent 100%)',
-                    WebkitMaskImage:
-                      'linear-gradient(90deg, transparent 0%, black 4%, black 96%, transparent 100%)',
                   }}
-                  className={`relative z-10 w-full h-full flex items-center justify-center transition-transform duration-300 ease-out ${
+                  className={`relative z-10 w-full h-full transition-transform duration-300 ease-out ${
                     heroTilt.active ? '' : 'hero-cover-3d-idle'
                   }`}
                 >
                   <ResilientImage
                     src={resolvedCoverSrc}
                     alt="La Cabra con la camiseta de Argentina Messi abrazando la Copa del Mundo en 3D frente a la bandera ESTO ES LIGA MASTER ARGENTINA"
-                    className="w-full h-full object-contain object-center contrast-[1.09] brightness-[1.03] saturate-[1.12] drop-shadow-[0_18px_36px_rgba(0,0,0,0.86)]"
+                    className="w-full h-full object-contain object-center contrast-[1.06] brightness-[1.03] saturate-[1.08]"
                     fallbackLabel="Esto es Liga Master Argentina"
                   />
                 </div>
 
-                {/* Reflejo Dorado y Celeste 3D */}
+                {/* Reflejo Dorado y Celeste 3D sutil sin oscurecer la bandera */}
                 <div
                   aria-hidden="true"
                   style={{
-                    background: `radial-gradient(circle at ${heroTilt.glareX}% ${heroTilt.glareY}%, rgba(254, 240, 138, 0.16) 0%, rgba(56, 189, 248, 0.08) 28%, transparent 55%)`,
+                    background: `radial-gradient(circle at ${heroTilt.glareX}% ${heroTilt.glareY}%, rgba(254, 240, 138, 0.12) 0%, rgba(56, 189, 248, 0.06) 28%, transparent 55%)`,
                   }}
                   className="absolute inset-0 z-20 pointer-events-none transition-opacity duration-300 mix-blend-screen"
                 />
                 <div
                   aria-hidden="true"
-                  className="absolute inset-0 z-20 pointer-events-none bg-[radial-gradient(circle_at_50%_50%,transparent_54%,rgba(0,0,0,0.42)_100%)] ring-1 ring-inset ring-amber-300/30"
+                  className="absolute inset-0 z-20 pointer-events-none ring-1 ring-inset ring-amber-300/30"
                 />
-                <div className="absolute inset-x-0 top-0 h-12 z-20 bg-gradient-to-b from-black/35 via-transparent to-transparent pointer-events-none" />
 
                 {user?.role === 'admin' && (
                   <button

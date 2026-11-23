@@ -21,7 +21,7 @@ import {
   uploadBufferToSupabaseStorage,
   uploadFileToSupabaseStorage,
   writeLeagueDbToSupabase,
-} from './src/server/supabaseBackend';
+} from './src/server/supabaseBackend.ts';
 
 dotenv.config({ path: path.resolve(process.cwd(), '.env.local') });
 dotenv.config();
@@ -452,6 +452,7 @@ interface LeagueComment {
 
 type CredentialAuditAction =
   | 'create_participant'
+  | 'self_register'
   | 'update_participant_id'
   | 'reset_participant_password'
   | 'block_participant'
@@ -2434,7 +2435,7 @@ Responde en JSON.`;
 
     const response = await Promise.race([
       ai.models.generateContent({
-        model: 'gemini-4-hydrogen',
+        model: 'gemini-2.5-flash',
         contents: [
           {
             role: 'user',
@@ -3003,6 +3004,127 @@ function buildApiApp(): express.Express {
       const detail = err instanceof Error ? err.message : 'Error interno del servidor.';
       res.status(500).json({
         error: `No se pudo procesar el inicio de sesión en el servidor (${detail}).`,
+      });
+    }
+  });
+
+  // Public visitor self-registration (creates active member account + club with ID + Clave)
+  app.post('/api/auth/register', async (req: Request, res: Response) => {
+    try {
+      if (!checkLoginRateLimit(req)) {
+        res.status(429).json({
+          error: 'Demasiados intentos seguidos. Esperá unos minutos antes de reintentar.',
+        });
+        return;
+      }
+
+      const db = await loadDb({ fresh: true });
+      const memberName = String(req.body?.memberName || '').trim();
+      const teamName = String(req.body?.teamName || '').trim();
+      const requestedId = String(req.body?.id || '').trim().toUpperCase();
+      const clave = String(req.body?.clave || '');
+
+      if (memberName.length < 2 || memberName.length > 60) {
+        res.status(400).json({ error: 'Tu nombre o apodo debe tener entre 2 y 60 caracteres.' });
+        return;
+      }
+      if (teamName.length < 2 || teamName.length > 60) {
+        res.status(400).json({ error: 'El nombre de tu equipo debe tener entre 2 y 60 caracteres.' });
+        return;
+      }
+      if (clave.length < 4 || clave.length > 64) {
+        res.status(400).json({ error: 'La contraseña debe tener entre 4 y 64 caracteres.' });
+        return;
+      }
+
+      const maxTeams = Math.max(2, Number(db.settings.maxTeams) || 100);
+      const teams = Array.isArray(db.teams) ? db.teams : [];
+      if (teams.length >= maxTeams) {
+        res.status(409).json({
+          error: `Se alcanzó el cupo máximo de participantes de la liga (${maxTeams}).`,
+        });
+        return;
+      }
+
+      let teamId = requestedId;
+      if (teamId) {
+        if (!/^[A-Z0-9_-]{2,24}$/.test(teamId)) {
+          res.status(400).json({
+            error: 'El ID elegido debe tener entre 2 y 24 caracteres (solo letras, números, guiones o _).',
+          });
+          return;
+        }
+        if (teamId === db.settings.adminId.toUpperCase() || teamId === 'ADMI') {
+          res.status(400).json({ error: 'Ese ID está reservado para el Administrador.' });
+          return;
+        }
+        if (teams.some((t) => String(t?.id || '').toUpperCase() === teamId)) {
+          res.status(409).json({ error: `El ID ${teamId} ya está en uso. Elegí otro.` });
+          return;
+        }
+      } else {
+        let nextNum = teams.length + 1;
+        teamId = `LMA${String(nextNum).padStart(2, '0')}`;
+        const existingSet = new Set(teams.map((t) => String(t?.id || '').toUpperCase()));
+        while (existingSet.has(teamId) || teamId === db.settings.adminId.toUpperCase()) {
+          nextNum += 1;
+          teamId = `LMA${String(nextNum).padStart(2, '0')}`;
+        }
+      }
+
+      const now = new Date().toISOString();
+      const newTeam: Team = {
+        id: teamId,
+        name: teamName,
+        memberName,
+        crestUrl: `/api/crest/${encodeURIComponent(teamId)}`,
+        bio: '',
+        likes: 0,
+        trophies: [],
+        personalMusic: [],
+        claveHash: hashPassword(clave),
+        tokenVersion: 1,
+        credentialsUpdatedAt: now,
+        accountStatus: 'active',
+        createdAt: now,
+      };
+
+      db.teams.push(newTeam);
+      appendCredentialAudit(db, {
+        action: 'self_register',
+        targetType: 'participant',
+        targetId: newTeam.id,
+        targetLabel: `${newTeam.memberName} (${newTeam.name})`,
+        details: `Registro público de nuevo participante (${newTeam.id}).`,
+        performedBy: newTeam.id,
+      });
+
+      await saveDb(db);
+
+      const payload: TokenPayload = {
+        role: 'member',
+        id: newTeam.id,
+        displayName: `${newTeam.memberName} (${newTeam.name})`,
+        teamId: newTeam.id,
+        tokenVersion: newTeam.tokenVersion ?? 1,
+        exp: Date.now() + 7 * 24 * 60 * 60 * 1000,
+      };
+
+      res.status(201).json({
+        token: signToken(payload),
+        user: {
+          role: payload.role,
+          id: payload.id,
+          displayName: payload.displayName,
+          teamId: payload.teamId,
+        },
+        team: sanitizeTeam(newTeam),
+      });
+    } catch (err) {
+      console.error('Error in /api/auth/register:', err);
+      const detail = err instanceof Error ? err.message : 'Error interno del servidor.';
+      res.status(500).json({
+        error: `No se pudo completar el registro de la cuenta (${detail}).`,
       });
     }
   });
@@ -5591,8 +5713,22 @@ function buildApiApp(): express.Express {
   // Public community videos proxy (reads Firestore videos_comunidad server-side to avoid browser RPC network blocks)
   app.get('/api/community-videos', async (_req: Request, res: Response) => {
     try {
-      const firestoreUrl =
-        'https://firestore.googleapis.com/v1/projects/liga-master-argentina/databases/(default)/documents:runQuery';
+      let projectId = 'gen-lang-client-0563474959';
+      let databaseId = 'ai-studio-lmapes6-4facbcd3-8783-41f7-95b2-99d70eda3a92';
+      try {
+        const cfgPath = path.join(ROOT_DIR, 'firebase-applet-config.json');
+        if (fs.existsSync(cfgPath)) {
+          const parsedCfg = JSON.parse(fs.readFileSync(cfgPath, 'utf8')) as {
+            projectId?: string;
+            firestoreDatabaseId?: string;
+          };
+          if (parsedCfg.projectId?.trim()) projectId = parsedCfg.projectId.trim();
+          if (parsedCfg.firestoreDatabaseId?.trim()) databaseId = parsedCfg.firestoreDatabaseId.trim();
+        }
+      } catch {
+        // Use configured defaults
+      }
+      const firestoreUrl = `https://firestore.googleapis.com/v1/projects/${encodeURIComponent(projectId)}/databases/${encodeURIComponent(databaseId)}/documents:runQuery`;
       const response = await fetch(firestoreUrl, {
         method: 'POST',
         headers: {

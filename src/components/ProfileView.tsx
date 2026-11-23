@@ -67,6 +67,7 @@ import type {
   Team,
   TopGoalItem,
 } from '../types';
+import { auth } from '../firebase';
 import {
   addLeagueMusicFirestore,
   addPersonalMusicFirestore,
@@ -103,6 +104,7 @@ import {
   saveRulesFirestore,
   saveSettingsFirestore,
   saveUserMusicModeFirestore,
+  selfCreateTeamFirestore,
   toggleFeaturedOfficialVideoFirestore,
   updateChampionFirestore,
   updateCupEditionNameFirestore,
@@ -185,6 +187,7 @@ interface ProfileViewProps {
   onNavigate: (tab: NavTab, subTab?: string) => void;
   onViewParticipant?: (teamId: string) => void;
   onLikeTeam?: (teamId: string) => Promise<void>;
+  onAuthUpdate?: (user: AuthUser) => void;
 }
 
 const DEFAULT_CREST = resolveAssetUrl('/assets/aistudio/Liga_Master_Argentina__F_tbol_de__lite_eeeab9aa.png');
@@ -242,6 +245,7 @@ export function ProfileView({
   onNavigate,
   onViewParticipant,
   onLikeTeam,
+  onAuthUpdate,
 }: ProfileViewProps) {
   const [adminTab, setAdminTab] = useState<AdminSection>(initialAdminTab || 'equipos');
   const [participantsSearch, setParticipantsSearch] = useState('');
@@ -303,13 +307,15 @@ export function ProfileView({
   const [personalMp3Msg, setPersonalMp3Msg] = useState<{ type: 'ok' | 'err'; text: string } | null>(null);
   const personalMp3InputRef = useRef<HTMLInputElement | null>(null);
 
+  const [selfClubName, setSelfClubName] = useState('');
+  const [selfMemberName, setSelfMemberName] = useState(user?.displayName || '');
+  const [selfClubId, setSelfClubId] = useState('');
+  const [creatingSelfClub, setCreatingSelfClub] = useState(false);
+  const [selfClubMsg, setSelfClubMsg] = useState<{ type: 'ok' | 'err'; text: string } | null>(null);
+
   useEffect(() => {
     let active = true;
     const refreshLocal = async () => {
-      if (user?.firebaseAuthenticated) {
-        if (active) setLocalPersonalSongs([]);
-        return;
-      }
       const list = await loadPersonalLocalTracks(personalOwnerKey);
       if (active) setLocalPersonalSongs(list);
     };
@@ -322,7 +328,7 @@ export function ProfileView({
       active = false;
       window.removeEventListener('lma:personal-music-changed', onChanged);
     };
-  }, [personalOwnerKey, user?.firebaseAuthenticated]);
+  }, [personalOwnerKey]);
 
   useEffect(() => {
     if (initialAdminTab) {
@@ -1035,7 +1041,14 @@ export function ProfileView({
     e.preventDefault();
     if (!myTeam) return;
     try {
-      await updateMyBioFirestore(myTeam.id, bio);
+      if (auth.currentUser && auth.currentUser.emailVerified) {
+        await updateMyBioFirestore(myTeam.id, bio);
+      } else {
+        await apiFetch('/api/profile', {
+          method: 'PATCH',
+          body: JSON.stringify({ bio }),
+        });
+      }
       setBioSaved(true);
       await onRefresh();
       window.setTimeout(() => setBioSaved(false), 2500);
@@ -1637,8 +1650,17 @@ export function ProfileView({
     setCelebMsg(null);
     setUploadingCeleb(true);
     try {
-      const celebrationImageUrl = await uploadMediaFile('champions', celebFile);
-      await updateMyCelebrationFirestore(myTeam.id, celebrationImageUrl, user?.role === 'admin');
+      if (auth.currentUser && auth.currentUser.emailVerified) {
+        const celebrationImageUrl = await uploadMediaFile('champions', celebFile);
+        await updateMyCelebrationFirestore(myTeam.id, celebrationImageUrl, user?.role === 'admin');
+      } else {
+        const form = new FormData();
+        form.append('image', celebFile);
+        await apiFetch('/api/profile/celebration', {
+          method: 'POST',
+          body: form,
+        });
+      }
       setCelebFile(null);
       if (celebInputRef.current) celebInputRef.current.value = '';
       await onRefresh();
@@ -1647,7 +1669,7 @@ export function ProfileView({
         text:
           user?.role === 'admin'
             ? 'Foto de festejo publicada en tu perfil.'
-            : 'Foto de festejo subida a Cloud Firestore y sujeta a verificación del Administrador.',
+            : 'Foto de festejo subida y sujeta a verificación del Administrador.',
       });
     } catch (err) {
       setCelebMsg({
@@ -1663,7 +1685,11 @@ export function ProfileView({
     if (!myTeam) return;
     setCelebMsg(null);
     try {
-      await deleteMyCelebrationFirestore(myTeam.id);
+      if (auth.currentUser && auth.currentUser.emailVerified) {
+        await deleteMyCelebrationFirestore(myTeam.id);
+      } else {
+        await apiFetch('/api/profile/celebration', { method: 'DELETE' });
+      }
       await onRefresh();
       setCelebMsg({ type: 'ok', text: 'Foto de festejo quitada de tu perfil.' });
     } catch (err) {
@@ -2045,7 +2071,11 @@ export function ProfileView({
     setCommentBusyId(commentId);
     setCommentModMsg(null);
     try {
-      await approveCommentFirestore(commentId);
+      if (auth.currentUser && auth.currentUser.emailVerified) {
+        await approveCommentFirestore(commentId);
+      } else {
+        await apiFetch(`/api/admin/comments/${encodeURIComponent(commentId)}`, { method: 'PATCH' });
+      }
       await onRefresh();
       setCommentModMsg({ type: 'ok', text: 'Comentario aprobado y visible para todos en el Inicio.' });
     } catch (err) {
@@ -2062,7 +2092,11 @@ export function ProfileView({
     setCommentBusyId(commentId);
     setCommentModMsg(null);
     try {
-      await deleteCommentFirestore(commentId);
+      if (auth.currentUser && auth.currentUser.emailVerified) {
+        await deleteCommentFirestore(commentId);
+      } else {
+        await apiFetch(`/api/admin/comments/${encodeURIComponent(commentId)}`, { method: 'DELETE' });
+      }
       await onRefresh();
       setCommentModMsg({ type: 'ok', text: 'Comentario eliminado.' });
     } catch (err) {
@@ -2435,6 +2469,121 @@ export function ProfileView({
         </section>
       )}
 
+      {/* Alta automática de Club para cuentas Google nuevas sin equipo asignado */}
+      {user.role !== 'admin' && !myTeam && user.firebaseAuthenticated && (
+        <section className="p-6 bg-[#071D38]/95 border-2 border-amber-400/65 rounded-2xl space-y-4 shadow-xl">
+          <div>
+            <h2 className="font-display text-2xl font-extrabold text-lma-title flex items-center gap-2">
+              <ShieldCheck className="w-6 h-6 text-amber-300" />
+              <span>Creá tu Club para Jugar en la Liga</span>
+            </h2>
+            <p className="text-xs text-sky-200/85 mt-1">
+              Tu cuenta de Google ya está conectada. Elegí el nombre de tu equipo para aparecer en la Tabla de Posiciones, cargar resultados, enviar reclamos y personalizar tu perfil.
+            </p>
+          </div>
+
+          {selfClubMsg && (
+            <div
+              className={`p-3 rounded-xl text-xs font-semibold border ${
+                selfClubMsg.type === 'ok'
+                  ? 'bg-emerald-500/15 border-emerald-400/50 text-emerald-200'
+                  : 'bg-rose-500/15 border-rose-400/50 text-rose-200'
+              }`}
+            >
+              {selfClubMsg.text}
+            </div>
+          )}
+
+          <form
+            onSubmit={async (e) => {
+              e.preventDefault();
+              setSelfClubMsg(null);
+              setCreatingSelfClub(true);
+              try {
+                const created = await selfCreateTeamFirestore({
+                  name: selfClubName.trim(),
+                  memberName: selfMemberName.trim() || user.displayName || 'Jugador',
+                  customId: selfClubId.trim() || undefined,
+                  existingTeamIds: teams.map((t) => t.id),
+                });
+                onAuthUpdate?.({
+                  ...user,
+                  id: created.id,
+                  teamId: created.teamId,
+                  displayName: created.displayName,
+                });
+                setSelfClubName('');
+                setSelfClubId('');
+                setSelfClubMsg({
+                  type: 'ok',
+                  text: `¡Club creado! Tu ID oficial es ${created.teamId}. Ya podés cargar partidos y competir.`,
+                });
+                await onRefresh();
+              } catch (err) {
+                setSelfClubMsg({
+                  type: 'err',
+                  text: err instanceof Error ? err.message : 'No se pudo crear tu club.',
+                });
+              } finally {
+                setCreatingSelfClub(false);
+              }
+            }}
+            className="grid grid-cols-1 sm:grid-cols-4 gap-3 items-end"
+          >
+            <div>
+              <label className="block text-xs font-semibold text-amber-200 mb-1">
+                Tu Nombre / Apodo *
+              </label>
+              <input
+                type="text"
+                required
+                minLength={2}
+                maxLength={60}
+                value={selfMemberName}
+                onChange={(e) => setSelfMemberName(e.target.value)}
+                placeholder="Ej: Marcos 10"
+                className="w-full px-3 py-2 text-xs bg-[#041224] text-white border border-amber-400/45 rounded-lg"
+              />
+            </div>
+            <div>
+              <label className="block text-xs font-semibold text-amber-200 mb-1">
+                Nombre de tu Club *
+              </label>
+              <input
+                type="text"
+                required
+                minLength={2}
+                maxLength={60}
+                value={selfClubName}
+                onChange={(e) => setSelfClubName(e.target.value)}
+                placeholder="Ej: Racing PES6"
+                className="w-full px-3 py-2 text-xs bg-[#041224] text-white border border-amber-400/45 rounded-lg"
+              />
+            </div>
+            <div>
+              <label className="block text-xs font-semibold text-amber-200 mb-1">
+                ID (opcional)
+              </label>
+              <input
+                type="text"
+                maxLength={24}
+                value={selfClubId}
+                onChange={(e) => setSelfClubId(e.target.value.toUpperCase())}
+                placeholder="Automático (LMAxx)"
+                className="w-full px-3 py-2 text-xs bg-[#041224] text-white border border-amber-400/45 rounded-lg font-mono"
+              />
+            </div>
+            <button
+              type="submit"
+              disabled={creatingSelfClub}
+              className="px-4 py-2 text-xs font-extrabold btn-gold-luxury rounded-lg disabled:opacity-50 h-[34px]"
+            >
+              {creatingSelfClub ? 'Creando...' : 'Crear mi Club'}
+            </button>
+          </form>
+        </section>
+      )}
+
       {/* Full History, Effectiveness %, Championships Won & Profile Celebration Photo (Member & Participating Admin) */}
       {myTeam && (
         <section className="p-6 bg-[#071D38]/95 border border-amber-400/50 rounded-2xl space-y-6">
@@ -2738,16 +2887,23 @@ export function ProfileView({
                                 setSavingTrophyId(trophy.id);
                                 setTrophyFeedback(null);
                                 try {
-                                  await updateTrophyMessageFirestore(
-                                    myTeam.id,
-                                    trophy.id,
-                                    trophyMsgDraft.trim()
-                                  );
+                                  if (auth.currentUser && auth.currentUser.emailVerified) {
+                                    await updateTrophyMessageFirestore(
+                                      myTeam.id,
+                                      trophy.id,
+                                      trophyMsgDraft.trim()
+                                    );
+                                  } else {
+                                    await apiFetch(`/api/profile/trophies/${encodeURIComponent(trophy.id)}/message`, {
+                                      method: 'PATCH',
+                                      body: JSON.stringify({ message: trophyMsgDraft.trim() }),
+                                    });
+                                  }
                                   setEditingTrophyId(null);
                                   await onRefresh();
                                   setTrophyFeedback({
                                     type: 'ok',
-                                    text: 'Mensaje del trofeo guardado en Cloud Firestore.',
+                                    text: 'Mensaje del trofeo guardado.',
                                   });
                                 } catch (err) {
                                   setTrophyFeedback({
@@ -2805,7 +2961,14 @@ export function ProfileView({
                                   setSavingTrophyId(trophy.id);
                                   setTrophyFeedback(null);
                                   try {
-                                    await updateTrophyMessageFirestore(myTeam.id, trophy.id, '');
+                                    if (auth.currentUser && auth.currentUser.emailVerified) {
+                                      await updateTrophyMessageFirestore(myTeam.id, trophy.id, '');
+                                    } else {
+                                      await apiFetch(`/api/profile/trophies/${encodeURIComponent(trophy.id)}/message`, {
+                                        method: 'PATCH',
+                                        body: JSON.stringify({ message: '' }),
+                                      });
+                                    }
                                     await onRefresh();
                                     setTrophyFeedback({
                                       type: 'ok',
@@ -2839,7 +3002,7 @@ export function ProfileView({
       )}
 
       {/* Reproductor MP3 Personal Independiente de Cada Miembro */}
-      {(myTeam || user?.firebaseAuthenticated) && (
+      {(myTeam || user) && (
         <section className="p-6 bg-[#071D38]/95 border border-amber-400/50 rounded-2xl space-y-4 shadow-xl">
           <div className="flex flex-wrap items-center justify-between gap-3">
             <div>
@@ -2869,32 +3032,50 @@ export function ProfileView({
                   setPersonalMp3Msg(null);
                   try {
                     if (user?.firebaseAuthenticated) {
+                      const localFallbackFiles: File[] = [];
+                      let cloudCount = 0;
                       for (const f of files) {
-                        const audioUrl = await uploadMediaFile('music', f);
-                        const baseName = f.name.replace(/\.[^.]+$/, '').replace(/[_-]+/g, ' ').trim();
-                        const trackPayload: MusicTrack = {
-                          id: `pm_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
-                          title: baseName || 'Canción MP3',
-                          artist: myTeam?.memberName || user.displayName || 'Mi Lista MP3',
-                          audioUrl,
-                          createdAt: new Date().toISOString(),
-                        };
-                        if (myTeam) {
-                          await addPersonalMusicFirestore(myTeam.id, trackPayload);
-                        } else {
-                          await addUserPersonalMusicFirestore(trackPayload);
+                        try {
+                          const audioUrl = await uploadMediaFile('music', f);
+                          const baseName = f.name.replace(/\.[^.]+$/, '').replace(/[_-]+/g, ' ').trim();
+                          const trackPayload: MusicTrack = {
+                            id: `pm_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+                            title: baseName || 'Canción MP3',
+                            artist: myTeam?.memberName || user.displayName || 'Mi Lista MP3',
+                            audioUrl,
+                            createdAt: new Date().toISOString(),
+                          };
+                          if (myTeam) {
+                            await addPersonalMusicFirestore(myTeam.id, trackPayload);
+                          } else {
+                            await addUserPersonalMusicFirestore(trackPayload);
+                          }
+                          cloudCount += 1;
+                        } catch {
+                          localFallbackFiles.push(f);
                         }
                       }
-                      await saveUserMusicModeFirestore('personal');
-                      await onRefresh();
+                      if (localFallbackFiles.length > 0) {
+                        await savePersonalLocalTracks(
+                          personalOwnerKey,
+                          localFallbackFiles,
+                          myTeam?.memberName || user.displayName || 'Mi Lista MP3'
+                        );
+                      }
+                      await saveUserMusicModeFirestore('personal').catch(() => undefined);
+                      if (cloudCount > 0) await onRefresh();
                       notifyPersonalMusicChanged({ switchToPersonal: true });
-                    } else if (myTeam) {
-                      await savePersonalLocalTracks(personalOwnerKey, files, myTeam.memberName || 'Mi Lista MP3');
+                    } else {
+                      await savePersonalLocalTracks(
+                        personalOwnerKey,
+                        files,
+                        myTeam?.memberName || user?.displayName || 'Mi Lista MP3'
+                      );
                       notifyPersonalMusicChanged({ switchToPersonal: true });
                     }
                     setPersonalMp3Msg({
                       type: 'ok',
-                      text: `Se agregaron ${files.length} canción(es) y se copiaron automáticamente a "Mi Música" en Cloud Firestore.`,
+                      text: `Se agregaron ${files.length} canción(es) y se copiaron automáticamente a "Mi Música" en tu reproductor.`,
                     });
                   } catch (err) {
                     setPersonalMp3Msg({
@@ -2925,9 +3106,10 @@ export function ProfileView({
 
           {(() => {
             const cloudPersonal = myTeam ? myTeam.personalMusic || [] : userPersonalMusic;
-            const combinedPersonal: Array<MusicTrack & { isLocal?: boolean }> = user?.firebaseAuthenticated
-              ? cloudPersonal
-              : [...cloudPersonal, ...localPersonalSongs];
+            const combinedPersonal: Array<MusicTrack & { isLocal?: boolean }> = [
+              ...cloudPersonal,
+              ...localPersonalSongs,
+            ];
             if (combinedPersonal.length === 0) {
               return (
                 <div className="p-4 rounded-xl bg-[#041224]/85 border border-sky-400/25 text-xs text-sky-200/80 text-center">
@@ -2968,12 +3150,18 @@ export function ProfileView({
                           if (tr.isLocal) {
                             await deletePersonalLocalTrack(tr.id);
                             notifyPersonalMusicChanged();
-                          } else if (myTeam) {
+                          } else if (myTeam && user?.firebaseAuthenticated) {
                             await deletePersonalMusicFirestore(myTeam.id, tr.id);
                             await onRefresh();
                             notifyPersonalMusicChanged();
                           } else if (user?.firebaseAuthenticated) {
                             await deleteUserPersonalMusicFirestore(tr.id);
+                            await onRefresh();
+                            notifyPersonalMusicChanged();
+                          } else {
+                            await apiFetch(`/api/profile/music/${encodeURIComponent(tr.id)}`, {
+                              method: 'DELETE',
+                            });
                             await onRefresh();
                             notifyPersonalMusicChanged();
                           }

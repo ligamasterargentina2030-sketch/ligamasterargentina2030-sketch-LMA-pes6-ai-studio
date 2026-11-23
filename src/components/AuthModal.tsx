@@ -1,9 +1,9 @@
 import { useEffect, useState, type FormEvent } from 'react';
-import { KeyRound, Mail, ShieldCheck, X } from 'lucide-react';
+import { KeyRound, Mail, ShieldCheck, UserPlus, X } from 'lucide-react';
 import { signInWithPopup } from 'firebase/auth';
 import { auth, googleProvider } from '../firebase';
 import { resolveOrLinkFirebaseMember } from '../services/firestoreLeague';
-import type { AuthUser } from '../types';
+import type { AuthUser, PublicTeam } from '../types';
 import { apiFetch, setStoredToken } from '../utils/api';
 import {
   formatFirebaseAuthResetError,
@@ -15,7 +15,7 @@ interface AuthModalProps {
   prefillId?: string;
   staticHostingMode?: boolean;
   onClose: () => void;
-  onSuccess: (user: AuthUser) => void;
+  onSuccess: (user: AuthUser, createdTeam?: PublicTeam) => void;
 }
 
 export function AuthModal({
@@ -25,8 +25,14 @@ export function AuthModal({
   onClose,
   onSuccess,
 }: AuthModalProps) {
+  const [mode, setMode] = useState<'login' | 'register'>('login');
   const [id, setId] = useState(prefillId || '');
   const [clave, setClave] = useState('');
+  const [regMemberName, setRegMemberName] = useState('');
+  const [regTeamName, setRegTeamName] = useState('');
+  const [regCustomId, setRegCustomId] = useState('');
+  const [regClave, setRegClave] = useState('');
+  const [regClaveConfirm, setRegClaveConfirm] = useState('');
   const [loading, setLoading] = useState(false);
   const [googleLoading, setGoogleLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -123,6 +129,42 @@ export function AuthModal({
     }
   };
 
+  const handleRegisterSubmit = async (e: FormEvent) => {
+    e.preventDefault();
+    setError(null);
+    if (regClave !== regClaveConfirm) {
+      setError('Las contraseñas no coinciden. Verificalas antes de continuar.');
+      return;
+    }
+    setLoading(true);
+    try {
+      const res = await apiFetch<{ token: string; user: AuthUser; team?: PublicTeam }>(
+        '/api/auth/register',
+        {
+          method: 'POST',
+          body: JSON.stringify({
+            memberName: regMemberName.trim(),
+            teamName: regTeamName.trim(),
+            id: regCustomId.trim() || undefined,
+            clave: regClave,
+          }),
+        }
+      );
+      setStoredToken(res.token);
+      onSuccess(res.user, res.team);
+      setRegMemberName('');
+      setRegTeamName('');
+      setRegCustomId('');
+      setRegClave('');
+      setRegClaveConfirm('');
+      onClose();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'No se pudo crear tu cuenta.');
+    } finally {
+      setLoading(false);
+    }
+  };
+
   const handleSendFirebaseReset = async (e: FormEvent) => {
     e.preventDefault();
     setRecoveryError(null);
@@ -154,14 +196,16 @@ export function AuthModal({
         <div className="flex items-center justify-between px-6 py-4 bg-gradient-to-r from-black/75 via-[#08264A]/65 to-black/75 text-white border-b border-yellow-400/45">
           <div className="flex items-center gap-2.5">
             <div className="p-1.5 rounded-lg bg-yellow-400 text-zinc-950 shadow-[0_0_16px_rgba(250,204,21,0.8)]">
-              <KeyRound className="w-5 h-5" />
+              {mode === 'register' ? <UserPlus className="w-5 h-5" /> : <KeyRound className="w-5 h-5" />}
             </div>
             <div>
               <h2 className="font-display text-2xl font-bold tracking-tight text-lma-title">
-                Ingresar a Cuenta
+                {mode === 'register' ? 'Crear Cuenta Nueva' : 'Ingresar a Cuenta'}
               </h2>
               <p className="text-[11px] text-sky-200/90">
-                Acceso con tu ID y Clave (Miembros y Administrador)
+                {mode === 'register'
+                  ? 'Registro abierto para cualquier visitante o nuevo jugador'
+                  : 'Acceso con tu ID y Clave (Miembros y Administrador)'}
               </p>
             </div>
           </div>
@@ -176,6 +220,38 @@ export function AuthModal({
         </div>
 
         <div className="p-6 space-y-4">
+          {/* Selector Iniciar Sesión / Registrarse */}
+          <div className="grid grid-cols-2 gap-1.5 p-1 rounded-xl bg-black/60 border border-yellow-400/35">
+            <button
+              type="button"
+              onClick={() => {
+                setMode('login');
+                setError(null);
+              }}
+              className={`py-2 text-xs font-extrabold rounded-lg transition-all ${
+                mode === 'login'
+                  ? 'bg-yellow-400 text-zinc-950 shadow-[0_0_14px_rgba(250,204,21,0.5)]'
+                  : 'text-sky-200 hover:text-white'
+              }`}
+            >
+              Ingresar
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                setMode('register');
+                setError(null);
+              }}
+              className={`py-2 text-xs font-extrabold rounded-lg transition-all ${
+                mode === 'register'
+                  ? 'bg-yellow-400 text-zinc-950 shadow-[0_0_14px_rgba(250,204,21,0.5)]'
+                  : 'text-sky-200 hover:text-white'
+              }`}
+            >
+              Registrarse
+            </button>
+          </div>
+
           {error && (
             <div className="p-3 text-sm font-medium text-rose-100 bg-rose-950/75 border border-rose-400/55 rounded-lg leading-relaxed">
               {error}
@@ -184,77 +260,193 @@ export function AuthModal({
 
           {staticHostingMode && (
             <div className="p-3 text-xs text-amber-100 bg-amber-950/65 border border-amber-400/55 rounded-lg leading-relaxed">
-              <strong>Modo estático detectado:</strong> Si no hay servidor API conectado (`VITE_API_BASE_URL`), podés usar <strong>Ingresar con Google</strong> abajo para acceder directamente vía Cloud Firestore.
+              <strong>Modo estático detectado:</strong> Si no hay servidor API conectado (`VITE_API_BASE_URL`), podés usar <strong>Ingresar con Google</strong> abajo para registrarte o acceder directamente vía Cloud Firestore.
             </div>
           )}
 
-          {/* Formulario Principal: ID y Clave visible al instante */}
-          <form onSubmit={handleSubmit} className="p-4 rounded-xl bg-black/50 border border-yellow-400/55 space-y-3.5 shadow-[inset_0_1px_0_rgba(255,255,255,0.08)]">
-            <div className="flex items-center justify-between gap-2">
-              <span className="text-xs font-bold uppercase tracking-wider text-yellow-300">
-                Iniciar Sesión con ID y Clave
-              </span>
-              <span className="text-[10px] font-semibold px-2 py-0.5 rounded bg-sky-400/15 border border-sky-300/35 text-sky-200">
-                Admin · Miembros
-              </span>
-            </div>
+          {mode === 'login' ? (
+            <form onSubmit={handleSubmit} className="p-4 rounded-xl bg-black/50 border border-yellow-400/55 space-y-3.5 shadow-[inset_0_1px_0_rgba(255,255,255,0.08)]">
+              <div className="flex items-center justify-between gap-2">
+                <span className="text-xs font-bold uppercase tracking-wider text-yellow-300">
+                  Iniciar Sesión con ID y Clave
+                </span>
+                <span className="text-[10px] font-semibold px-2 py-0.5 rounded bg-sky-400/15 border border-sky-300/35 text-sky-200">
+                  Admin · Miembros
+                </span>
+              </div>
 
-            <div>
-              <label
-                className="block text-xs font-semibold text-white mb-1.5"
-                htmlFor="login-id"
-              >
-                ID de usuario
-              </label>
-              <input
-                id="login-id"
-                type="text"
-                required
-                autoFocus
-                autoComplete="username"
-                value={id}
-                onChange={(e) => setId(e.target.value)}
-                placeholder="Ej: LMA01 o ID de Administrador"
-                className="w-full px-3.5 py-2.5 text-sm bg-black/70 text-white placeholder:text-zinc-400 border border-yellow-400/50 rounded-lg focus:outline-none focus:ring-2 focus:ring-yellow-400 font-mono"
-              />
-            </div>
+              <div>
+                <label
+                  className="block text-xs font-semibold text-white mb-1.5"
+                  htmlFor="login-id"
+                >
+                  ID de usuario
+                </label>
+                <input
+                  id="login-id"
+                  type="text"
+                  required
+                  autoFocus
+                  autoComplete="username"
+                  value={id}
+                  onChange={(e) => setId(e.target.value)}
+                  placeholder="Ej: LMA01 o ID de Administrador"
+                  className="w-full px-3.5 py-2.5 text-sm bg-black/70 text-white placeholder:text-zinc-400 border border-yellow-400/50 rounded-lg focus:outline-none focus:ring-2 focus:ring-yellow-400 font-mono"
+                />
+              </div>
 
-            <div>
-              <label
-                className="block text-xs font-semibold text-white mb-1.5"
-                htmlFor="login-clave"
-              >
-                Clave / Contraseña
-              </label>
-              <input
-                id="login-clave"
-                type="password"
-                required
-                autoComplete="current-password"
-                value={clave}
-                onChange={(e) => setClave(e.target.value)}
-                placeholder="Ingresá tu clave secreta"
-                className="w-full px-3.5 py-2.5 text-sm bg-black/70 text-white placeholder:text-zinc-400 border border-yellow-400/50 rounded-lg focus:outline-none focus:ring-2 focus:ring-yellow-400"
-              />
-            </div>
+              <div>
+                <label
+                  className="block text-xs font-semibold text-white mb-1.5"
+                  htmlFor="login-clave"
+                >
+                  Clave / Contraseña
+                </label>
+                <input
+                  id="login-clave"
+                  type="password"
+                  required
+                  autoComplete="current-password"
+                  value={clave}
+                  onChange={(e) => setClave(e.target.value)}
+                  placeholder="Ingresá tu clave secreta"
+                  className="w-full px-3.5 py-2.5 text-sm bg-black/70 text-white placeholder:text-zinc-400 border border-yellow-400/50 rounded-lg focus:outline-none focus:ring-2 focus:ring-yellow-400"
+                />
+              </div>
 
-            <div className="flex items-center justify-end gap-3 pt-1">
-              <button
-                type="button"
-                onClick={onClose}
-                className="px-4 py-2 text-sm font-medium text-sky-200 hover:text-white rounded-lg transition-colors"
-              >
-                Cancelar
-              </button>
-              <button
-                type="submit"
-                disabled={loading || googleLoading}
-                className="px-6 py-2.5 text-sm font-extrabold bg-yellow-400 hover:bg-yellow-300 text-zinc-950 border border-yellow-200 shadow-[0_0_20px_rgba(250,204,21,0.65)] disabled:opacity-60 rounded-lg transition-all"
-              >
-                {loading ? 'VERIFICANDO...' : 'INGRESAR CON ID Y CLAVE'}
-              </button>
-            </div>
-          </form>
+              <div className="flex items-center justify-end gap-3 pt-1">
+                <button
+                  type="button"
+                  onClick={onClose}
+                  className="px-4 py-2 text-sm font-medium text-sky-200 hover:text-white rounded-lg transition-colors"
+                >
+                  Cancelar
+                </button>
+                <button
+                  type="submit"
+                  disabled={loading || googleLoading}
+                  className="px-6 py-2.5 text-sm font-extrabold bg-yellow-400 hover:bg-yellow-300 text-zinc-950 border border-yellow-200 shadow-[0_0_20px_rgba(250,204,21,0.65)] disabled:opacity-60 rounded-lg transition-all"
+                >
+                  {loading ? 'VERIFICANDO...' : 'INGRESAR CON ID Y CLAVE'}
+                </button>
+              </div>
+            </form>
+          ) : (
+            <form onSubmit={handleRegisterSubmit} className="p-4 rounded-xl bg-black/50 border border-yellow-400/55 space-y-3 shadow-[inset_0_1px_0_rgba(255,255,255,0.08)]">
+              <div className="flex items-center justify-between gap-2">
+                <span className="text-xs font-bold uppercase tracking-wider text-yellow-300">
+                  Registro Rápido de Miembro
+                </span>
+                <span className="text-[10px] font-semibold px-2 py-0.5 rounded bg-emerald-400/15 border border-emerald-300/35 text-emerald-200">
+                  Acceso Inmediato
+                </span>
+              </div>
+
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+                <div>
+                  <label className="block text-xs font-semibold text-white mb-1" htmlFor="reg-member">
+                    Tu Nombre / Apodo *
+                  </label>
+                  <input
+                    id="reg-member"
+                    type="text"
+                    required
+                    minLength={2}
+                    maxLength={60}
+                    value={regMemberName}
+                    onChange={(e) => setRegMemberName(e.target.value)}
+                    placeholder="Ej: Marcos 10"
+                    className="w-full px-3 py-2 text-sm bg-black/70 text-white placeholder:text-zinc-400 border border-yellow-400/50 rounded-lg focus:outline-none focus:ring-2 focus:ring-yellow-400"
+                  />
+                </div>
+                <div>
+                  <label className="block text-xs font-semibold text-white mb-1" htmlFor="reg-team">
+                    Nombre de tu Club *
+                  </label>
+                  <input
+                    id="reg-team"
+                    type="text"
+                    required
+                    minLength={2}
+                    maxLength={60}
+                    value={regTeamName}
+                    onChange={(e) => setRegTeamName(e.target.value)}
+                    placeholder="Ej: Boca PES6"
+                    className="w-full px-3 py-2 text-sm bg-black/70 text-white placeholder:text-zinc-400 border border-yellow-400/50 rounded-lg focus:outline-none focus:ring-2 focus:ring-yellow-400"
+                  />
+                </div>
+              </div>
+
+              <div>
+                <label className="block text-xs font-semibold text-white mb-1" htmlFor="reg-id">
+                  ID de Usuario (opcional — automático si lo dejás vacío)
+                </label>
+                <input
+                  id="reg-id"
+                  type="text"
+                  maxLength={24}
+                  value={regCustomId}
+                  onChange={(e) => setRegCustomId(e.target.value.toUpperCase())}
+                  placeholder="Ej: MARCOS10 (o dejalo libre para LMAxx)"
+                  className="w-full px-3 py-2 text-sm bg-black/70 text-white placeholder:text-zinc-400 border border-yellow-400/40 rounded-lg focus:outline-none focus:ring-2 focus:ring-yellow-400 font-mono"
+                />
+              </div>
+
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+                <div>
+                  <label className="block text-xs font-semibold text-white mb-1" htmlFor="reg-clave">
+                    Clave (mín. 4) *
+                  </label>
+                  <input
+                    id="reg-clave"
+                    type="password"
+                    required
+                    minLength={4}
+                    maxLength={64}
+                    autoComplete="new-password"
+                    value={regClave}
+                    onChange={(e) => setRegClave(e.target.value)}
+                    placeholder="Elegí tu contraseña"
+                    className="w-full px-3 py-2 text-sm bg-black/70 text-white placeholder:text-zinc-400 border border-yellow-400/50 rounded-lg focus:outline-none focus:ring-2 focus:ring-yellow-400"
+                  />
+                </div>
+                <div>
+                  <label className="block text-xs font-semibold text-white mb-1" htmlFor="reg-clave2">
+                    Repetir Clave *
+                  </label>
+                  <input
+                    id="reg-clave2"
+                    type="password"
+                    required
+                    minLength={4}
+                    maxLength={64}
+                    autoComplete="new-password"
+                    value={regClaveConfirm}
+                    onChange={(e) => setRegClaveConfirm(e.target.value)}
+                    placeholder="Repetí tu clave"
+                    className="w-full px-3 py-2 text-sm bg-black/70 text-white placeholder:text-zinc-400 border border-yellow-400/50 rounded-lg focus:outline-none focus:ring-2 focus:ring-yellow-400"
+                  />
+                </div>
+              </div>
+
+              <div className="flex items-center justify-end gap-3 pt-1">
+                <button
+                  type="button"
+                  onClick={onClose}
+                  className="px-4 py-2 text-sm font-medium text-sky-200 hover:text-white rounded-lg transition-colors"
+                >
+                  Cancelar
+                </button>
+                <button
+                  type="submit"
+                  disabled={loading || googleLoading}
+                  className="px-5 py-2.5 text-sm font-extrabold bg-yellow-400 hover:bg-yellow-300 text-zinc-950 border border-yellow-200 shadow-[0_0_20px_rgba(250,204,21,0.65)] disabled:opacity-60 rounded-lg transition-all"
+                >
+                  {loading ? 'CREANDO CUENTA...' : 'CREAR MI CUENTA Y ENTRAR'}
+                </button>
+              </div>
+            </form>
+          )}
 
           <div className="relative flex items-center py-0.5">
             <div className="flex-grow border-t border-sky-400/25" />

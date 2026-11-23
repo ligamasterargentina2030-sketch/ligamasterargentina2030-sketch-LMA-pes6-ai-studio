@@ -192,16 +192,10 @@ export function MusicBar({
     setPlaylistMode(musicMode);
   }, [musicMode]);
 
+  const dreamersInitRef = useRef(false);
+  const manualTrackSelectionRef = useRef(false);
+
   const reloadLocalPersonal = useCallback(async () => {
-    if (user?.firebaseAuthenticated) {
-      setLocalPersonalTracks((prev) => {
-        for (const old of prev) {
-          if (old.audioUrl.startsWith('blob:')) URL.revokeObjectURL(old.audioUrl);
-        }
-        return [];
-      });
-      return;
-    }
     const loaded = await loadPersonalLocalTracks(ownerKey);
     setLocalPersonalTracks((prev) => {
       for (const old of prev) {
@@ -209,7 +203,7 @@ export function MusicBar({
       }
       return loaded;
     });
-  }, [ownerKey, user?.firebaseAuthenticated]);
+  }, [ownerKey]);
 
   useEffect(() => {
     void reloadLocalPersonal();
@@ -217,6 +211,7 @@ export function MusicBar({
       void reloadLocalPersonal();
       const customEv = ev as CustomEvent<{ switchToPersonal?: boolean } | undefined>;
       if (customEv.detail?.switchToPersonal) {
+        manualTrackSelectionRef.current = true;
         setPlaylistMode('personal');
         setCurrentIndex(0);
         void onChangeMusicMode?.('personal');
@@ -236,8 +231,27 @@ export function MusicBar({
     playlistMode === 'personal' && personalTracks.length > 0 ? personalTracks : tracks;
   const usingPersonal = playlistMode === 'personal' && personalTracks.length > 0;
 
-  const [currentIndex, setCurrentIndex] = useState(0);
+  const [currentIndex, setCurrentIndex] = useState(() => {
+    const idx = tracks.findIndex((t) => t.id === 'track_pes_dreamers' || /dreamers/i.test(t.title));
+    return idx >= 0 ? idx : 0;
+  });
   const [isPlaying, setIsPlaying] = useState(false);
+
+  useEffect(() => {
+    if (
+      dreamersInitRef.current ||
+      manualTrackSelectionRef.current ||
+      playlistMode !== 'league' ||
+      tracks.length === 0
+    ) {
+      return;
+    }
+    const idx = tracks.findIndex((t) => t.id === 'track_pes_dreamers' || /dreamers/i.test(t.title));
+    if (idx >= 0) {
+      dreamersInitRef.current = true;
+      setCurrentIndex(idx);
+    }
+  }, [tracks, playlistMode]);
   const [autoplayBlocked, setAutoplayBlocked] = useState(false);
   const [volume, setVolume] = useState(0.55);
   const [muted, setMuted] = useState(false);
@@ -557,6 +571,7 @@ export function MusicBar({
     if (activeTracks.length === 0) return;
     stopRadio();
     userPausedRef.current = false;
+    manualTrackSelectionRef.current = true;
     setCurrentIndex((prev) => (prev + 1) % activeTracks.length);
     setIsPlaying(true);
   };
@@ -565,11 +580,13 @@ export function MusicBar({
     if (activeTracks.length === 0) return;
     stopRadio();
     userPausedRef.current = false;
+    manualTrackSelectionRef.current = true;
     setCurrentIndex((prev) => (prev - 1 + activeTracks.length) % activeTracks.length);
     setIsPlaying(true);
   };
 
   const switchPlaylistMode = (mode: 'personal' | 'league') => {
+    manualTrackSelectionRef.current = true;
     setPlaylistMode(mode);
     setCurrentIndex(0);
     setErrorMsg(null);
@@ -640,33 +657,51 @@ export function MusicBar({
     if (!fileList || fileList.length === 0) return;
     setTrackFormError(null);
     setAddingTrack(true);
+    manualTrackSelectionRef.current = true;
     const files = Array.from(fileList);
     try {
       if (user?.firebaseAuthenticated) {
         const targetTeamId = personalTeamId || user.teamId;
+        const localFallbackFiles: File[] = [];
+        let uploadedCount = 0;
+
         for (const file of files) {
-          const audioUrl = await uploadMediaFile('music', file);
-          const rawTitle = file.name.replace(/\.[^/.]+$/, '').trim() || 'Mi Canción MP3';
-          const trackPayload: MusicTrack = {
-            id: `pm_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
-            title: rawTitle,
-            artist: user.displayName || 'Mi Lista MP3',
-            audioUrl,
-            createdAt: new Date().toISOString(),
-          };
-          if (targetTeamId) {
-            await addPersonalMusicFirestore(targetTeamId, trackPayload);
-          } else {
-            await addUserPersonalMusicFirestore(trackPayload);
+          try {
+            const audioUrl = await uploadMediaFile('music', file);
+            const rawTitle = file.name.replace(/\.[^/.]+$/, '').trim() || 'Mi Canción MP3';
+            const trackPayload: MusicTrack = {
+              id: `pm_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+              title: rawTitle,
+              artist: user.displayName || 'Mi Lista MP3',
+              audioUrl,
+              createdAt: new Date().toISOString(),
+            };
+            if (targetTeamId) {
+              await addPersonalMusicFirestore(targetTeamId, trackPayload);
+            } else {
+              await addUserPersonalMusicFirestore(trackPayload);
+            }
+            uploadedCount += 1;
+          } catch {
+            localFallbackFiles.push(file);
           }
         }
-        if (onRefresh) await onRefresh();
+
+        if (localFallbackFiles.length > 0) {
+          await savePersonalLocalTracks(
+            ownerKey,
+            localFallbackFiles,
+            user?.displayName || 'Mi Lista MP3'
+          );
+        }
+        if (uploadedCount > 0 && onRefresh) await onRefresh();
         notifyPersonalMusicChanged({ switchToPersonal: true });
       } else {
         await savePersonalLocalTracks(ownerKey, files, user?.displayName || 'Mi Lista MP3');
         notifyPersonalMusicChanged({ switchToPersonal: true });
       }
       switchPlaylistMode('personal');
+      setShowPlaylist(true);
     } catch (err) {
       setTrackFormError(err instanceof Error ? err.message : 'No se pudieron cargar tus MP3.');
     } finally {
@@ -1061,6 +1096,25 @@ export function MusicBar({
                 />
               </div>
 
+              <label
+                className="inline-flex items-center gap-1 px-1.5 py-1 text-[10px] font-bold btn-gold-luxury rounded-md cursor-pointer whitespace-nowrap shrink-0"
+                title="Agregar tus propios MP3 al reproductor"
+              >
+                <Upload className="w-3 h-3" />
+                <span>+ MP3</span>
+                <input
+                  type="file"
+                  multiple
+                  disabled={addingTrack}
+                  accept=".mp3,.wav,.ogg,.m4a,audio/mpeg,audio/*"
+                  onChange={(e) => {
+                    void handleUploadPersonalMp3(e.target.files);
+                    e.target.value = '';
+                  }}
+                  className="hidden"
+                />
+              </label>
+
               <button
                 type="button"
                 onClick={() => {
@@ -1068,7 +1122,7 @@ export function MusicBar({
                   setShowPlaylist((v) => !v);
                 }}
                 className="inline-flex items-center gap-1 px-2 py-1 text-[10px] font-semibold text-white hover:text-amber-200 bg-[#05162B] hover:bg-[#0B2D54] border border-amber-400/45 rounded-md transition-colors whitespace-nowrap shrink-0"
-                title="Abrir lista de música y agregar tus propios MP3"
+                title="Abrir lista de música para agregar o eliminar MP3"
               >
                 <ListMusic className="w-3 h-3 text-amber-300" />
                 <span>{usingPersonal ? `Mía (${personalTracks.length})` : activeTracks.length}</span>

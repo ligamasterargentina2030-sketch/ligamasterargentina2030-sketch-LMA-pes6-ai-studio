@@ -856,9 +856,17 @@ export function subscribeLeagueRealtime(
     onSnapshot(
       collection(db, 'music'),
       (snap) => {
+        const isDreamers = (t: MusicTrack) =>
+          t.id === 'track_pes_dreamers' || /dreamers/i.test(t.title || '');
         const list = snap.docs
           .map((d) => ({ ...(d.data() as MusicTrack), id: d.id }))
-          .sort((a, b) => (a.createdAt || '').localeCompare(b.createdAt || ''));
+          .sort((a, b) => {
+            const aD = isDreamers(a);
+            const bD = isDreamers(b);
+            if (aD && !bD) return -1;
+            if (!aD && bD) return 1;
+            return (a.createdAt || '').localeCompare(b.createdAt || '');
+          });
         onUpdate({ music: list });
       },
       (err) => onError(formatFirestoreError(err, OperationType.LIST, 'music'))
@@ -3295,4 +3303,94 @@ export async function resolveOrLinkFirebaseMember(
     id: uid,
     displayName: displayName || cleanEmail,
   };
+}
+
+export async function selfCreateTeamFirestore(input: {
+  name: string;
+  memberName: string;
+  customId?: string;
+  existingTeamIds?: string[];
+}): Promise<{ id: string; role: 'member'; displayName: string; teamId: string }> {
+  const user = requireVerifiedFirebaseUser();
+  const teamName = clamp(input.name, 100);
+  const memberName = clamp(input.memberName || user.displayName || user.email || 'Jugador', 100);
+  if (teamName.length < 2) {
+    throw new Error('Ingresá un nombre válido para tu equipo (mínimo 2 caracteres).');
+  }
+
+  let teamId = '';
+  const cleanedCustom = String(input.customId || '')
+    .trim()
+    .toUpperCase()
+    .replace(/[^A-Z0-9_-]/g, '');
+
+  const existingSet = new Set((input.existingTeamIds || []).map((id) => id.toUpperCase()));
+  if (cleanedCustom) {
+    if (cleanedCustom.length < 2 || cleanedCustom.length > 24 || cleanedCustom === 'ADMI') {
+      throw new Error('El ID elegido debe tener entre 2 y 24 caracteres válidos (letras/números).');
+    }
+    if (existingSet.has(cleanedCustom)) {
+      throw new Error(`El ID ${cleanedCustom} ya está ocupado por otro equipo.`);
+    }
+    teamId = cleanedCustom;
+  } else {
+    let idx = 1;
+    while (existingSet.has(`LMA${String(idx).padStart(2, '0')}`)) {
+      idx += 1;
+    }
+    teamId = `LMA${String(idx).padStart(2, '0')}`;
+  }
+
+  return runConfirmedWrite('Crear mi club en la Liga', OperationType.WRITE, `teams/${teamId}`, async () => {
+    const now = new Date().toISOString();
+    const memberRef = doc(db, 'members', safeDocId(user.uid));
+    const existingMember = await getDoc(memberRef);
+    if (existingMember.exists()) {
+      const mData = existingMember.data() as { teamId?: string };
+      if (mData?.teamId) {
+        throw new Error(`Tu cuenta ya tiene un club asignado (${mData.teamId}).`);
+      }
+    }
+
+    const teamRef = doc(db, 'teams', teamId);
+    const existingTeam = await getDoc(teamRef);
+    if (existingTeam.exists()) {
+      throw new Error(`El ID ${teamId} ya existe en la Liga. Probá con otro.`);
+    }
+
+    const cleanEmail = (user.email || '').trim().toLowerCase();
+    const batch = writeBatch(db);
+    batch.set(teamRef, {
+      id: teamId,
+      name: teamName,
+      memberName,
+      bio: '',
+      likes: 0,
+      trophies: [],
+      personalMusic: [],
+      accountStatus: 'active',
+      primaryColor: '#38BDF8',
+      secondaryColor: '#FACC15',
+      ownerUid: user.uid,
+      createdAt: now,
+      updatedAt: now,
+    });
+    batch.set(memberRef, {
+      uid: user.uid,
+      teamId,
+      email: clamp(cleanEmail, 180),
+      displayName: clamp(`${memberName} (${teamName})`, 120),
+      status: 'active',
+      createdAt: now,
+      updatedAt: now,
+    });
+    await batch.commit();
+
+    return {
+      role: 'member' as const,
+      id: teamId,
+      teamId,
+      displayName: `${memberName} (${teamName})`,
+    };
+  });
 }

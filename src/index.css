@@ -52,65 +52,69 @@
 .text-lma-brand,
 .text-albiceleste-3d {
   background-image: linear-gradient(
-    115deg,
-    #fff7cc 0%,
-    #facc15 14%,
-    #d97706 24%,
-    #09090b 30%,
-    #fde047 38%,
-    #38bdf8 50%,
-    #ffffff 60%,
-    #7dd3fc 70%,
-    #09090b 77%,
+    110deg,
+    #facc15 0%,
+    #fde047 13%,
+    #09090b 22%,
+    #facc15 31%,
+    #38bdf8 43%,
+    #ffffff 55%,
+    #09090b 64%,
+    #7dd3fc 75%,
     #facc15 86%,
     #ffffff 94%,
     #eab308 100%
   );
-  background-size: 280% 100%;
+  background-size: 165% 100%;
   -webkit-background-clip: text;
   background-clip: text;
   color: transparent;
   -webkit-text-stroke: 1.6px #000000;
   paint-order: stroke fill;
-  filter: drop-shadow(0 3px 0 #000000) drop-shadow(0 5px 14px rgba(250, 204, 21, 0.36));
-  animation: lma-text-color-shift 20s ease-in-out infinite;
+  filter: drop-shadow(0 3px 0 #000000) drop-shadow(0 5px 14px rgba(250, 204, 21, 0.38));
+  animation: lma-text-color-shift 18s ease-in-out infinite;
   will-change: background-position;
 }
 
-/* Títulos de Inicio: Dorado con Negro, Celeste y Blanco */
+/* Títulos de Inicio: Dorado, Negro, Celeste y Blanco */
 .text-lma-title {
   background-image: linear-gradient(
-    105deg,
-    #fef08a 0%,
-    #facc15 24%,
-    #ffffff 46%,
-    #38bdf8 66%,
-    #fde047 84%,
+    108deg,
+    #facc15 0%,
+    #fde047 18%,
+    #09090b 30%,
+    #ffffff 44%,
+    #38bdf8 62%,
+    #facc15 78%,
+    #09090b 89%,
     #ffffff 100%
   );
+  background-size: 155% 100%;
   -webkit-background-clip: text;
   background-clip: text;
   color: transparent;
-  -webkit-text-stroke: 1.25px #000000;
+  -webkit-text-stroke: 1.35px #000000;
   paint-order: stroke fill;
-  filter: drop-shadow(0 2px 0 #000000) drop-shadow(0 4px 10px rgba(56, 189, 248, 0.25));
+  filter: drop-shadow(0 2px 0 #000000) drop-shadow(0 4px 10px rgba(56, 189, 248, 0.3));
+  animation: lma-text-color-shift 20s ease-in-out infinite;
 }
 
 .text-lma-brand-static {
   background-image: linear-gradient(
-    115deg,
-    #fff7cc 0%,
-    #facc15 22%,
-    #fde047 40%,
-    #38bdf8 58%,
-    #ffffff 74%,
-    #facc15 90%,
+    112deg,
+    #facc15 0%,
+    #fde047 18%,
+    #09090b 31%,
+    #38bdf8 48%,
+    #ffffff 66%,
+    #09090b 79%,
+    #facc15 92%,
     #fff7cc 100%
   );
   -webkit-background-clip: text;
   background-clip: text;
   color: transparent;
-  -webkit-text-stroke: 1.4px #000000;
+  -webkit-text-stroke: 1.45px #000000;
   paint-order: stroke fill;
   filter: drop-shadow(0 2px 0 #000000);
 }

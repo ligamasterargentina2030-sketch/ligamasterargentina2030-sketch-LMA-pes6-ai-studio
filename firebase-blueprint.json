@@ -24,6 +24,10 @@
         "ligaTrophyUrl": { "type": "string", "maxLength": 500 },
         "copaTrophyUrl": { "type": "string", "maxLength": 500 },
         "recopaTrophyUrl": { "type": "string", "maxLength": 500 },
+        "messiPlaqueUrl": { "type": "string", "maxLength": 500 },
+        "messiMaradonaUrl": { "type": "string", "maxLength": 500 },
+        "maradonaPlaqueUrl": { "type": "string", "maxLength": 500 },
+        "extraHeroImages": { "type": "array" },
         "customTitles": { "type": "object" },
         "updatedAt": { "type": "string", "format": "date-time" }
       },

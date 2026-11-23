@@ -86,6 +86,11 @@ export function AuthModal({
         setError('Se cerró la ventana de acceso con Google antes de completar el ingreso.');
       } else if (code === 'auth/popup-blocked') {
         setError('El navegador bloqueó la ventana emergente de Google. Permití ventanas emergentes para este sitio.');
+      } else if (code === 'auth/unauthorized-domain') {
+        const host = typeof window !== 'undefined' ? window.location.hostname : 'este dominio';
+        setError(
+          `Este dominio público ("${host}") todavía no está autorizado en Firebase Authentication. Agregalo en Firebase Console -> Authentication -> Settings -> Authorized domains, o ingresá arriba con tu ID y Clave.`
+        );
       } else {
         setError(err instanceof Error ? err.message : 'No se pudo iniciar sesión con Google.');
       }
@@ -143,20 +148,28 @@ export function AuthModal({
   };
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/85 p-4">
-      <div className="w-full max-w-md bg-[#071D38] border-2 border-amber-400/70 rounded-2xl shadow-2xl overflow-hidden text-white max-h-[92vh] overflow-y-auto">
-        <div className="flex items-center justify-between px-6 py-4 bg-gradient-to-r from-[#08264A] via-[#0D3C70] to-[#08264A] text-white border-b border-amber-400/45">
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/75 backdrop-blur-sm p-4">
+      <div className="w-full max-w-md glass-lma-card border-2 border-yellow-400/80 rounded-2xl shadow-[0_0_50px_rgba(250,204,21,0.22),0_24px_60px_rgba(0,0,0,0.9)] overflow-hidden text-white max-h-[92vh] overflow-y-auto">
+        <div className="h-1 w-full albiceleste-ribbon" aria-hidden="true" />
+        <div className="flex items-center justify-between px-6 py-4 bg-gradient-to-r from-black/75 via-[#08264A]/65 to-black/75 text-white border-b border-yellow-400/45">
           <div className="flex items-center gap-2.5">
-            <KeyRound className="w-5 h-5 text-amber-300" />
-            <h2 className="font-display text-2xl font-bold tracking-tight text-albiceleste-shiny">
-              Ingresar a Cuenta
-            </h2>
+            <div className="p-1.5 rounded-lg bg-yellow-400 text-zinc-950 shadow-[0_0_16px_rgba(250,204,21,0.8)]">
+              <KeyRound className="w-5 h-5" />
+            </div>
+            <div>
+              <h2 className="font-display text-2xl font-bold tracking-tight text-lma-title">
+                Ingresar a Cuenta
+              </h2>
+              <p className="text-[11px] text-sky-200/90">
+                Acceso con tu ID y Clave (Miembros y Administrador)
+              </p>
+            </div>
           </div>
           <button
             type="button"
             onClick={onClose}
             aria-label="Cerrar ventana"
-            className="p-1.5 text-sky-200 hover:text-amber-300 rounded-lg transition-colors"
+            className="p-1.5 text-sky-200 hover:text-yellow-300 rounded-lg transition-colors"
           >
             <X className="w-5 h-5" />
           </button>
@@ -164,25 +177,107 @@ export function AuthModal({
 
         <div className="p-6 space-y-4">
           {error && (
-            <div className="p-3 text-sm font-medium text-rose-200 bg-rose-950/60 border border-rose-500/40 rounded-lg leading-relaxed">
+            <div className="p-3 text-sm font-medium text-rose-100 bg-rose-950/75 border border-rose-400/55 rounded-lg leading-relaxed">
               {error}
             </div>
           )}
 
-          {/* Acceso Principal Cloud Firestore via Google Firebase Auth */}
-          <div className="p-4 rounded-xl bg-[#05162B] border border-emerald-400/45 space-y-2.5">
-            <div className="text-xs font-semibold text-emerald-300 flex items-center gap-1.5">
-              <ShieldCheck className="w-4 h-4 shrink-0" />
-              <span>Acceso Oficial en la Nube (Cloud Firestore)</span>
+          {staticHostingMode && (
+            <div className="p-3 text-xs text-amber-100 bg-amber-950/65 border border-amber-400/55 rounded-lg leading-relaxed">
+              <strong>Modo estático detectado:</strong> Si no hay servidor API conectado (`VITE_API_BASE_URL`), podés usar <strong>Ingresar con Google</strong> abajo para acceder directamente vía Cloud Firestore.
             </div>
-            <p className="text-[11px] text-sky-200/85 leading-relaxed">
-              Recomendado para Administrador y Miembros: permite guardar resultados, cambios, comentarios y sincronización en tiempo real en toda la liga.
+          )}
+
+          {/* Formulario Principal: ID y Clave visible al instante */}
+          <form onSubmit={handleSubmit} className="p-4 rounded-xl bg-black/50 border border-yellow-400/55 space-y-3.5 shadow-[inset_0_1px_0_rgba(255,255,255,0.08)]">
+            <div className="flex items-center justify-between gap-2">
+              <span className="text-xs font-bold uppercase tracking-wider text-yellow-300">
+                Iniciar Sesión con ID y Clave
+              </span>
+              <span className="text-[10px] font-semibold px-2 py-0.5 rounded bg-sky-400/15 border border-sky-300/35 text-sky-200">
+                Admin · Miembros
+              </span>
+            </div>
+
+            <div>
+              <label
+                className="block text-xs font-semibold text-white mb-1.5"
+                htmlFor="login-id"
+              >
+                ID de usuario
+              </label>
+              <input
+                id="login-id"
+                type="text"
+                required
+                autoFocus
+                autoComplete="username"
+                value={id}
+                onChange={(e) => setId(e.target.value)}
+                placeholder="Ej: LMA01 o ID de Administrador"
+                className="w-full px-3.5 py-2.5 text-sm bg-black/70 text-white placeholder:text-zinc-400 border border-yellow-400/50 rounded-lg focus:outline-none focus:ring-2 focus:ring-yellow-400 font-mono"
+              />
+            </div>
+
+            <div>
+              <label
+                className="block text-xs font-semibold text-white mb-1.5"
+                htmlFor="login-clave"
+              >
+                Clave / Contraseña
+              </label>
+              <input
+                id="login-clave"
+                type="password"
+                required
+                autoComplete="current-password"
+                value={clave}
+                onChange={(e) => setClave(e.target.value)}
+                placeholder="Ingresá tu clave secreta"
+                className="w-full px-3.5 py-2.5 text-sm bg-black/70 text-white placeholder:text-zinc-400 border border-yellow-400/50 rounded-lg focus:outline-none focus:ring-2 focus:ring-yellow-400"
+              />
+            </div>
+
+            <div className="flex items-center justify-end gap-3 pt-1">
+              <button
+                type="button"
+                onClick={onClose}
+                className="px-4 py-2 text-sm font-medium text-sky-200 hover:text-white rounded-lg transition-colors"
+              >
+                Cancelar
+              </button>
+              <button
+                type="submit"
+                disabled={loading || googleLoading}
+                className="px-6 py-2.5 text-sm font-extrabold bg-yellow-400 hover:bg-yellow-300 text-zinc-950 border border-yellow-200 shadow-[0_0_20px_rgba(250,204,21,0.65)] disabled:opacity-60 rounded-lg transition-all"
+              >
+                {loading ? 'VERIFICANDO...' : 'INGRESAR CON ID Y CLAVE'}
+              </button>
+            </div>
+          </form>
+
+          <div className="relative flex items-center py-0.5">
+            <div className="flex-grow border-t border-sky-400/25" />
+            <span className="px-3 text-[11px] font-semibold text-sky-200/80 uppercase tracking-wider">
+              o acceso en la nube con Google
+            </span>
+            <div className="flex-grow border-t border-sky-400/25" />
+          </div>
+
+          {/* Acceso Complementario Cloud Firestore via Google Firebase Auth */}
+          <div className="p-3.5 rounded-xl bg-black/40 border border-sky-400/40 space-y-2">
+            <div className="text-xs font-semibold text-sky-300 flex items-center gap-1.5">
+              <ShieldCheck className="w-4 h-4 shrink-0" />
+              <span>Google Auth (Sincronización total Cloud Firestore)</span>
+            </div>
+            <p className="text-[11px] text-zinc-200/85 leading-relaxed">
+              Si tu correo está autorizado, vinculá Google para guardar partidos, Me Gusta y administración en tiempo real.
             </p>
             <button
               type="button"
               onClick={handleGoogleSignIn}
               disabled={googleLoading || loading}
-              className="w-full py-2.5 px-4 rounded-lg bg-white hover:bg-zinc-100 text-zinc-900 font-bold text-sm flex items-center justify-center gap-2.5 shadow-md transition-all disabled:opacity-60"
+              className="w-full py-2.5 px-4 rounded-lg bg-white hover:bg-zinc-100 text-zinc-950 font-bold text-sm flex items-center justify-center gap-2.5 shadow-md transition-all disabled:opacity-60"
             >
               <svg viewBox="0 0 24 24" className="w-4 h-4 shrink-0" aria-hidden="true">
                 <path
@@ -206,79 +301,8 @@ export function AuthModal({
             </button>
           </div>
 
-          <div className="relative flex items-center py-1">
-            <div className="flex-grow border-t border-amber-400/20" />
-            <span className="px-3 text-[11px] font-semibold text-sky-200/70 uppercase tracking-wider">
-              o acceso con ID y Clave
-            </span>
-            <div className="flex-grow border-t border-amber-400/20" />
-          </div>
-
-          {staticHostingMode && (
-            <div className="p-3 text-xs text-amber-100 bg-amber-950/60 border border-amber-400/50 rounded-lg leading-relaxed">
-              <strong>Modo estático detectado:</strong> Usá el botón <strong>Ingresar con Google</strong> de arriba para sincronizar tus datos directo en Cloud Firestore sin depender del servidor local.
-            </div>
-          )}
-
-          <form onSubmit={handleSubmit} className="space-y-4">
-            <div>
-              <label
-                className="block text-xs font-semibold text-sky-200 mb-1.5"
-                htmlFor="login-id"
-              >
-                ID de usuario
-              </label>
-              <input
-                id="login-id"
-                type="text"
-                required
-                autoComplete="username"
-                value={id}
-                onChange={(e) => setId(e.target.value)}
-                placeholder="Ingresá tu ID de usuario"
-                className="w-full px-3.5 py-2.5 text-sm bg-[#041224] text-white border border-amber-400/40 rounded-lg focus:outline-none focus:ring-2 focus:ring-amber-400 font-mono"
-              />
-            </div>
-
-            <div>
-              <label
-                className="block text-xs font-semibold text-sky-200 mb-1.5"
-                htmlFor="login-clave"
-              >
-                Contraseña
-              </label>
-              <input
-                id="login-clave"
-                type="password"
-                required
-                autoComplete="current-password"
-                value={clave}
-                onChange={(e) => setClave(e.target.value)}
-                placeholder="Ingresá tu contraseña"
-                className="w-full px-3.5 py-2.5 text-sm bg-[#041224] text-white border border-amber-400/40 rounded-lg focus:outline-none focus:ring-2 focus:ring-amber-400"
-              />
-            </div>
-
-            <div className="flex items-center justify-end gap-3 pt-1">
-              <button
-                type="button"
-                onClick={onClose}
-                className="px-4 py-2 text-sm font-medium text-sky-200 hover:text-white rounded-lg transition-colors"
-              >
-                Cancelar
-              </button>
-              <button
-                type="submit"
-                disabled={loading || googleLoading}
-                className="px-6 py-2.5 text-sm font-bold btn-gold-luxury disabled:opacity-60 rounded-lg"
-              >
-                {loading ? 'VERIFICANDO...' : 'INGRESAR'}
-              </button>
-            </div>
-          </form>
-
           {/* Recuperación exclusiva para cuenta del Administrador */}
-          <div className="pt-3 border-t border-amber-400/20 space-y-2.5">
+          <div className="pt-2 border-t border-amber-400/20 space-y-2.5">
             <button
               type="button"
               onClick={() => {
@@ -298,7 +322,7 @@ export function AuthModal({
             {recoveryOpen && (
               <form
                 onSubmit={handleSendFirebaseReset}
-                className="p-4 rounded-xl bg-[#05162B] border border-amber-400/40 space-y-3"
+                className="p-4 rounded-xl bg-black/55 border border-amber-400/40 space-y-3"
               >
                 <p className="text-xs text-sky-100 leading-relaxed">
                   Exclusivo para el Administrador: ingresá el correo electrónico de recuperación configurado en tu cuenta administrativa.
@@ -327,7 +351,7 @@ export function AuthModal({
                     value={recoveryEmail}
                     onChange={(e) => setRecoveryEmail(e.target.value)}
                     placeholder="Correo de recuperación del Admin..."
-                    className="flex-1 px-3 py-2 text-xs bg-[#041224] text-white border border-amber-400/40 rounded-lg focus:outline-none focus:ring-2 focus:ring-amber-300"
+                    className="flex-1 px-3 py-2 text-xs bg-black/70 text-white border border-amber-400/40 rounded-lg focus:outline-none focus:ring-2 focus:ring-yellow-400"
                   />
                   <button
                     type="submit"

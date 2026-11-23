@@ -73,7 +73,8 @@ service cloud.firestore {
           'crestUrl', 'coverUrl', 'backgroundUrl', 'faviconUrl', 'adminId',
           'adminTeamId', 'featuredVideo', 'radioName', 'radioStreamUrl',
           'maxTeams', 'pageLikes', 'ligaTrophyUrl', 'copaTrophyUrl',
-          'recopaTrophyUrl', 'customTitles', 'updatedAt'
+          'recopaTrophyUrl', 'messiPlaqueUrl', 'messiMaradonaUrl',
+          'maradonaPlaqueUrl', 'extraHeroImages', 'customTitles', 'updatedAt'
         ])
         && data.title is string && data.title.size() >= 1 && data.title.size() <= 140
         && data.adminId is string && data.adminId.size() >= 2 && data.adminId.size() <= 32
@@ -93,6 +94,14 @@ service cloud.firestore {
         && isOptString(data, 'ligaTrophyUrl', 500)
         && isOptString(data, 'copaTrophyUrl', 500)
         && isOptString(data, 'recopaTrophyUrl', 500)
+        && isOptString(data, 'messiPlaqueUrl', 500)
+        && isOptString(data, 'messiMaradonaUrl', 500)
+        && isOptString(data, 'maradonaPlaqueUrl', 500)
+        && (!( 'extraHeroImages' in data ) || (
+          data.extraHeroImages is list &&
+          data.extraHeroImages.size() <= 12 &&
+          (data.extraHeroImages.size() == 0 || (data.extraHeroImages[0] is string && data.extraHeroImages[0].size() <= 500))
+        ))
         && (!( 'featuredVideo' in data ) || data.featuredVideo == null || data.featuredVideo is map)
         && (!( 'customTitles' in data ) || data.customTitles == null || (data.customTitles is map && data.customTitles.keys().size() <= 50))
         && isOptTimestampOrStr(data, 'updatedAt');

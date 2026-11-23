@@ -1194,7 +1194,7 @@ function createInitialDb(): LeagueDatabase {
       calendarMessage: '',
       bannerText: 'Esto es Liga Master Argentina',
       crestUrl: '/assets/aistudio/Liga_Master_Argentina__F_tbol_de__lite_eeeab9aa.png',
-      coverUrl: '/assets/aistudio/cabra_copa_3d_hd.jpg',
+      coverUrl: '/assets/aistudio/_Liga_master_argentina_PES6._36522b75.png',
       faviconUrl: '/assets/aistudio/Liga_Master_Argentina__F_tbol_de__lite_eeeab9aa.png',
       adminId: 'ADMI',
       adminClaveHash: hashPassword('LMA2026'),
@@ -1373,9 +1373,9 @@ async function migrateAndNormalizeDb(parsed: LeagueDatabase): Promise<{ db: Leag
     parsed.settings.coverUrl === '/default-assets/hero_cabra_messi_argentina_1794730196481.jpg' ||
     parsed.settings.coverUrl === '/default-assets/hero_cabra_sol_bandera_1794730623048.jpg' ||
     parsed.settings.coverUrl === '/default-assets/hero_cabra_messi_hd_1794813291066.jpg' ||
-    parsed.settings.coverUrl === '/assets/aistudio/_Liga_master_argentina_PES6._36522b75.png'
+    parsed.settings.coverUrl === '/assets/aistudio/cabra_copa_3d_hd.jpg'
   ) {
-    parsed.settings.coverUrl = '/assets/aistudio/cabra_copa_3d_hd.jpg';
+    parsed.settings.coverUrl = '/assets/aistudio/_Liga_master_argentina_PES6._36522b75.png';
     migrated = true;
   }
   if (
@@ -2902,28 +2902,35 @@ function buildApiApp(): express.Express {
 
       if (id.toUpperCase() === configuredAdminId.toUpperCase()) {
         let authorized = verifyPassword(clave, db.settings?.adminClaveHash);
-        if (!authorized && db.settings?.backupGmail) {
-          const firebaseVerified = await verifyFirebaseEmailPassword(
-            db.settings.backupGmail,
-            clave
+        if (!authorized) {
+          const candidateEmails = Array.from(
+            new Set(
+              [db.settings?.backupGmail, ...ADMIN_EMAILS_SET]
+                .map((e) => String(e || '').trim().toLowerCase())
+                .filter(Boolean)
+            )
           );
-          if (firebaseVerified) {
-            db.settings.adminClaveHash = hashPassword(clave);
-            db.settings.adminTokenVersion = (db.settings.adminTokenVersion ?? 1) + 1;
-            appendCredentialAudit(db, {
-              action: 'admin_firebase_password_reset',
-              targetType: 'admin',
-              targetId: configuredAdminId,
-              targetLabel: 'Administrador General',
-              details: 'Contraseña de Administrador sincronizada desde Firebase Authentication.',
-              performedBy: configuredAdminId,
-            });
-            try {
-              await saveDb(db);
-            } catch (saveErr) {
-              console.error('Warning saving synced adminClaveHash:', saveErr);
+          for (const candidateEmail of candidateEmails) {
+            const firebaseVerified = await verifyFirebaseEmailPassword(candidateEmail, clave);
+            if (firebaseVerified) {
+              db.settings.adminClaveHash = hashPassword(clave);
+              db.settings.adminTokenVersion = (db.settings.adminTokenVersion ?? 1) + 1;
+              appendCredentialAudit(db, {
+                action: 'admin_firebase_password_reset',
+                targetType: 'admin',
+                targetId: configuredAdminId,
+                targetLabel: 'Administrador General',
+                details: 'Contraseña de Administrador sincronizada desde Firebase Authentication.',
+                performedBy: configuredAdminId,
+              });
+              try {
+                await saveDb(db);
+              } catch (saveErr) {
+                console.error('Warning saving synced adminClaveHash:', saveErr);
+              }
+              authorized = true;
+              break;
             }
-            authorized = true;
           }
         }
 

@@ -40,6 +40,10 @@ export interface LeagueSettings {
   ligaTrophyUrl?: string;
   copaTrophyUrl?: string;
   recopaTrophyUrl?: string;
+  messiPlaqueUrl?: string;
+  messiMaradonaUrl?: string;
+  maradonaPlaqueUrl?: string;
+  extraHeroImages?: string[];
   customTitles?: CustomTitles;
 }
 

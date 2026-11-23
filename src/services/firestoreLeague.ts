@@ -983,6 +983,17 @@ export async function saveSettingsFirestore(
     const cur = (existing.exists() ? existing.data() : {}) as Partial<LeagueSettings>;
     const now = new Date().toISOString();
     const { backupGmail, ...publicUpdates } = updates;
+    const resolvedExtraHero =
+      publicUpdates.extraHeroImages !== undefined
+        ? publicUpdates.extraHeroImages
+        : cur.extraHeroImages;
+    const cleanExtraHero = Array.isArray(resolvedExtraHero)
+      ? resolvedExtraHero
+          .map((u) => clamp(u, 500))
+          .filter(Boolean)
+          .slice(0, 12)
+      : undefined;
+
     const nextPublic: LeagueSettings = stripUndefined({
       title: clamp(publicUpdates.title ?? cur.title ?? 'Liga Master Argentina Pes6', 140),
       subtitle: clamp(publicUpdates.subtitle ?? cur.subtitle ?? '', 160),
@@ -990,7 +1001,7 @@ export async function saveSettingsFirestore(
       calendarMessage: clamp(publicUpdates.calendarMessage ?? cur.calendarMessage ?? '', 600),
       bannerText: clamp(publicUpdates.bannerText ?? cur.bannerText ?? '', 200),
       crestUrl: clamp(publicUpdates.crestUrl ?? cur.crestUrl ?? '', 500),
-      coverUrl: clamp(publicUpdates.coverUrl ?? cur.coverUrl ?? '', 500),
+      coverUrl: clamp(publicUpdates.coverUrl !== undefined ? publicUpdates.coverUrl : cur.coverUrl ?? '', 500),
       backgroundUrl: clamp(publicUpdates.backgroundUrl ?? cur.backgroundUrl ?? '', 500),
       faviconUrl: clamp(publicUpdates.faviconUrl ?? cur.faviconUrl ?? '', 500),
       adminId: clamp(publicUpdates.adminId ?? cur.adminId ?? 'ADMI', 32) || 'ADMI',
@@ -1008,6 +1019,25 @@ export async function saveSettingsFirestore(
       ligaTrophyUrl: clamp(publicUpdates.ligaTrophyUrl ?? cur.ligaTrophyUrl ?? '', 500),
       copaTrophyUrl: clamp(publicUpdates.copaTrophyUrl ?? cur.copaTrophyUrl ?? '', 500),
       recopaTrophyUrl: clamp(publicUpdates.recopaTrophyUrl ?? cur.recopaTrophyUrl ?? '', 500),
+      messiPlaqueUrl:
+        publicUpdates.messiPlaqueUrl !== undefined
+          ? clamp(publicUpdates.messiPlaqueUrl, 500)
+          : cur.messiPlaqueUrl !== undefined
+          ? clamp(cur.messiPlaqueUrl, 500)
+          : undefined,
+      messiMaradonaUrl:
+        publicUpdates.messiMaradonaUrl !== undefined
+          ? clamp(publicUpdates.messiMaradonaUrl, 500)
+          : cur.messiMaradonaUrl !== undefined
+          ? clamp(cur.messiMaradonaUrl, 500)
+          : undefined,
+      maradonaPlaqueUrl:
+        publicUpdates.maradonaPlaqueUrl !== undefined
+          ? clamp(publicUpdates.maradonaPlaqueUrl, 500)
+          : cur.maradonaPlaqueUrl !== undefined
+          ? clamp(cur.maradonaPlaqueUrl, 500)
+          : undefined,
+      extraHeroImages: cleanExtraHero,
       customTitles: sanitizeCustomTitles(
         publicUpdates.customTitles !== undefined ? publicUpdates.customTitles : cur.customTitles
       ),

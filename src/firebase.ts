@@ -2,7 +2,6 @@ import { getApp, getApps, initializeApp } from 'firebase/app';
 import { browserLocalPersistence, getAuth, GoogleAuthProvider, setPersistence } from 'firebase/auth';
 import {
   doc,
-  enableNetwork,
   getDocFromServer,
   getFirestore,
   initializeFirestore,
@@ -21,7 +20,7 @@ function createFirestoreInstance(): Firestore {
       return initializeFirestore(
         app,
         {
-          experimentalForceLongPolling: true,
+          experimentalAutoDetectLongPolling: true,
         },
         databaseId
       );
@@ -162,14 +161,12 @@ export async function testConnection(): Promise<boolean> {
   if (connectionTested) return true;
   connectionTested = true;
   try {
-    await enableNetwork(db).catch(() => undefined);
     await getDocFromServer(doc(db, 'test', 'connection'));
     return true;
   } catch (firstError) {
     if (typeof window !== 'undefined' && navigator.onLine !== false) {
-      await new Promise((resolve) => setTimeout(resolve, 1200));
+      await new Promise((resolve) => setTimeout(resolve, 1000));
       try {
-        await enableNetwork(db).catch(() => undefined);
         await getDocFromServer(doc(db, 'test', 'connection'));
         return true;
       } catch (retryError) {

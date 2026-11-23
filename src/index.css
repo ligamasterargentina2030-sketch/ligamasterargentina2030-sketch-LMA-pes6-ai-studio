@@ -22,21 +22,21 @@
   font-variant-numeric: tabular-nums;
 }
 
-/* Cinta Liga Master Argentina: Celeste, Blanco, Verde, Plata y Oro */
+/* Cinta Oficial Liga Master Argentina: Celeste, Blanco, Dorado y Negro */
 .albiceleste-ribbon {
   background: linear-gradient(
     90deg,
     #38bdf8 0%,
-    #ffffff 24%,
-    #10b981 42%,
-    #e2e8f0 56%,
-    #facc15 72%,
-    #ffffff 86%,
+    #ffffff 22%,
+    #facc15 48%,
+    #09090b 52%,
+    #facc15 56%,
+    #ffffff 78%,
     #38bdf8 100%
   );
 }
 
-/* Tipografía Oficial Liga Master Argentina: Dorada con Negro y cambio dinámico de color lento y fluido */
+/* Tipografía Oficial Liga Master Argentina: Dorada con Negro, Celeste y Blanco */
 @keyframes lma-text-color-shift {
   0% {
     background-position: 0% 50%;
@@ -54,39 +54,57 @@
   background-image: linear-gradient(
     115deg,
     #fff7cc 0%,
-    #facc15 12%,
-    #b45309 22%,
-    #18181b 27%,
-    #fde047 35%,
-    #38bdf8 48%,
-    #ffffff 56%,
-    #22c55e 66%,
-    #09090b 74%,
-    #facc15 84%,
-    #fff7cc 94%,
-    #d97706 100%
+    #facc15 14%,
+    #d97706 24%,
+    #09090b 30%,
+    #fde047 38%,
+    #38bdf8 50%,
+    #ffffff 60%,
+    #7dd3fc 70%,
+    #09090b 77%,
+    #facc15 86%,
+    #ffffff 94%,
+    #eab308 100%
   );
-  background-size: 320% 100%;
+  background-size: 280% 100%;
   -webkit-background-clip: text;
   background-clip: text;
   color: transparent;
   -webkit-text-stroke: 1.6px #000000;
   paint-order: stroke fill;
-  filter: drop-shadow(0 3px 0 #000000) drop-shadow(0 5px 12px rgba(250, 204, 21, 0.32));
-  animation: lma-text-color-shift 22s ease-in-out infinite;
+  filter: drop-shadow(0 3px 0 #000000) drop-shadow(0 5px 14px rgba(250, 204, 21, 0.36));
+  animation: lma-text-color-shift 20s ease-in-out infinite;
   will-change: background-position;
+}
+
+/* Títulos de Inicio: Dorado con Negro, Celeste y Blanco */
+.text-lma-title {
+  background-image: linear-gradient(
+    105deg,
+    #fef08a 0%,
+    #facc15 24%,
+    #ffffff 46%,
+    #38bdf8 66%,
+    #fde047 84%,
+    #ffffff 100%
+  );
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+  -webkit-text-stroke: 1.25px #000000;
+  paint-order: stroke fill;
+  filter: drop-shadow(0 2px 0 #000000) drop-shadow(0 4px 10px rgba(56, 189, 248, 0.25));
 }
 
 .text-lma-brand-static {
   background-image: linear-gradient(
     115deg,
     #fff7cc 0%,
-    #facc15 18%,
-    #fde047 36%,
-    #38bdf8 52%,
-    #ffffff 64%,
-    #22c55e 78%,
-    #facc15 92%,
+    #facc15 22%,
+    #fde047 40%,
+    #38bdf8 58%,
+    #ffffff 74%,
+    #facc15 90%,
     #fff7cc 100%
   );
   -webkit-background-clip: text;
@@ -94,38 +112,37 @@
   color: transparent;
   -webkit-text-stroke: 1.4px #000000;
   paint-order: stroke fill;
-  text-shadow: 0 3px 0 rgba(0, 0, 0, 0.85);
+  filter: drop-shadow(0 2px 0 #000000);
 }
 
-/* Tipografía Ligera GPU para Títulos de Sección (Celeste / Blanco / Plateado) */
+/* Tipografía Celeste / Blanco */
 .text-albiceleste-shiny {
   background-image: linear-gradient(
     180deg,
     #ffffff 0%,
     #f1f5f9 32%,
     #bae6fd 68%,
-    #7dd3fc 100%
+    #38bdf8 100%
   );
   -webkit-background-clip: text;
   background-clip: text;
   color: transparent;
-  filter: drop-shadow(0 2px 3px rgba(0, 0, 0, 0.9));
+  filter: drop-shadow(0 2px 3px rgba(0, 0, 0, 0.92));
 }
 
-/* Tipografía Metálica Plateada Elegante */
+/* Tipografía Blanca / Plateada */
 .text-silver-shiny {
   background-image: linear-gradient(
     180deg,
     #ffffff 0%,
-    #f1f5f9 26%,
-    #cbd5e1 55%,
-    #94a3b8 82%,
-    #e2e8f0 100%
+    #f8fafc 30%,
+    #e2e8f0 62%,
+    #bae6fd 100%
   );
   -webkit-background-clip: text;
   background-clip: text;
   color: transparent;
-  filter: drop-shadow(0 2px 2px rgba(0, 0, 0, 0.88));
+  filter: drop-shadow(0 2px 2px rgba(0, 0, 0, 0.9));
 }
 
 /* Tipografía Oro Brillante */
@@ -141,7 +158,7 @@
   -webkit-background-clip: text;
   background-clip: text;
   color: transparent;
-  filter: drop-shadow(0 2px 3px rgba(0, 0, 0, 0.9));
+  filter: drop-shadow(0 2px 3px rgba(0, 0, 0, 0.92));
 }
 
 .text-gold-3d-front {
@@ -157,35 +174,123 @@
   -webkit-background-clip: text;
   background-clip: text;
   color: transparent;
-  filter: drop-shadow(0 1px 0 rgba(120, 53, 15, 0.96))
+  filter: drop-shadow(0 1px 0 rgba(0, 0, 0, 0.96))
     drop-shadow(0 4px 10px rgba(0, 0, 0, 0.95));
 }
 
+/* Superficies Transparentes Glass: Dorado, Negro, Celeste y Blanco */
 .surface-luxury,
-.surface-albiceleste {
-  background-color: rgba(11, 13, 18, 0.95);
-  border: 1px solid rgba(250, 204, 21, 0.35);
-  box-shadow: 0 16px 36px -14px rgba(0, 0, 0, 0.9), inset 0 1px 0 rgba(226, 232, 240, 0.08);
+.surface-albiceleste,
+.glass-lma-card {
+  background: linear-gradient(
+    145deg,
+    rgba(5, 8, 15, 0.62) 0%,
+    rgba(8, 28, 56, 0.48) 54%,
+    rgba(4, 7, 13, 0.68) 100%
+  );
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  border: 1px solid rgba(250, 204, 21, 0.42);
+  box-shadow:
+    0 18px 42px -14px rgba(0, 0, 0, 0.85),
+    inset 0 1px 0 rgba(255, 255, 255, 0.14),
+    inset 0 0 24px rgba(56, 189, 248, 0.06);
 }
 
 .btn-gold-luxury {
-  background-image: linear-gradient(95deg, #fef08a 0%, #facc15 48%, #d97706 100%);
-  color: #07080b;
-  font-weight: 700;
-  border: 1px solid rgba(254, 240, 138, 0.8);
-  box-shadow: 0 4px 16px rgba(245, 158, 11, 0.25);
+  background-image: linear-gradient(100deg, #fef08a 0%, #facc15 48%, #d97706 100%);
+  color: #050608;
+  font-weight: 800;
+  border: 1px solid rgba(254, 240, 138, 0.88);
+  box-shadow: 0 4px 18px rgba(250, 204, 21, 0.28);
 }
 
 .btn-gold-luxury:hover {
   filter: brightness(1.08);
 }
 
+/* Botón Ingresar a Cuenta: se ilumina en amarillo al tocar/presionar o abrir */
+.btn-login-yellow {
+  background: linear-gradient(135deg, rgba(10, 14, 24, 0.82) 0%, rgba(22, 28, 44, 0.78) 100%);
+  color: #fef08a;
+  font-weight: 800;
+  border: 1.5px solid rgba(250, 204, 21, 0.75);
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.55);
+  transition: all 180ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+.btn-login-yellow:hover,
+.btn-login-yellow:focus-visible {
+  background: linear-gradient(135deg, #fef08a 0%, #facc15 55%, #eab308 100%);
+  color: #050608;
+  border-color: #fef9c3;
+  box-shadow: 0 0 22px rgba(250, 204, 21, 0.88), 0 0 42px rgba(234, 179, 8, 0.55);
+}
+
+.btn-login-yellow:active,
+.btn-login-yellow.is-lit {
+  background: linear-gradient(135deg, #fef9c3 0%, #fde047 45%, #facc15 100%);
+  color: #050608;
+  border-color: #ffffff;
+  transform: scale(1.03);
+  box-shadow: 0 0 28px rgba(250, 204, 21, 0.98), 0 0 56px rgba(250, 204, 21, 0.78);
+}
+
+/* Efectos de luz para redes sociales (Facebook Azul, YouTube Rojo, WhatsApp Verde) */
+.social-glow-facebook {
+  background: linear-gradient(145deg, rgba(8, 22, 46, 0.72), rgba(24, 119, 242, 0.24));
+  border: 1.5px solid rgba(56, 189, 248, 0.52);
+  transition: all 200ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+.social-glow-facebook:hover,
+.social-glow-facebook:active,
+.social-glow-facebook:focus-visible,
+.social-glow-facebook.is-lit {
+  background: linear-gradient(145deg, rgba(24, 119, 242, 0.88), rgba(56, 189, 248, 0.55));
+  border-color: #7dd3fc;
+  color: #ffffff;
+  transform: translateY(-1px) scale(1.04);
+  box-shadow: 0 0 24px rgba(24, 119, 242, 0.95), 0 0 48px rgba(56, 189, 248, 0.65);
+}
+
+.social-glow-youtube {
+  background: linear-gradient(145deg, rgba(32, 8, 12, 0.72), rgba(255, 0, 0, 0.22));
+  border: 1.5px solid rgba(248, 113, 113, 0.52);
+  transition: all 200ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+.social-glow-youtube:hover,
+.social-glow-youtube:active,
+.social-glow-youtube:focus-visible,
+.social-glow-youtube.is-lit {
+  background: linear-gradient(145deg, rgba(220, 38, 38, 0.92), rgba(255, 0, 0, 0.65));
+  border-color: #fca5a5;
+  color: #ffffff;
+  transform: translateY(-1px) scale(1.04);
+  box-shadow: 0 0 24px rgba(255, 0, 0, 0.95), 0 0 48px rgba(239, 68, 68, 0.68);
+}
+
+.social-glow-whatsapp {
+  background: linear-gradient(145deg, rgba(6, 26, 18, 0.72), rgba(37, 211, 102, 0.22));
+  border: 1.5px solid rgba(74, 222, 128, 0.52);
+  transition: all 200ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+.social-glow-whatsapp:hover,
+.social-glow-whatsapp:active,
+.social-glow-whatsapp:focus-visible,
+.social-glow-whatsapp.is-lit {
+  background: linear-gradient(145deg, rgba(22, 163, 74, 0.9), rgba(37, 211, 102, 0.65));
+  border-color: #86efac;
+  color: #ffffff;
+  transform: translateY(-1px) scale(1.04);
+  box-shadow: 0 0 24px rgba(37, 211, 102, 0.95), 0 0 48px rgba(34, 197, 94, 0.68);
+}
+
 .btn-silver-luxury {
-  background-image: linear-gradient(135deg, #f8fafc 0%, #cbd5e1 52%, #94a3b8 100%);
-  color: #07080b;
+  background-image: linear-gradient(135deg, #ffffff 0%, #e2e8f0 52%, #bae6fd 100%);
+  color: #050608;
   font-weight: 700;
-  border: 1px solid rgba(255, 255, 255, 0.75);
-  box-shadow: 0 4px 14px rgba(148, 163, 184, 0.22);
+  border: 1px solid rgba(255, 255, 255, 0.8);
+  box-shadow: 0 4px 14px rgba(56, 189, 248, 0.22);
 }
 
 .btn-silver-luxury:hover {
@@ -193,15 +298,22 @@
 }
 
 .btn-celeste-gold {
-  background-image: linear-gradient(135deg, #0b111a 0%, #101826 52%, #071916 100%);
+  background-image: linear-gradient(
+    135deg,
+    rgba(6, 12, 24, 0.8) 0%,
+    rgba(12, 42, 76, 0.72) 52%,
+    rgba(7, 10, 18, 0.85) 100%
+  );
+  backdrop-filter: blur(8px);
   color: #f8fafc;
   font-weight: 700;
-  border: 1.5px solid rgba(250, 204, 21, 0.65);
-  box-shadow: 0 4px 14px rgba(16, 185, 129, 0.16), 0 0 0 1px rgba(226, 232, 240, 0.12);
+  border: 1.5px solid rgba(250, 204, 21, 0.68);
+  box-shadow: 0 4px 16px rgba(56, 189, 248, 0.2), 0 0 0 1px rgba(255, 255, 255, 0.14);
 }
 
 .btn-celeste-gold:hover {
-  border-color: rgba(250, 204, 21, 0.92);
+  border-color: rgba(250, 204, 21, 0.95);
+  box-shadow: 0 4px 20px rgba(56, 189, 248, 0.36), 0 0 12px rgba(250, 204, 21, 0.25);
   filter: brightness(1.12);
 }
 
@@ -221,7 +333,7 @@
 
 .crest-border-0,
 .crest-border-1 {
-  background: conic-gradient(from 0deg, #fde047, #e2e8f0, #38bdf8, #10b981, #ffffff, #f59e0b, #fde047);
+  background: conic-gradient(from 0deg, #fde047, #ffffff, #38bdf8, #09090b, #ffffff, #f59e0b, #fde047);
 }
 .crest-glow-0,
 .crest-glow-1 {
@@ -229,50 +341,46 @@
 }
 
 .crest-border-2 {
-  background: conic-gradient(from 0deg, #e2e8f0, #38bdf8, #ffffff, #10b981, #facc15, #e2e8f0);
+  background: conic-gradient(from 0deg, #ffffff, #38bdf8, #fde047, #09090b, #facc15, #ffffff);
 }
 .crest-glow-2 {
-  box-shadow: 0 0 22px rgba(226, 232, 240, 0.34), 0 12px 28px rgba(0, 0, 0, 0.85);
+  box-shadow: 0 0 22px rgba(56, 189, 248, 0.34), 0 12px 28px rgba(0, 0, 0, 0.85);
 }
 
 .crest-border-3 {
-  background: conic-gradient(from 0deg, #fde68a, #10b981, #ffffff, #cbd5e1, #38bdf8, #fde68a);
+  background: conic-gradient(from 0deg, #fde68a, #38bdf8, #ffffff, #09090b, #7dd3fc, #fde68a);
 }
 .crest-glow-3 {
-  box-shadow: 0 0 22px rgba(16, 185, 129, 0.36), 0 12px 28px rgba(0, 0, 0, 0.85);
+  box-shadow: 0 0 22px rgba(56, 189, 248, 0.36), 0 12px 28px rgba(0, 0, 0, 0.85);
 }
 
 .crest-border-4 {
-  background: conic-gradient(from 0deg, #fef08a, #cbd5e1, #38bdf8, #ffffff, #f59e0b, #fef08a);
+  background: conic-gradient(from 0deg, #fef08a, #ffffff, #38bdf8, #09090b, #f59e0b, #fef08a);
 }
 .crest-glow-4 {
   box-shadow: 0 0 22px rgba(250, 204, 21, 0.4), 0 12px 28px rgba(0, 0, 0, 0.85);
 }
 
 .crest-border-5 {
-  background: conic-gradient(from 0deg, #e2e8f0, #fde047, #ffffff, #10b981, #38bdf8, #e2e8f0);
+  background: conic-gradient(from 0deg, #ffffff, #fde047, #38bdf8, #09090b, #7dd3fc, #ffffff);
 }
 .crest-glow-5 {
   box-shadow: 0 0 22px rgba(56, 189, 248, 0.34), 0 12px 28px rgba(0, 0, 0, 0.85);
 }
 
-/* Bordes del escudo oficial que cambian de color suavemente (Celeste, Blanco, Verde, Dorado, Plata) */
+/* Bordes del escudo oficial: Celeste, Blanco, Dorado y Negro */
 @keyframes lma-crest-color-cycle {
   0% {
     border-color: #38bdf8;
     box-shadow: 0 0 18px rgba(56, 189, 248, 0.72), 0 0 36px rgba(56, 189, 248, 0.32), inset 0 0 12px rgba(56, 189, 248, 0.35);
   }
-  25% {
-    border-color: #f8fafc;
-    box-shadow: 0 0 18px rgba(248, 250, 252, 0.78), 0 0 36px rgba(226, 232, 240, 0.35), inset 0 0 12px rgba(255, 255, 255, 0.35);
+  33% {
+    border-color: #ffffff;
+    box-shadow: 0 0 18px rgba(255, 255, 255, 0.8), 0 0 36px rgba(226, 232, 240, 0.35), inset 0 0 12px rgba(255, 255, 255, 0.35);
   }
-  50% {
-    border-color: #22c55e;
-    box-shadow: 0 0 18px rgba(34, 197, 94, 0.76), 0 0 36px rgba(16, 185, 129, 0.36), inset 0 0 12px rgba(34, 197, 94, 0.35);
-  }
-  75% {
+  66% {
     border-color: #facc15;
-    box-shadow: 0 0 20px rgba(250, 204, 21, 0.82), 0 0 40px rgba(245, 158, 11, 0.38), inset 0 0 12px rgba(250, 204, 21, 0.4);
+    box-shadow: 0 0 20px rgba(250, 204, 21, 0.84), 0 0 40px rgba(245, 158, 11, 0.4), inset 0 0 12px rgba(250, 204, 21, 0.4);
   }
   100% {
     border-color: #38bdf8;
@@ -293,10 +401,10 @@
 
 @keyframes hero-cover-3d-float {
   0%, 100% {
-    transform: rotateX(1.2deg) rotateY(-1.8deg) translateZ(6px) scale(1.015);
+    transform: rotateX(1.6deg) rotateY(-2.4deg) translateZ(16px) scale(1);
   }
   50% {
-    transform: rotateX(-1.1deg) rotateY(1.8deg) translateZ(14px) scale(1.028);
+    transform: rotateX(-1.4deg) rotateY(2.4deg) translateZ(24px) scale(1);
   }
 }
 

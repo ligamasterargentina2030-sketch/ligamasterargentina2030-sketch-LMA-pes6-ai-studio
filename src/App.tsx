@@ -155,6 +155,16 @@ export default function App() {
   );
   const [staticHostingMode, setStaticHostingMode] = useState(false);
   const [viewingTeamId, setViewingTeamId] = useState<string | null>(null);
+  const [litFooterSocial, setLitFooterSocial] = useState<'facebook' | 'youtube' | 'whatsapp' | null>(null);
+
+  const flashFooterSocial = (network: 'facebook' | 'youtube' | 'whatsapp') => {
+    setLitFooterSocial(network);
+    if (typeof window !== 'undefined') {
+      window.setTimeout(() => {
+        setLitFooterSocial((cur) => (cur === network ? null : cur));
+      }, 950);
+    }
+  };
 
   useEffect(() => {
     return subscribeSaveStatus((st) => setSaveStatus(st));
@@ -591,7 +601,7 @@ export default function App() {
   );
 
   return (
-    <div className="relative min-h-screen flex flex-col bg-[#050608] text-white pb-8">
+    <div className="relative min-h-screen flex flex-col bg-[#050608] text-white pb-8 overflow-x-hidden">
       {/* Fondo de pantalla completo */}
       {(!showIntro || introContentReady) && (
         <div
@@ -605,7 +615,7 @@ export default function App() {
         />
       )}
       <div
-        className="fixed inset-0 z-0 bg-gradient-to-b from-[#040507]/88 via-[#090B10]/82 to-[#040507]/92 pointer-events-none"
+        className="fixed inset-0 z-0 bg-gradient-to-b from-[#03060C]/62 via-[#061830]/48 to-[#03060C]/68 pointer-events-none"
         aria-hidden="true"
       />
 
@@ -620,7 +630,7 @@ export default function App() {
       )}
 
       {/* Top Navigation Bar */}
-      <header className="sticky top-0 z-30 bg-gradient-to-r from-[#06070A]/96 via-[#0E1118]/96 to-[#06070A]/96 border-b border-amber-400/55 shadow-[0_10px_30px_rgba(0,0,0,0.85)]">
+      <header className="sticky top-0 z-30 bg-gradient-to-r from-[#04070D]/72 via-[#072142]/64 to-[#04070D]/72 backdrop-blur-lg border-b border-amber-400/55 shadow-[0_10px_30px_rgba(0,0,0,0.65)]">
         <div className="h-1 w-full albiceleste-ribbon" aria-hidden="true" />
         <div className="max-w-7xl mx-auto px-4 sm:px-6 min-h-[72px] py-1.5 flex items-center justify-between gap-4">
           <nav className="hidden lg:flex items-center gap-4 xl:gap-5">
@@ -633,8 +643,8 @@ export default function App() {
                   onClick={() => handleNavigate(item.id)}
                   className={`py-1.5 text-sm font-semibold border-b-2 transition-colors whitespace-nowrap shrink-0 ${
                     isActive
-                      ? 'text-amber-300 border-amber-400'
-                      : 'text-zinc-200/90 border-transparent hover:text-white hover:border-zinc-300/70'
+                      ? 'text-amber-300 border-amber-400 drop-shadow-[0_0_8px_rgba(250,204,21,0.45)]'
+                      : 'text-white/90 border-transparent hover:text-sky-300 hover:border-sky-300/70'
                   }`}
                 >
                   {item.label}
@@ -659,7 +669,10 @@ export default function App() {
               <button
                 type="button"
                 onClick={openAuthModal}
-                className="px-3.5 py-2 text-xs font-bold btn-gold-luxury rounded-lg transition-all whitespace-nowrap shrink-0"
+                aria-pressed={authModalOpen}
+                className={`px-3.5 py-2 text-xs btn-login-yellow rounded-lg whitespace-nowrap shrink-0 ${
+                  authModalOpen ? 'is-lit' : ''
+                }`}
               >
                 Ingresar a Cuenta
               </button>
@@ -669,7 +682,7 @@ export default function App() {
               type="button"
               onClick={() => setMobileMenuOpen((v) => !v)}
               aria-label="Abrir menú"
-              className="lg:hidden p-2 text-zinc-200 hover:text-white rounded-lg border border-zinc-400/45 bg-[#0B0D12]"
+              className="lg:hidden p-2 text-white hover:text-amber-300 rounded-lg border border-amber-400/45 bg-black/55 backdrop-blur-md"
             >
               {mobileMenuOpen ? <X className="w-5 h-5" /> : <Menu className="w-5 h-5" />}
             </button>
@@ -677,7 +690,7 @@ export default function App() {
         </div>
 
         {mobileMenuOpen && (
-          <nav className="lg:hidden border-t border-zinc-700/60 bg-[#08090D] px-4 py-3 grid grid-cols-2 gap-2">
+          <nav className="lg:hidden border-t border-amber-400/30 bg-[#050A14]/85 backdrop-blur-xl px-4 py-3 grid grid-cols-2 gap-2">
             {navItems.map((item) => {
               const isActive = activeTab === item.id;
               return (
@@ -687,8 +700,8 @@ export default function App() {
                   onClick={() => handleNavigate(item.id)}
                   className={`px-3 py-2.5 text-left text-sm font-semibold rounded-lg transition-colors whitespace-nowrap ${
                     isActive
-                      ? 'bg-amber-400/15 text-amber-200 border border-amber-400/60'
-                      : 'text-zinc-200 hover:bg-white/10'
+                      ? 'bg-amber-400/20 text-amber-200 border border-amber-400/60'
+                      : 'text-white hover:bg-sky-400/15'
                   }`}
                 >
                   {item.label}
@@ -913,10 +926,10 @@ export default function App() {
       </main>
 
       {/* Footer */}
-      <footer className="relative z-10 border-t border-amber-400/50 bg-gradient-to-r from-[#06070A]/96 via-[#0E1118]/96 to-[#06070A]/96 mt-12">
-        <div className="max-w-7xl mx-auto px-4 sm:px-6 py-6 flex flex-col lg:flex-row items-center justify-between gap-4 text-xs text-zinc-200">
+      <footer className="relative z-10 border-t border-amber-400/50 bg-gradient-to-r from-[#04070D]/72 via-[#072142]/64 to-[#04070D]/72 backdrop-blur-lg mt-12">
+        <div className="max-w-7xl mx-auto px-4 sm:px-6 py-6 flex flex-col lg:flex-row items-center justify-between gap-4 text-xs text-white">
           <div className="text-center lg:text-left">
-            <span className="font-semibold text-silver-shiny">
+            <span className="font-semibold text-sky-200">
               {data?.settings.title || 'Liga Master Argentina Pes6'}
             </span>{' '}
             ·{' '}
@@ -926,18 +939,26 @@ export default function App() {
           </div>
 
           <div className="flex flex-wrap items-center justify-center gap-4">
-            <span className="text-zinc-200 font-medium">
+            <span className="text-zinc-100 font-medium">
               {getTitleText(data?.settings, 'homeSocialTitle')}
             </span>
-            <div className="flex items-center gap-2.5">
+            <div className="flex items-center gap-3">
               <a
                 href="https://www.facebook.com/profile.php?id=61592685431765"
                 target="_blank"
                 rel="noopener noreferrer"
-                aria-label="Facebook"
-                className="p-2 rounded-lg bg-[#1877F2]/20 hover:bg-[#1877F2]/40 border border-[#1877F2]/40 transition-colors"
+                aria-label="Facebook oficial Liga Master Argentina"
+                onPointerDown={() => flashFooterSocial('facebook')}
+                onClick={() => flashFooterSocial('facebook')}
+                className={`group inline-flex items-center justify-center w-10 h-10 rounded-xl social-glow-facebook ${
+                  litFooterSocial === 'facebook' ? 'is-lit' : ''
+                }`}
               >
-                <svg viewBox="0 0 24 24" className="w-4 h-4 fill-[#4C9BFF]" aria-hidden="true">
+                <svg
+                  viewBox="0 0 24 24"
+                  className="w-5 h-5 fill-[#60A5FA] group-hover:fill-white transition-colors"
+                  aria-hidden="true"
+                >
                   <path d="M22.675 0H1.325C.593 0 0 .593 0 1.325v21.351C0 23.407.593 24 1.325 24H12.82v-9.294H9.692v-3.622h3.128V8.413c0-3.1 1.893-4.788 4.659-4.788 1.325 0 2.463.099 2.795.143v3.24l-1.918.001c-1.504 0-1.795.715-1.795 1.763v2.313h3.587l-.467 3.622h-3.12V24h6.116c.73 0 1.323-.593 1.323-1.325V1.325C24 .593 23.407 0 22.675 0z" />
                 </svg>
               </a>
@@ -945,10 +966,18 @@ export default function App() {
                 href="https://www.youtube.com/channel/UClCVRB-u2ZNJJdIXTyi7DjQ"
                 target="_blank"
                 rel="noopener noreferrer"
-                aria-label="YouTube"
-                className="p-2 rounded-lg bg-[#FF0000]/20 hover:bg-[#FF0000]/40 border border-[#FF0000]/40 transition-colors"
+                aria-label="YouTube oficial Liga Master Argentina"
+                onPointerDown={() => flashFooterSocial('youtube')}
+                onClick={() => flashFooterSocial('youtube')}
+                className={`group inline-flex items-center justify-center w-10 h-10 rounded-xl social-glow-youtube ${
+                  litFooterSocial === 'youtube' ? 'is-lit' : ''
+                }`}
               >
-                <svg viewBox="0 0 24 24" className="w-4 h-4 fill-[#FF4E45]" aria-hidden="true">
+                <svg
+                  viewBox="0 0 24 24"
+                  className="w-5 h-5 fill-[#FF4E45] group-hover:fill-white transition-colors"
+                  aria-hidden="true"
+                >
                   <path d="M23.498 6.186a3.016 3.016 0 0 0-2.122-2.136C19.505 3.545 12 3.545 12 3.545s-7.505 0-9.377.505A3.017 3.017 0 0 0 .502 6.186C0 8.07 0 12 0 12s0 3.93.502 5.814a3.016 3.016 0 0 0 2.122 2.136c1.871.505 9.376.505 9.376.505s7.505 0 9.377-.505a3.015 3.015 0 0 0 2.122-2.136C24 15.93 24 12 24 12s0-3.93-.502-5.814zM9.545 15.568V8.432L15.818 12l-6.273 3.568z" />
                 </svg>
               </a>
@@ -956,10 +985,18 @@ export default function App() {
                 href="https://chat.whatsapp.com/IA8EyaupDRIKXpLJiTeF8X?s=cl&p=a&iam=2"
                 target="_blank"
                 rel="noopener noreferrer"
-                aria-label="WhatsApp"
-                className="p-2 rounded-lg bg-[#25D366]/20 hover:bg-[#25D366]/40 border border-[#25D366]/40 transition-colors"
+                aria-label="WhatsApp oficial Liga Master Argentina"
+                onPointerDown={() => flashFooterSocial('whatsapp')}
+                onClick={() => flashFooterSocial('whatsapp')}
+                className={`group inline-flex items-center justify-center w-10 h-10 rounded-xl social-glow-whatsapp ${
+                  litFooterSocial === 'whatsapp' ? 'is-lit' : ''
+                }`}
               >
-                <svg viewBox="0 0 24 24" className="w-4 h-4 fill-[#25D366]" aria-hidden="true">
+                <svg
+                  viewBox="0 0 24 24"
+                  className="w-5 h-5 fill-[#4ADE80] group-hover:fill-white transition-colors"
+                  aria-hidden="true"
+                >
                   <path d="M20.52 3.48A11.87 11.87 0 0 0 12.05 0C5.5 0 .16 5.33.16 11.89c0 2.1.55 4.14 1.59 5.95L0 24l6.33-1.66a11.88 11.88 0 0 0 5.71 1.45h.01c6.55 0 11.89-5.34 11.89-11.9 0-3.17-1.24-6.16-3.42-8.41zM12.05 21.78h-.01a9.86 9.86 0 0 1-5.02-1.37l-.36-.21-3.75.98 1-3.66-.23-.38a9.87 9.87 0 0 1-1.51-5.25c0-5.46 4.44-9.9 9.9-9.9 2.64 0 5.12 1.03 6.99 2.9a9.82 9.82 0 0 1 2.9 7c0 5.45-4.45 9.89-9.91 9.89zm5.43-7.41c-.3-.15-1.76-.87-2.03-.97-.27-.1-.47-.15-.67.15-.2.3-.77.97-.94 1.16-.17.2-.35.22-.64.08-.3-.15-1.25-.46-2.38-1.47-.88-.78-1.48-1.75-1.65-2.05-.17-.3-.02-.46.13-.6.13-.14.3-.35.45-.52.15-.17.2-.3.3-.5.1-.2.05-.37-.02-.52-.08-.15-.67-1.62-.92-2.22-.24-.58-.49-.5-.67-.51l-.57-.01c-.2 0-.52.08-.8.37-.27.3-1.04 1.02-1.04 2.49 0 1.47 1.07 2.89 1.22 3.09.15.2 2.1 3.21 5.09 4.5.71.31 1.27.49 1.7.63.71.22 1.36.19 1.87.12.57-.09 1.76-.72 2.01-1.41.25-.7.25-1.29.17-1.41-.07-.12-.27-.2-.57-.35z" />
                 </svg>
               </a>

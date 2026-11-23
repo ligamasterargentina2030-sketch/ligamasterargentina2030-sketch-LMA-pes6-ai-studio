@@ -188,6 +188,16 @@ interface ProfileViewProps {
 }
 
 const DEFAULT_CREST = resolveAssetUrl('/assets/aistudio/Liga_Master_Argentina__F_tbol_de__lite_eeeab9aa.png');
+const DEFAULT_COVER_IMG = resolveAssetUrl('/assets/aistudio/_Liga_master_argentina_PES6._36522b75.png');
+const DEFAULT_MESSI_PLAQUE_IMG = resolveAssetUrl(
+  '/assets/aistudio/Placa_dorada_de_datos_personales_de_Messi_586edfb3.png'
+);
+const DEFAULT_MESSI_MARADONA_IMG = resolveAssetUrl(
+  '/assets/aistudio/72b3144e-994e-4bd7-8467-44208d372402_df3c9156.png'
+);
+const DEFAULT_MARADONA_PLAQUE_IMG = resolveAssetUrl(
+  '/assets/aistudio/Placa_dorada_de_datos_personales_c4bdca47.png'
+);
 
 const DEFAULT_CUP_RULES: CupRulesSettings = {
   format: 'Eliminación directa (16 equipos: 8°, 4°, Semifinales y Final)',
@@ -519,6 +529,24 @@ export function ProfileView({
   const [applyingCrest, setApplyingCrest] = useState(false);
   const [siteFaviconFile, setSiteFaviconFile] = useState<File | null>(null);
   const [siteCoverFile, setSiteCoverFile] = useState<File | null>(null);
+  const [siteCoverUrlDraft, setSiteCoverUrlDraft] = useState<string | undefined>(settings.coverUrl);
+  const [messiPlaqueFile, setMessiPlaqueFile] = useState<File | null>(null);
+  const [messiPlaqueUrlDraft, setMessiPlaqueUrlDraft] = useState<string | undefined>(
+    settings.messiPlaqueUrl
+  );
+  const [messiMaradonaFile, setMessiMaradonaFile] = useState<File | null>(null);
+  const [messiMaradonaUrlDraft, setMessiMaradonaUrlDraft] = useState<string | undefined>(
+    settings.messiMaradonaUrl
+  );
+  const [maradonaPlaqueFile, setMaradonaPlaqueFile] = useState<File | null>(null);
+  const [maradonaPlaqueUrlDraft, setMaradonaPlaqueUrlDraft] = useState<string | undefined>(
+    settings.maradonaPlaqueUrl
+  );
+  const [extraHeroImagesDraft, setExtraHeroImagesDraft] = useState<string[]>(
+    settings.extraHeroImages || []
+  );
+  const [newExtraHeroDraftUrl, setNewExtraHeroDraftUrl] = useState('');
+  const [uploadingExtraHero, setUploadingExtraHero] = useState(false);
   const [siteBackgroundFile, setSiteBackgroundFile] = useState<File | null>(null);
   const [maxTeamsInput, setMaxTeamsInput] = useState<string>(() =>
     String(Number(settings.maxTeams) > 50 ? Math.min(500, Number(settings.maxTeams)) : 100)
@@ -588,6 +616,11 @@ export function ProfileView({
     );
     setAdminTeamId(settings.adminTeamId || '');
     setSiteCrestUrlInput(settings.crestUrl || '');
+    setSiteCoverUrlDraft(settings.coverUrl);
+    setMessiPlaqueUrlDraft(settings.messiPlaqueUrl);
+    setMessiMaradonaUrlDraft(settings.messiMaradonaUrl);
+    setMaradonaPlaqueUrlDraft(settings.maradonaPlaqueUrl);
+    setExtraHeroImagesDraft(settings.extraHeroImages || []);
     setMaxTeamsInput(
       String(Number(settings.maxTeams) > 50 ? Math.min(500, Number(settings.maxTeams)) : 100)
     );
@@ -973,22 +1006,22 @@ export function ProfileView({
   if (!user) {
     return (
       <div className="space-y-8">
-        <div className="max-w-xl mx-auto p-8 bg-[#071D38]/95 border-2 border-amber-400/60 rounded-2xl text-center space-y-4 shadow-xl">
-          <div className="w-14 h-14 mx-auto rounded-2xl bg-sky-500/20 border-2 border-amber-400/50 text-amber-300 flex items-center justify-center">
+        <div className="max-w-xl mx-auto p-8 glass-lma-card border-2 border-amber-400/65 rounded-2xl text-center space-y-4">
+          <div className="w-14 h-14 mx-auto rounded-2xl bg-amber-400/15 border-2 border-amber-400/65 text-amber-300 flex items-center justify-center shadow-[0_0_22px_rgba(250,204,21,0.28)]">
             <KeyRound className="w-7 h-7" />
           </div>
-          <h1 className="font-display text-3xl font-extrabold text-albiceleste-shiny">Mi Perfil</h1>
+          <h1 className="font-display text-3xl font-extrabold text-lma-title">Mi Perfil</h1>
           <p className="text-sm text-sky-100/90">
-            Iniciá sesión con el <strong className="text-amber-200">ID de usuario</strong> y la{' '}
-            <strong className="text-amber-200">Contraseña</strong> asignados por el Administrador para acceder a tu cuenta o administrar la liga.
+            Iniciá sesión con tu <strong className="text-amber-200">ID de usuario y Clave</strong> (o con tu cuenta de Google) para acceder a tu perfil o administrar la liga.
           </p>
           <div className="flex flex-wrap items-center justify-center gap-3">
             <button
               type="button"
               onClick={onOpenAuth}
-              className="px-6 py-3 text-sm font-semibold btn-gold-luxury rounded-xl transition-all"
+              className="inline-flex items-center gap-2 px-6 py-3 text-sm font-bold btn-login-yellow rounded-xl"
             >
-              Ingresar con ID y Clave
+              <KeyRound className="w-4 h-4" />
+              <span>Ingresar a Cuenta</span>
             </button>
           </div>
         </div>
@@ -1076,6 +1109,9 @@ export function ProfileView({
       if (newCrestFile) {
         crestUrl = await uploadMediaFile('crests', newCrestFile);
       }
+      const desiredClave =
+        newTeamClave.trim() || `PES6_${Math.random().toString(36).slice(2, 6).toUpperCase()}`;
+
       const created = await createTeamFirestore({
         id: resolvedId,
         name: newTeamName.trim() || newMemberName.trim(),
@@ -1084,6 +1120,37 @@ export function ProfileView({
         bio: newTeamBio.trim(),
         linkedEmail: newMemberEmail.trim() || undefined,
       });
+
+      let backendSynced = false;
+      try {
+        await apiFetch('/api/admin/teams', {
+          method: 'POST',
+          body: JSON.stringify({
+            id: created.id,
+            clave: desiredClave,
+            name: created.name,
+            memberName: created.memberName,
+            bio: created.bio || '',
+          }),
+        });
+        backendSynced = true;
+      } catch {
+        try {
+          await apiFetch(`/api/admin/teams/${encodeURIComponent(created.id)}`, {
+            method: 'PUT',
+            body: JSON.stringify({
+              id: created.id,
+              clave: desiredClave,
+              name: created.name,
+              memberName: created.memberName,
+              bio: created.bio || '',
+            }),
+          });
+          backendSynced = true;
+        } catch {
+          // Backend might be unavailable in static-only preview
+        }
+      }
 
       const invitedEmail = newMemberEmail.trim().toLowerCase();
       setNewTeamId('');
@@ -1095,18 +1162,20 @@ export function ProfileView({
       setNewCrestFile(null);
       if (newCrestInputRef.current) newCrestInputRef.current.value = '';
       await onRefresh();
-      if (invitedEmail) {
-        setOneTimeCredentialBanner({
-          title: 'Participante creado en Cloud Firestore · Acceso Google Autorizado',
-          id: created.id,
-          memberName: created.memberName,
-          teamName: created.name,
-          password: `Google Auth: ${invitedEmail}`,
-        });
-      }
+      setOneTimeCredentialBanner({
+        title: invitedEmail
+          ? 'Participante creado · Credenciales ID + Clave y Google Auth'
+          : 'Participante creado · Credenciales de Acceso (ID y Clave)',
+        id: created.id,
+        memberName: created.memberName,
+        teamName: created.name,
+        password: invitedEmail
+          ? `${desiredClave} · Google: ${invitedEmail}`
+          : desiredClave,
+      });
       setTeamMsg({
         type: 'ok',
-        text: `Participante "${created.memberName}" (${created.name} · ID: ${created.id}) guardado permanentemente en Cloud Firestore y publicado en la Tabla de Posiciones.`,
+        text: `Participante "${created.memberName}" (${created.name} · ID: ${created.id}) guardado en Cloud Firestore${backendSynced ? ' y sincronizado con acceso por ID + Clave' : ''}.`,
       });
     } catch (err) {
       setTeamMsg({
@@ -1145,6 +1214,8 @@ export function ProfileView({
         crestUrl = await uploadMediaFile('crests', editCrestFile);
       }
       const cleanInvite = editMemberEmail.trim().toLowerCase();
+      const nextClave = editClave.trim();
+      const nextId = editId.trim().toUpperCase() || editingTeam.id;
       await updateTeamFirestore(editingTeam.id, {
         name: editName.trim(),
         memberName: editMember.trim(),
@@ -1152,6 +1223,22 @@ export function ProfileView({
         crestUrl,
         linkedEmail: cleanInvite || undefined,
       });
+      if (nextClave || nextId !== editingTeam.id) {
+        try {
+          await apiFetch(`/api/admin/teams/${encodeURIComponent(editingTeam.id)}`, {
+            method: 'PUT',
+            body: JSON.stringify({
+              id: nextId,
+              ...(nextClave ? { clave: nextClave } : {}),
+              name: editName.trim(),
+              memberName: editMember.trim(),
+              bio: editBio,
+            }),
+          });
+        } catch {
+          // Best-effort sync to backend credentials
+        }
+      }
       const editedTeamId = editingTeam.id;
       setEditingTeam(null);
       setEditClave('');
@@ -1159,7 +1246,9 @@ export function ProfileView({
       await onRefresh();
       setTeamMsg({
         type: 'ok',
-        text: cleanInvite
+        text: nextClave
+          ? `Datos y nueva Clave actualizados para ${editMember.trim()} (${editedTeamId}).`
+          : cleanInvite
           ? `Datos actualizados en Cloud Firestore para ${editMember.trim()} (${editedTeamId}) y correo Google autorizado: ${cleanInvite}.`
           : `Datos actualizados en Cloud Firestore para ${editMember.trim()} (${editedTeamId}).`,
       });
@@ -1199,12 +1288,37 @@ export function ProfileView({
 
   const handleResetParticipantPassword = async (team: Team) => {
     setResetBusyTeamId(team.id);
+    setTeamMsg(null);
     try {
-      startEditTeam(team);
-      setTeamMsg({
-        type: 'ok',
-        text: `Editando ${team.memberName} (${team.id}): asigná o actualizá su correo de Google en el panel abierto abajo para vincular su acceso seguro por Firebase Auth.`,
-      });
+      let generatedPass = '';
+      try {
+        const res = await apiFetch<{ resetPassword?: string }>(
+          `/api/admin/teams/${encodeURIComponent(team.id)}/reset-password`,
+          { method: 'POST', body: JSON.stringify({ generate: true }) }
+        );
+        generatedPass = res.resetPassword || '';
+      } catch {
+        // Fallback if backend route isn't active
+      }
+      if (generatedPass) {
+        setOneTimeCredentialBanner({
+          title: 'Nueva Contraseña Generada (ID y Clave)',
+          id: team.id,
+          memberName: team.memberName,
+          teamName: team.name,
+          password: generatedPass,
+        });
+        setTeamMsg({
+          type: 'ok',
+          text: `Se generó una nueva contraseña para ${team.memberName} (${team.id}). Copiala desde el cartel superior.`,
+        });
+      } else {
+        startEditTeam(team);
+        setTeamMsg({
+          type: 'ok',
+          text: `Editando ${team.memberName} (${team.id}): asigná una nueva contraseña o correo de Google en el panel abierto abajo.`,
+        });
+      }
     } finally {
       setResetBusyTeamId(null);
     }
@@ -1670,7 +1784,10 @@ export function ProfileView({
     try {
       let crestUrl = siteCrestUrlInput.trim() || settings.crestUrl;
       let faviconUrl = settings.faviconUrl;
-      let coverUrl = settings.coverUrl;
+      let coverUrl = siteCoverUrlDraft;
+      let messiPlaqueUrl = messiPlaqueUrlDraft;
+      let messiMaradonaUrl = messiMaradonaUrlDraft;
+      let maradonaPlaqueUrl = maradonaPlaqueUrlDraft;
       let backgroundUrl = settings.backgroundUrl;
       let ligaTrophyUrl = ligaTrophyUrlInput.trim();
       let copaTrophyUrl = copaTrophyUrlInput.trim();
@@ -1678,6 +1795,9 @@ export function ProfileView({
       if (siteCrestFile) crestUrl = await uploadMediaFile('site', siteCrestFile);
       if (siteFaviconFile) faviconUrl = await uploadMediaFile('site', siteFaviconFile);
       if (siteCoverFile) coverUrl = await uploadMediaFile('site', siteCoverFile);
+      if (messiPlaqueFile) messiPlaqueUrl = await uploadMediaFile('site', messiPlaqueFile);
+      if (messiMaradonaFile) messiMaradonaUrl = await uploadMediaFile('site', messiMaradonaFile);
+      if (maradonaPlaqueFile) maradonaPlaqueUrl = await uploadMediaFile('site', maradonaPlaqueFile);
       if (siteBackgroundFile) backgroundUrl = await uploadMediaFile('site', siteBackgroundFile);
       if (ligaTrophyFile) ligaTrophyUrl = await uploadMediaFile('site', ligaTrophyFile);
       if (copaTrophyFile) copaTrophyUrl = await uploadMediaFile('site', copaTrophyFile);
@@ -1700,6 +1820,10 @@ export function ProfileView({
         crestUrl,
         faviconUrl,
         coverUrl,
+        messiPlaqueUrl,
+        messiMaradonaUrl,
+        maradonaPlaqueUrl,
+        extraHeroImages: extraHeroImagesDraft,
         backgroundUrl,
         ligaTrophyUrl,
         copaTrophyUrl,
@@ -1716,6 +1840,9 @@ export function ProfileView({
       setSiteCrestUrlInput(crestUrl);
       setSiteFaviconFile(null);
       setSiteCoverFile(null);
+      setMessiPlaqueFile(null);
+      setMessiMaradonaFile(null);
+      setMaradonaPlaqueFile(null);
       setSiteBackgroundFile(null);
       setLigaTrophyFile(null);
       setLigaTrophyUrlInput(ligaTrophyUrl);
@@ -1727,7 +1854,7 @@ export function ProfileView({
       await onRefresh();
       setSiteMsg({
         type: 'ok',
-        text: 'Títulos, copas, trofeos, cupo y configuración general guardados en Cloud Firestore.',
+        text: 'Títulos, imágenes de portada y leyendas, trofeos, cupo y configuración guardados en Cloud Firestore.',
       });
       window.setTimeout(() => setSiteMsg(null), 4000);
     } catch (err) {
@@ -6022,12 +6149,38 @@ export function ProfileView({
                     </div>
                   </div>
 
-                  <div className="p-4 bg-[#05162B] border border-amber-400/45 rounded-xl space-y-2">
-                    <div>
-                      <div className="text-xs font-semibold text-amber-200">
-                        Cambiar Imagen de Portada
+                  <div className="p-4 bg-[#05162B] border border-amber-400/45 rounded-xl space-y-2.5">
+                    <div className="flex items-center justify-between gap-2">
+                      <div>
+                        <div className="text-xs font-semibold text-amber-200">
+                          1. Imagen de Portada Principal
+                        </div>
+                        <div className="text-[11px] text-sky-200/80">
+                          {siteCoverUrlDraft === '' ? 'Eliminada (oculta)' : 'Ancho completo de pantalla'}
+                        </div>
                       </div>
-                      <div className="text-[11px] text-sky-200/80">Recomendado 16:9 (PNG/JPG)</div>
+                      <div className="flex items-center gap-1.5">
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setSiteCoverUrlDraft('');
+                            setSiteCoverFile(null);
+                          }}
+                          className="px-2 py-1 text-[11px] font-semibold rounded bg-rose-500/20 hover:bg-rose-500/35 border border-rose-400/50 text-rose-200"
+                        >
+                          Eliminar
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setSiteCoverUrlDraft(DEFAULT_COVER_IMG);
+                            setSiteCoverFile(null);
+                          }}
+                          className="px-2 py-1 text-[11px] font-semibold rounded bg-amber-400/15 hover:bg-amber-400/30 border border-amber-400/45 text-amber-200"
+                        >
+                          Original
+                        </button>
+                      </div>
                     </div>
                     <input
                       type="file"
@@ -6050,6 +6203,182 @@ export function ProfileView({
                       onChange={(e) => setSiteBackgroundFile(e.target.files?.[0] || null)}
                       className="w-full text-xs text-sky-100/90 file:mr-2 file:py-1.5 file:px-2.5 file:rounded-lg file:border-0 file:text-xs file:font-semibold file:bg-amber-400/20 file:text-amber-300"
                     />
+                  </div>
+                </div>
+
+                {/* Gestión de las 3 Imágenes de Messi & Maradona + Nuevas Imágenes del Inicio */}
+                <div className="p-5 bg-[#05162B]/95 border border-amber-400/50 rounded-2xl space-y-4">
+                  <div>
+                    <h4 className="font-display text-lg font-bold text-amber-300 flex items-center gap-2">
+                      <ImageIcon className="w-4 h-4 text-sky-300" />
+                      <span>Las 4 Imágenes del Inicio (Portada, Messi, Maradona y Nuevas)</span>
+                    </h4>
+                    <p className="text-xs text-sky-200/80 mt-0.5">
+                      Podés eliminar o cambiar la Placa de Messi, la Foto de Messi & Maradona, la Placa de Maradona y agregar nuevas imágenes al Inicio (guardá cambios abajo para aplicar).
+                    </p>
+                  </div>
+
+                  <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                    {(
+                      [
+                        {
+                          title: '2. Placa Datos Messi',
+                          draft: messiPlaqueUrlDraft,
+                          setDraft: setMessiPlaqueUrlDraft,
+                          setFile: setMessiPlaqueFile,
+                          fallback: DEFAULT_MESSI_PLAQUE_IMG,
+                        },
+                        {
+                          title: '3. Foto Messi & Maradona',
+                          draft: messiMaradonaUrlDraft,
+                          setDraft: setMessiMaradonaUrlDraft,
+                          setFile: setMessiMaradonaFile,
+                          fallback: DEFAULT_MESSI_MARADONA_IMG,
+                        },
+                        {
+                          title: '4. Placa Datos Maradona',
+                          draft: maradonaPlaqueUrlDraft,
+                          setDraft: setMaradonaPlaqueUrlDraft,
+                          setFile: setMaradonaPlaqueFile,
+                          fallback: DEFAULT_MARADONA_PLAQUE_IMG,
+                        },
+                      ] as const
+                    ).map((slot) => {
+                      const activeUrl = slot.draft === undefined ? slot.fallback : slot.draft.trim();
+                      return (
+                        <div
+                          key={slot.title}
+                          className="p-3.5 bg-[#041224] border border-amber-400/40 rounded-xl space-y-2.5"
+                        >
+                          <div className="flex items-center justify-between gap-2">
+                            <span className="text-xs font-bold text-amber-200">{slot.title}</span>
+                            <div className="flex items-center gap-1.5">
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  slot.setDraft('');
+                                  slot.setFile(null);
+                                }}
+                                className="px-2 py-0.5 text-[11px] font-semibold rounded bg-rose-500/20 hover:bg-rose-500/35 border border-rose-400/50 text-rose-200"
+                              >
+                                Eliminar
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  slot.setDraft(slot.fallback);
+                                  slot.setFile(null);
+                                }}
+                                className="px-2 py-0.5 text-[11px] font-semibold rounded bg-amber-400/15 hover:bg-amber-400/30 border border-amber-400/45 text-amber-200"
+                              >
+                                Original
+                              </button>
+                            </div>
+                          </div>
+                          {activeUrl ? (
+                            <div className="h-24 rounded-lg overflow-hidden bg-black/50 border border-white/15">
+                              <img
+                                src={resolveAssetUrl(activeUrl)}
+                                alt={slot.title}
+                                className="w-full h-full object-contain"
+                              />
+                            </div>
+                          ) : (
+                            <div className="h-24 rounded-lg bg-black/45 border border-dashed border-rose-400/50 flex items-center justify-center text-[11px] text-rose-200">
+                              Imagen eliminada
+                            </div>
+                          )}
+                          <input
+                            type="file"
+                            accept="image/*"
+                            onChange={(e) => slot.setFile(e.target.files?.[0] || null)}
+                            className="w-full text-[11px] text-sky-100/90 file:mr-2 file:py-1 file:px-2 file:rounded file:border-0 file:text-[11px] file:font-semibold file:bg-amber-400/20 file:text-amber-300"
+                          />
+                        </div>
+                      );
+                    })}
+                  </div>
+
+                  {/* Agregar o quitar imágenes extra */}
+                  <div className="pt-3 border-t border-amber-400/20 space-y-2.5">
+                    <div className="text-xs font-semibold text-sky-100">
+                      Imágenes Nuevas Adicionales en el Inicio ({extraHeroImagesDraft.length}/12)
+                    </div>
+                    <div className="flex flex-col sm:flex-row gap-2">
+                      <label className="inline-flex items-center justify-center gap-1.5 px-3 py-2 rounded-lg bg-amber-400/20 hover:bg-amber-400/30 border border-amber-400/55 text-amber-200 text-xs font-bold cursor-pointer shrink-0">
+                        <Upload className="w-3.5 h-3.5" />
+                        <span>{uploadingExtraHero ? 'Subiendo...' : 'Subir Nueva Imagen'}</span>
+                        <input
+                          type="file"
+                          accept="image/*"
+                          className="hidden"
+                          disabled={uploadingExtraHero}
+                          onChange={async (e) => {
+                            const f = e.target.files?.[0];
+                            e.target.value = '';
+                            if (!f) return;
+                            setUploadingExtraHero(true);
+                            try {
+                              const url = await uploadMediaFile('site', f);
+                              setExtraHeroImagesDraft((prev) => [...prev, url].slice(0, 12));
+                            } catch (err) {
+                              setSiteMsg({
+                                type: 'err',
+                                text: err instanceof Error ? err.message : 'No se pudo subir la imagen.',
+                              });
+                            } finally {
+                              setUploadingExtraHero(false);
+                            }
+                          }}
+                        />
+                      </label>
+                      <input
+                        type="url"
+                        value={newExtraHeroDraftUrl}
+                        onChange={(e) => setNewExtraHeroDraftUrl(e.target.value)}
+                        placeholder="O pegá URL de una nueva imagen (https://...)"
+                        className="flex-1 px-3 py-2 text-xs bg-[#041224] text-amber-50 border border-amber-400/40 rounded-lg"
+                      />
+                      <button
+                        type="button"
+                        disabled={!newExtraHeroDraftUrl.trim()}
+                        onClick={() => {
+                          const clean = newExtraHeroDraftUrl.trim();
+                          if (!clean) return;
+                          setExtraHeroImagesDraft((prev) => [...prev, clean].slice(0, 12));
+                          setNewExtraHeroDraftUrl('');
+                        }}
+                        className="px-3 py-2 text-xs font-bold bg-sky-500/25 hover:bg-sky-500/40 border border-sky-400/50 text-sky-100 rounded-lg disabled:opacity-50 shrink-0"
+                      >
+                        + Agregar
+                      </button>
+                    </div>
+                    {extraHeroImagesDraft.length > 0 && (
+                      <div className="grid grid-cols-2 sm:grid-cols-4 gap-2.5 pt-1">
+                        {extraHeroImagesDraft.map((imgUrl, idx) => (
+                          <div
+                            key={`${imgUrl}_${idx}`}
+                            className="relative h-20 rounded-lg overflow-hidden border border-amber-400/45 bg-black/60"
+                          >
+                            <img
+                              src={resolveAssetUrl(imgUrl)}
+                              alt={`Extra #${idx + 1}`}
+                              className="w-full h-full object-cover"
+                            />
+                            <button
+                              type="button"
+                              onClick={() =>
+                                setExtraHeroImagesDraft((prev) => prev.filter((_, i) => i !== idx))
+                              }
+                              title="Eliminar imagen"
+                              className="absolute top-1 right-1 p-1 rounded bg-rose-600/90 text-white hover:bg-rose-500"
+                            >
+                              <Trash2 className="w-3 h-3" />
+                            </button>
+                          </div>
+                        ))}
+                      </div>
+                    )}
                   </div>
                 </div>
 
